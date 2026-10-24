@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "teapottrainer"
+version = "0.1.0"
+description = "A modular, config-driven library for training LLMs."
+readme = "README.md"
+authors = [
+    { name = "Zakery Clarke" }
+]
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.0.0",
+    "transformers>=4.30.0",
+    "datasets>=2.14.0",
+    "accelerate>=0.20.0",
+    "pydantic>=2.0.0",
+    "tensorboard>=2.0.0"
+]
+
+[tool.setuptools.packages.find]
+include = ["teapottrainer*"]
