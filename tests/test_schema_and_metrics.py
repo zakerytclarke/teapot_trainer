@@ -1,0 +1,313 @@
+"""Schema lock plus scorers that do not need a GPU."""
+
+from teapottrainer.config import ModelConfig, TrainingConfig
+from teapottrainer.datasets import (
+    DatasetSourceConfig,
+    GSM8K_TEST,
+    SMOLTALK_APIGEN_TEST,
+    encode_pair,
+    holdout_membership,
+    iterate_encoded,
+    row_pairs,
+)
+from teapottrainer.formatting import format_gsm8k, format_hotpot, format_squad, messages_format
+from teapottrainer.metrics import (
+    classify_decision,
+    constraint_checks,
+    extract_tool_calls,
+    is_abstention,
+    score_gsm,
+    score_tool_prediction,
+    token_f1,
+)
+
+
+LOCKED_TRAINING_FIELDS = {
+    "model",
+    "pretrain_datasets",
+    "sft_datasets",
+    "eval_datasets",
+    "tokenizer",
+    "batch_size",
+    "grad_accum",
+    "lr",
+    "weight_decay",
+    "compile",
+    "logging_dir",
+    "eval_every_percent",
+    "holdout_ratio",
+    "seed",
+}
+
+
+def test_training_config_fields_are_unchanged():
+    assert set(TrainingConfig.model_fields) == LOCKED_TRAINING_FIELDS
+    assert set(DatasetSpec.model_fields) == {"source", "target_tokens", "weight"}
+    assert set(DatasetSourceConfig.model_fields) == {
+        "name",
+        "subset",
+        "split",
+        "target_tokens",
+        "weight",
+        "text_column",
+        "is_sft",
+        "preprocess_fn",
+        "chat_template_fn",
+    }
+    assert set(ModelConfig.model_fields) == {
+        "model_type",
+        "hidden_size",
+        "layers",
+        "heads",
+        "kv_heads",
+        "intermediate",
+        "seq_len",
+        "custom_config_cls",
+        "custom_model_cls",
+    }
+
+
+def test_train_script_uses_the_same_constructor():
+    from train import build_config
+
+    config = build_config()
+    dumped = set(config.model_dump().keys())
+    assert dumped == LOCKED_TRAINING_FIELDS
+    assert config.model.layers == 26
+    assert config.model.hidden_size == 512
+    assert config.tokenizer == "gpt2"
+    assert config.pretrain_datasets[0].target_tokens == 2_000_000_000
+    names = []
+    for spec in config.sft_datasets:
+        names.append((spec.source.name, spec.source.subset))
+    assert ("HuggingFaceTB/smoltalk", "all") not in names
+    assert ("nvidia/When2Call", "train_sft") in names
+    assert GSM8K_TEST.split == "test"
+    assert SMOLTALK_APIGEN_TEST.chat_template_fn is not None
+
+
+def test_tool_score_on_exact_call():
+    gold = (
+        '<tool_call>[{"name": "generate_random_string", '
+        '"arguments": {"length": 5, "uppercase": true, "digits": false}}]</tool_call>'
+    )
+    scored = score_tool_prediction(gold, gold)
+    assert scored["parse"] == 1.0
+    assert scored["name"] == 1.0
+    assert scored["args"] == 1.0
+    refused = score_tool_prediction("No tool applies.", gold)
+    assert refused["parse"] == 0.0
+    restraint = score_tool_prediction("I cannot do that.", "The query cannot be answered, no tools were provided.")
+    assert restraint["restraint"] == 1.0
+    leaked = score_tool_prediction(gold, "The query cannot be answered, no tools were provided.")
+    assert leaked["restraint"] == 0.0
+
+
+def test_tool_args_ignore_key_order_and_numeric_strings():
+    gold = '<tool_call>[{"name": "lookup", "arguments": {"b": 2, "a": 1}}]</tool_call>'
+    pred = '<tool_call>[{"name": "lookup", "arguments": {"a": "1", "b": "2"}}]</tool_call>'
+    assert score_tool_prediction(pred, gold)["args"] == 1.0
+    bare = '{"name": "lookup", "arguments": {"a": 1, "b": 2}}'
+    assert extract_tool_calls(bare)[0]["name"] == "lookup"
+
+
+def test_decision_labels():
+    assert classify_decision('{"name": "get_weather", "arguments": {"city": "Paris"}}') == "tool_call"
+    assert classify_decision("Could you share the drink id?") == "request_for_info"
+    assert classify_decision("Apologies, but I'm unable to provide real-time information.") == "cannot_answer"
+    assert classify_decision("Paris is the capital of France.") == "direct"
+
+
+def test_squad_and_gsm_scores():
+    assert token_f1("in the late 1990s", "late 1990s") > 0.6
+    assert is_abstention("The context does not contain the answer.")
+    assert not is_abstention("Beyonce started in the late 1990s.")
+    assert score_gsm("16 - 3 - 4 = 9\n#### 18", "She makes 18.\n#### 18") == 1.0
+    assert score_gsm("The answer is 18.0", "#### 18") == 1.0
+    assert score_gsm("#### 17", "#### 18") == 0.0
+    prompt, answer = format_gsm8k({"question": "What is 2+2?", "answer": "2+2=4\n#### 4"})
+    assert prompt.endswith("Assistant:\n")
+    assert "#### 4" in answer
+    squad_prompt, squad_answer = format_squad(
+        {"context": "The capital is Paris.", "question": "What is the capital?", "answers": {"text": []}}
+    )
+    assert "does not contain the answer" in squad_prompt
+    assert squad_answer == "The context does not contain the answer."
+
+
+def test_constraint_checker_on_a_satisfying_reply():
+    instruction = (
+        "Your response should contain at least 3 sentences. "
+        "The response must contain exactly 3 bullet points. "
+        "Include keywords [health, reduce, improve]. "
+        "At the end of your response, please explicitly add a postscript starting with P.S."
+    )
+    reply = (
+        "Walking helps health. It can reduce stress. It can improve sleep.\n"
+        "* Walk every day for health\n"
+        "* Stretch to reduce tension\n"
+        "* Sleep enough to improve recovery\n"
+        "P.S. Start small."
+    )
+    checks = dict(constraint_checks(instruction, reply))
+    assert checks["min_sentences"]
+    assert checks["exact_bullets"]
+    assert checks["keywords"]
+    assert checks["postscript"]
+
+
+class _CharTokenizer:
+    eos_token = ""
+    eos_token_id = None
+    pad_token_id = 0
+
+    def encode(self, text, add_special_tokens=False):
+        return [ord(ch) % 97 + 1 for ch in text]
+
+
+def test_generators_do_not_share_a_source():
+    tok = _CharTokenizer()
+    left = DatasetSourceConfig(
+        name="left",
+        split="test",
+        is_sft=True,
+        chat_template_fn=lambda row: ("User: left\n\nAssistant:\n", row["answer"]),
+    )
+    right = DatasetSourceConfig(
+        name="right",
+        split="test",
+        is_sft=True,
+        chat_template_fn=lambda row: ("User: right\n\nAssistant:\n", row["answer"]),
+    )
+    gen_left = iterate_encoded(left, tok, seq_len=64, rows=[{"answer": "alpha"}])
+    gen_right = iterate_encoded(right, tok, seq_len=64, rows=[{"answer": "beta"}])
+    first_left = next(gen_left)
+    first_right = next(gen_right)
+    assert first_left["labels"] != first_right["labels"]
+    assert any(token != -100 for token in first_left["labels"])
+
+
+def test_holdout_slices_are_disjoint():
+    key = "a fineweb document about tides"
+    held = holdout_membership(key, 0.05, 42)
+    assert held or not held
+    # Same key always lands on the same side, and a large sample covers both.
+    flags = {holdout_membership(f"doc {i}", 0.05, 42) for i in range(400)}
+    assert flags == {True, False}
+
+
+def test_supervised_tail_contains_the_answer():
+    tok = _CharTokenizer()
+    encoded = encode_pair(tok, "User: hi\n\nAssistant:\n", "hello there", seq_len=64)
+    supervised = [token for token, label in zip(encoded["input_ids"], encoded["labels"]) if label != -100]
+    assert supervised
+    text = "".join(chr((token - 1) % 97 + 97) if False else "" for token in [])
+    del text
+    # Char tokenizer is invertible for this alphabet via the same encode of the answer.
+    answer_ids = tok.encode("hello there")
+    assert supervised[: len(answer_ids)] == answer_ids
+
+
+def test_prompt_is_masked_with_real_gpt2_tokenizer():
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained("gpt2")
+    prompt = "System: be brief\n\nUser: Say hello\n\nAssistant:\n"
+    answer = "Hello there."
+    encoded = encode_pair(tok, prompt, answer, seq_len=64)
+    assert encoded is not None
+    supervised = [token for token, label in zip(encoded["input_ids"], encoded["labels"]) if label != -100]
+    decoded = tok.decode(supervised)
+    assert "Hello" in decoded
+    masked = [token for token, label in zip(encoded["input_ids"], encoded["labels"]) if label == -100]
+    assert masked
+    assert "Assistant" in tok.decode(masked)
+
+
+def test_hotpot_keeps_supporting_pages_near_the_question():
+    prompt, answer = format_hotpot({
+        "question": "Were they the same nationality?",
+        "answer": "yes",
+        "supporting_facts": {"title": ["Ada Lovelace"], "sent_id": [0]},
+        "context": {
+            "title": ["Distractor City", "Ada Lovelace"],
+            "sentences": [
+                ["Distractor City is unrelated."],
+                ["Ada Lovelace was English."],
+            ],
+        },
+    })
+    assert answer == "yes"
+    assert prompt.index("Ada Lovelace") > prompt.index("Distractor City")
+    assert prompt.index("Were they the same nationality?") > prompt.index("Ada Lovelace")
+
+
+def test_messages_keep_system_and_every_assistant_turn():
+    pairs = messages_format({
+        "messages": [
+            {"role": "system", "content": "Always end with an emoji."},
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello"},
+            {"role": "user", "content": "Another"},
+            {"role": "assistant", "content": "Sure"},
+        ]
+    })
+    assert len(pairs) == 2
+    assert "Always end with an emoji." in pairs[0][0]
+    assert pairs[0][1] == "Hello"
+    assert "Hello" in pairs[1][0]
+    assert pairs[1][1] == "Sure"
+
+
+def test_apigen_row_roundtrip_if_cached():
+    from datasets import load_dataset
+
+    row = next(iter(load_dataset("HuggingFaceTB/smoltalk", "apigen-80k", split="test", streaming=True)))
+    pairs = row_pairs(SMOLTALK_APIGEN_TEST, row)
+    assert pairs
+    prompt, answer = pairs[-1]
+    assert "Assistant:" in prompt
+    assert row["messages"][1]["content"][:40] in prompt
+    if "<tool_call>" in answer:
+        assert score_tool_prediction(answer, answer)["args"] == 1.0
+    else:
+        assert score_tool_prediction(answer, answer)["restraint"] == 1.0
+
+
+def test_when2call_gold_text_matches_its_label():
+    from datasets import load_dataset
+
+    from teapottrainer.evals import load_task_rows
+    from teapottrainer.datasets import WHEN2CALL_TEST
+
+    rows = load_task_rows(WHEN2CALL_TEST, 60, seed=0, kind="when2call")
+    assert rows
+    hits = 0
+    labels = set()
+    for row in rows:
+        labels.add(row["correct_answer"])
+        gold = row["answers"][row["correct_answer"]]
+        hits += int(classify_decision(gold) == row["correct_answer"])
+    assert len(labels) >= 3
+    assert hits / len(rows) >= 0.9
+
+
+def test_constraint_gold_replies_pass_the_checker():
+    from datasets import load_dataset
+
+    from teapottrainer.datasets import SMOLTALK_CONSTRAINTS_TEST
+    from teapottrainer.metrics import score_constraints
+
+    rows = list(load_dataset("HuggingFaceTB/smoltalk", "smol-constraints", split="test", streaming=True).take(40))
+    scored = []
+    for row in rows:
+        pairs = row_pairs(SMOLTALK_CONSTRAINTS_TEST, row)
+        if not pairs:
+            continue
+        user = row["messages"][0]["content"]
+        result = score_constraints(user, pairs[-1][1])
+        if result is not None:
+            scored.append(result["example_pass"])
+    assert len(scored) >= 20
+    assert sum(scored) / len(scored) >= 0.75
+

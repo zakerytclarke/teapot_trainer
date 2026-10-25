@@ -1,10 +1,31 @@
-import random
-from typing import List, Dict, Callable, Optional, Union, Any
+"""Dataset presets and the streaming encoder.
+
+``DatasetSourceConfig`` fields are unchanged. New presets are additional
+constants. ``chat_template_fn`` may return one ``(prompt, answer)`` pair or a
+list of pairs (one per assistant turn).
+"""
+
+from __future__ import annotations
+
+import hashlib
+from typing import Any, Callable, Iterator, Optional
+
 from pydantic import BaseModel, ConfigDict, Field
-from datasets import load_dataset, Dataset as HFDataset, IterableDataset as HFIterableDataset
+from datasets import load_dataset
+
+from .formatting import (
+    as_pairs,
+    format_gsm8k,
+    format_hotpot,
+    format_squad,
+    format_when2call,
+    messages_format,
+)
+
 
 class DatasetSourceConfig(BaseModel):
     """Configuration for an individual dataset source in a mix."""
+
     name: str
     subset: Optional[str] = None
     split: str = "train"
@@ -12,134 +33,288 @@ class DatasetSourceConfig(BaseModel):
     weight: float = 1.0
     text_column: str = "text"
     is_sft: bool = False
-    
-    # Exclude functions from serialization to prevent any Pydantic serialization errors
-    preprocess_fn: Optional[Callable[[Dict], Dict]] = Field(default=None, exclude=True)
-    chat_template_fn: Optional[Callable[[Dict], tuple[str, str]]] = Field(default=None, exclude=True)
+
+    preprocess_fn: Optional[Callable[[dict], dict]] = Field(default=None, exclude=True)
+    chat_template_fn: Optional[Callable[[dict], tuple[str, str]]] = Field(default=None, exclude=True)
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-
-# ─────────────────────────────────────────────────────────────
-# Exported Dataset Preset Constants
-# ─────────────────────────────────────────────────────────────
 
 FINEWEB_EDU = DatasetSourceConfig(
     name="HuggingFaceFW/fineweb-edu",
     split="train",
     is_sft=False,
-    text_column="text"
+    text_column="text",
 )
-
-def _smoltalk_formatter(row):
-    messages = row.get("messages", [])
-    prompt, answer = "", ""
-    for i in range(len(messages) - 1):
-        if messages[i]["role"] == "user" and messages[i+1]["role"] == "assistant":
-            prompt = messages[i]["content"]
-            answer = messages[i+1]["content"]
-            break
-    if not prompt and messages:
-        prompt = messages[0].get("content", "")
-        answer = messages[-1].get("content", "")
-    return prompt, answer
 
 SMOLTALK = DatasetSourceConfig(
     name="HuggingFaceTB/smoltalk",
     subset="all",
     split="train",
     is_sft=True,
-    chat_template_fn=_smoltalk_formatter
+    chat_template_fn=messages_format,
 )
 
-def _gsm8k_formatter(row):
-    question = row.get("question", "")
-    answer = row.get("answer", "")
-    return f"Question: {question}\nAnswer:", f" {answer}"
+SMOLTALK_MAGPIE = DatasetSourceConfig(
+    name="HuggingFaceTB/smoltalk",
+    subset="smol-magpie-ultra",
+    split="train",
+    is_sft=True,
+    chat_template_fn=messages_format,
+)
+SMOLTALK_EVERYDAY = DatasetSourceConfig(
+    name="HuggingFaceTB/smoltalk",
+    subset="everyday-conversations",
+    split="train",
+    is_sft=True,
+    chat_template_fn=messages_format,
+)
+SMOLTALK_OPENHERMES = DatasetSourceConfig(
+    name="HuggingFaceTB/smoltalk",
+    subset="openhermes-100k",
+    split="train",
+    is_sft=True,
+    chat_template_fn=messages_format,
+)
+SMOLTALK_CONSTRAINTS = DatasetSourceConfig(
+    name="HuggingFaceTB/smoltalk",
+    subset="smol-constraints",
+    split="train",
+    is_sft=True,
+    chat_template_fn=messages_format,
+)
+SMOLTALK_SYSTEMCHATS = DatasetSourceConfig(
+    name="HuggingFaceTB/smoltalk",
+    subset="systemchats-30k",
+    split="train",
+    is_sft=True,
+    chat_template_fn=messages_format,
+)
+SMOLTALK_SUMMARIZE = DatasetSourceConfig(
+    name="HuggingFaceTB/smoltalk",
+    subset="smol-summarize",
+    split="train",
+    is_sft=True,
+    chat_template_fn=messages_format,
+)
+SMOLTALK_REWRITE = DatasetSourceConfig(
+    name="HuggingFaceTB/smoltalk",
+    subset="smol-rewrite",
+    split="train",
+    is_sft=True,
+    chat_template_fn=messages_format,
+)
+SMOLTALK_APIGEN = DatasetSourceConfig(
+    name="HuggingFaceTB/smoltalk",
+    subset="apigen-80k",
+    split="train",
+    is_sft=True,
+    chat_template_fn=messages_format,
+)
+SMOLTALK_METAMATH = DatasetSourceConfig(
+    name="HuggingFaceTB/smoltalk",
+    subset="metamathqa-50k",
+    split="train",
+    is_sft=True,
+    chat_template_fn=messages_format,
+)
+
+SMOLTALK_MAGPIE_TEST = SMOLTALK_MAGPIE.model_copy(update={"split": "test"})
+SMOLTALK_CONSTRAINTS_TEST = SMOLTALK_CONSTRAINTS.model_copy(update={"split": "test"})
+SMOLTALK_APIGEN_TEST = SMOLTALK_APIGEN.model_copy(update={"split": "test"})
 
 GSM8K = DatasetSourceConfig(
     name="gsm8k",
     subset="main",
     split="train",
     is_sft=True,
-    chat_template_fn=_gsm8k_formatter
+    chat_template_fn=format_gsm8k,
 )
+GSM8K_TEST = GSM8K.model_copy(update={"split": "test"})
+
+WHEN2CALL = DatasetSourceConfig(
+    name="nvidia/When2Call",
+    subset="train_sft",
+    split="train",
+    is_sft=True,
+    chat_template_fn=format_when2call,
+)
+WHEN2CALL_TEST = DatasetSourceConfig(
+    name="nvidia/When2Call",
+    subset="test",
+    split="mcq",
+    is_sft=True,
+    chat_template_fn=format_when2call,
+)
+
+SQUAD_V2 = DatasetSourceConfig(
+    name="rajpurkar/squad_v2",
+    split="train",
+    is_sft=True,
+    chat_template_fn=format_squad,
+)
+SQUAD_V2_VAL = SQUAD_V2.model_copy(update={"split": "validation"})
+
+HOTPOT = DatasetSourceConfig(
+    name="hotpot_qa",
+    subset="distractor",
+    split="train",
+    is_sft=True,
+    chat_template_fn=format_hotpot,
+)
+HOTPOT_VAL = HOTPOT.model_copy(update={"split": "validation"})
+
+
+def open_dataset(src: DatasetSourceConfig, streaming: bool):
+    kwargs = {"split": src.split, "streaming": streaming}
+    try:
+        if src.subset:
+            return load_dataset(src.name, src.subset, **kwargs)
+        return load_dataset(src.name, **kwargs)
+    except Exception:
+        if src.subset:
+            return load_dataset(src.name, **kwargs)
+        raise
+
+
+def holdout_membership(key: str, ratio: float, seed: int) -> bool:
+    """True when this example belongs to the train-split holdout."""
+    if ratio <= 0:
+        return False
+    digest = hashlib.md5(f"{seed}:{key[:500]}".encode()).digest()
+    bucket = int.from_bytes(digest[:4], "big") / 2**32
+    return bucket < ratio
+
+
+def encode_pair(tokenizer, prompt: str, answer: str, seq_len: int) -> dict | None:
+    """Mask the prompt. Left-truncate so the supervised answer still fits."""
+    answer = (answer or "").strip()
+    prompt = prompt or ""
+    if not answer or not prompt.strip():
+        return None
+    if not prompt.endswith("\n"):
+        prompt += "\n"
+    eos = tokenizer.eos_token or ""
+    full_ids = tokenizer.encode(prompt + answer + eos, add_special_tokens=False)
+    prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    if full_ids[: len(prompt_ids)] != prompt_ids:
+        answer_ids = tokenizer.encode(answer + eos, add_special_tokens=False)
+        full_ids = prompt_ids + answer_ids
+    else:
+        answer_ids = full_ids[len(prompt_ids) :]
+    if not answer_ids:
+        return None
+    overflow = len(full_ids) - seq_len
+    if overflow > 0:
+        if overflow >= len(prompt_ids):
+            full_ids = answer_ids[-seq_len:]
+            labels = list(full_ids)
+        else:
+            prompt_ids = prompt_ids[overflow:]
+            full_ids = prompt_ids + answer_ids
+            labels = [-100] * len(prompt_ids) + list(answer_ids)
+    else:
+        labels = [-100] * (len(full_ids) - len(answer_ids)) + list(answer_ids)
+    if len(labels) != len(full_ids) or all(token == -100 for token in labels):
+        return None
+    return {"input_ids": list(full_ids), "labels": list(labels)}
+
+
+def row_text(src: DatasetSourceConfig, row: dict) -> str:
+    if src.preprocess_fn:
+        row = src.preprocess_fn(row)
+    value = row.get(src.text_column, row.get("text", row.get("content", "")))
+    return value if isinstance(value, str) else ""
+
+
+def row_pairs(src: DatasetSourceConfig, row: dict) -> list[tuple[str, str]]:
+    if src.preprocess_fn:
+        row = src.preprocess_fn(row)
+    if not src.chat_template_fn:
+        return []
+    return as_pairs(src.chat_template_fn(row))
+
+
+def iterate_encoded(
+    src: DatasetSourceConfig,
+    tokenizer,
+    seq_len: int,
+    *,
+    is_eval: bool = False,
+    holdout_ratio: float = 0.05,
+    seed: int = 42,
+    rows: list[dict] | None = None,
+) -> Iterator[dict]:
+    """Yield fixed trainer examples.
+
+    Train and eval of a ``split='train'`` source share a hash holdout so the
+    eval slice is not trained on. Test and validation splits are used whole.
+    """
+
+    def source_rows():
+        if rows is not None:
+            yield from rows
+            return
+        for row in open_dataset(src, streaming=True):
+            yield row
+
+    use_holdout = src.split == "train" and holdout_ratio > 0
+
+    if not src.is_sft:
+        buffer: list[int] = []
+        eos_id = tokenizer.eos_token_id
+        for row in source_rows():
+            text = row_text(src, row)
+            if not text:
+                continue
+            if use_holdout:
+                held = holdout_membership(text, holdout_ratio, seed)
+                if held != is_eval:
+                    continue
+            ids = tokenizer.encode(text, add_special_tokens=False)
+            if eos_id is not None:
+                ids = ids + [eos_id]
+            buffer.extend(ids)
+            while len(buffer) >= seq_len:
+                chunk = buffer[:seq_len]
+                buffer = buffer[seq_len:]
+                yield {"input_ids": chunk, "labels": list(chunk)}
+        return
+
+    for row in source_rows():
+        pairs = row_pairs(src, row)
+        for prompt, answer in pairs:
+            if use_holdout:
+                held = holdout_membership(prompt + "\n" + answer, holdout_ratio, seed)
+                if held != is_eval:
+                    continue
+            encoded = encode_pair(tokenizer, prompt, answer, seq_len)
+            if encoded is not None:
+                yield encoded
 
 
 class DatasetRegistry:
-    """Manages loading, splitting, tokenizing, and mixing multiple data sources with leakage prevention."""
-    
+    """Load, encode, and mix sources. One generator is bound to one source."""
+
     @staticmethod
     def prepare_dataset_splits(
-        sources: List[Union[DatasetSourceConfig, Any]], 
-        tokenizer, 
-        seq_len: int, 
+        sources: list[Any],
+        tokenizer,
+        seq_len: int,
         is_eval: bool = False,
-        holdout_ratio: float = 0.05
+        holdout_ratio: float = 0.05,
+        seed: int = 42,
     ):
-        processed_data_streams = []
-        
+        streams = []
         for src in sources:
-            actual_split = src.split
-            if src.name == "gsm8k":
-                actual_split = "test" if is_eval else "train"
-            
-            try:
-                raw_ds = load_dataset(src.name, src.subset, split=actual_split, streaming=True)
-            except Exception:
-                raw_ds = load_dataset(src.name, split=actual_split, streaming=True)
-
-            if is_eval and src.name != "gsm8k" and actual_split == "train":
-                raw_ds = raw_ds.shard(num_shards=int(1 / holdout_ratio), index=0, contiguous=True)
-            elif not is_eval and src.name != "gsm8k" and actual_split == "train":
-                try:
-                    raw_ds = raw_ds.shard(num_shards=int(1 / holdout_ratio), index=1, contiguous=True)
-                except Exception:
-                    pass
-
-            def generator():
-                for item in raw_ds:
-                    if src.preprocess_fn:
-                        item = src.preprocess_fn(item)
-
-                    if src.is_sft and src.chat_template_fn:
-                        prompt, answer = src.chat_template_fn(item)
-                        if not prompt or not answer:
-                            continue
-                        
-                        prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
-                        answer_ids = tokenizer.encode(answer + tokenizer.eos_token, add_special_tokens=False)
-                        
-                        full_ids = prompt_ids + answer_ids
-                        labels_mask = [-100] * len(prompt_ids) + answer_ids
-
-                        while len(full_ids) >= seq_len:
-                            chunk_ids = full_ids[:seq_len]
-                            chunk_labels = labels_mask[:seq_len]
-                            
-                            full_ids = full_ids[seq_len:]
-                            labels_mask = labels_mask[seq_len:]
-                            yield {
-                                "input_ids": chunk_ids, 
-                                "labels": chunk_labels,
-                                "is_sft": True
-                            }
-                    else:
-                        text = item.get(src.text_column, item.get("text", item.get("content", "")))
-                        if not text:
-                            continue
-                        ids = tokenizer.encode(text, add_special_tokens=False)
-                        
-                        buffer = ids
-                        while len(buffer) >= seq_len:
-                            chunk = buffer[:seq_len]
-                            buffer = buffer[seq_len:]
-                            yield {
-                                "input_ids": chunk,
-                                "labels": chunk,
-                                "is_sft": False
-                            }
-
-            processed_data_streams.append(generator())
-
-        return processed_data_streams
+            streams.append(
+                iterate_encoded(
+                    src,
+                    tokenizer,
+                    seq_len,
+                    is_eval=is_eval,
+                    holdout_ratio=holdout_ratio,
+                    seed=seed,
+                )
+            )
+        return streams

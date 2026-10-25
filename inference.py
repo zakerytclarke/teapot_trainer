@@ -10,42 +10,6 @@ import sys
 
 import torch
 from transformers import AutoTokenizer, LlamaForCausalLM
-from pydantic import BaseModel, Field, ConfigDict
-
-
-# Match the configuration schema and checkpoint naming in train.py.
-class ModelConfig(BaseModel):
-    hidden_size: int = 256
-    layers: int = Field(8, alias="num_hidden_layers")
-    heads: int = Field(8, alias="num_attention_heads")
-    kv_heads: int = Field(4, alias="num_key_value_heads")
-    intermediate: int = Field(1024, alias="intermediate_size")
-    seq_len: int = Field(1024, alias="max_position_embeddings")
-
-    model_config = ConfigDict(populate_by_name=True)
-
-
-class DatasetConfig(BaseModel):
-    dataset: str = "HuggingFaceFW/fineweb-edu"
-    split: str = "train"
-    text_column: str = "text"
-
-    model_config = ConfigDict(populate_by_name=True)
-
-
-class TrainingConfig(BaseModel):
-    model: ModelConfig = Field(default_factory=ModelConfig, alias="model_config")
-    dataset_config: DatasetConfig = Field(default_factory=DatasetConfig)
-    tokenizer: str = "Qwen/Qwen2.5-0.5B"
-    target_tokens: int = 2_000_000_000
-    batch_size: int = 16
-    grad_accum: int = 8
-    lr: float = 3e-4
-    weight_decay: float = 0.1
-    sample_every_percent: float = 1.0
-    compile: bool = True
-
-    model_config = ConfigDict(populate_by_name=True)
 
 
 def parse_args():
@@ -86,73 +50,58 @@ def read_config(args):
     return None
 
 
+def _has_weights(path):
+    if os.path.isfile(os.path.join(path, "model.safetensors")) or os.path.isfile(
+        os.path.join(path, "pytorch_model.bin")
+    ):
+        return True
+    if not os.path.isdir(path):
+        return False
+    return any(
+        filename.startswith("model-") and filename.endswith(".safetensors")
+        for filename in os.listdir(path)
+    )
+
+
 def find_checkpoint(config):
-    """Find the same run directory created by train.py."""
+    """Find the run directory written by TeapotTrainer."""
     if config is None:
         return None
 
+    from teapottrainer import TrainingConfig
+
+    expected = None
     try:
         cfg = TrainingConfig(**config)
     except Exception as exc:
-        raise SystemExit(f"Invalid training configuration: {exc}")
+        print(f"Config did not match TrainingConfig ({exc}). Scanning runs/teapot-*.")
+        cfg = None
+    if cfg is not None:
+        tokenizer_short = cfg.tokenizer.split("/")[-1]
+        safe = cfg.model_dump(exclude_defaults=True, mode="json")
+        run_hash = hashlib.md5(json.dumps(safe, default=str).encode()).hexdigest()[:6]
+        expected = os.path.abspath(f"./runs/teapot-{tokenizer_short}-{run_hash}")
+        if os.path.isfile(os.path.join(expected, "config.json")) and _has_weights(expected):
+            return expected
 
-    dataset_short = cfg.dataset_config.dataset.split("/")[-1]
-    tokenizer_short = cfg.tokenizer.split("/")[-1]
-
-    run_hash = hashlib.md5(
-        cfg.model_dump_json().encode()
-    ).hexdigest()[:6]
-
-    expected = os.path.abspath(
-        f"./runs/{dataset_short}-{tokenizer_short}-{run_hash}"
-    )
-
-    if os.path.isfile(os.path.join(expected, "config.json")):
-        return expected
-
-    # Fallback for Pydantic-version or serialization differences.
     runs_dir = os.path.abspath("./runs")
-    prefix = f"{dataset_short}-{tokenizer_short}-"
-
-    if os.path.isdir(runs_dir):
-        candidates = []
-
-        for name in os.listdir(runs_dir):
-            path = os.path.join(runs_dir, name)
-
-            if not name.startswith(prefix) or not os.path.isdir(path):
-                continue
-
-            if not os.path.isfile(os.path.join(path, "config.json")):
-                continue
-
-            weights_exist = any(
-                os.path.isfile(os.path.join(path, filename))
-                for filename in (
-                    "model.safetensors",
-                    "pytorch_model.bin",
-                )
-            )
-
-            if not weights_exist:
-                weights_exist = any(
-                    filename.startswith("model-")
-                    and filename.endswith(".safetensors")
-                    for filename in os.listdir(path)
-                )
-
-            if weights_exist:
-                candidates.append((os.path.getmtime(path), path))
-
-        if candidates:
-            candidates.sort(reverse=True)
-            if len(candidates) > 1:
-                print("Multiple matching checkpoints found; using the newest:")
-                for _, path in candidates:
-                    print(f"  {path}")
-            return candidates[0][1]
-
-    return None
+    if not os.path.isdir(runs_dir):
+        return None
+    candidates = []
+    for name in os.listdir(runs_dir):
+        path = os.path.join(runs_dir, name)
+        if not name.startswith("teapot-") or not os.path.isdir(path):
+            continue
+        if os.path.isfile(os.path.join(path, "config.json")) and _has_weights(path):
+            candidates.append((os.path.getmtime(path), path))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    if len(candidates) > 1:
+        print("Multiple checkpoints found; using the newest:")
+        for _, path in candidates:
+            print(f"  {path}")
+    return candidates[0][1]
 
 
 def main():
