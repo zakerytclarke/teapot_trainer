@@ -1,5 +1,6 @@
 """Short from-scratch pretrain. Confirms the loop learns, then exits."""
 
+import os
 import sys
 from pathlib import Path
 
@@ -48,6 +49,10 @@ def main():
         f"smoke ok: loss {phase['first_loss']:.4f} -> {phase['last_loss']:.4f} "
         f"at {phase['tok_per_sec']:.0f} tok/s"
     )
+    # datasets/tokenizers threads abort during interpreter shutdown on this machine.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":

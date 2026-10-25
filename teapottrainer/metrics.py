@@ -16,6 +16,8 @@ from typing import Any
 from .formatting import ABSTAIN_TEXT
 
 _TOOL_BLOCK = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE)
+_TOOL_OPEN = re.compile(r"<tool_call>\s*(.*)$", re.DOTALL | re.IGNORECASE)
+_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 _WORD = re.compile(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?")
 
 
@@ -69,25 +71,58 @@ def _canonicalize(value: Any) -> Any:
     return value
 
 
+def _calls_from_payload(payload: str) -> list[dict]:
+    parsed = _parse_jsonish(payload)
+    if parsed is None:
+        parsed = _first_json_value(payload)
+    items = parsed if isinstance(parsed, list) else [parsed]
+    calls = []
+    for item in items:
+        call = _coerce_call(item)
+        if call is not None:
+            calls.append(call)
+    return calls
+
+
+def _first_json_value(text: str) -> Any | None:
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char not in "[{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, (dict, list)):
+            return value
+    return None
+
+
 def extract_tool_calls(text: str) -> list[dict]:
-    """Parse ``<tool_call>`` blocks or a bare JSON call. Empty means no call."""
+    """Parse tool calls from tags, fenced JSON, or a bare JSON object.
+
+    A missing closing tag still counts. Prose that never names a tool does not.
+    """
     if not text:
         return []
-    calls: list[dict] = []
-    blocks = _TOOL_BLOCK.findall(text)
-    payloads = blocks or []
+    payloads = _TOOL_BLOCK.findall(text)
+    if not payloads and re.search(r"<tool_call>", text, re.IGNORECASE):
+        payloads = _TOOL_OPEN.findall(text)
     if not payloads:
-        stripped = text.strip()
-        if stripped.startswith("{") or stripped.startswith("["):
-            payloads = [stripped]
+        payloads = _FENCE.findall(text)
     for payload in payloads:
-        parsed = _parse_jsonish(payload)
-        items = parsed if isinstance(parsed, list) else [parsed]
-        for item in items:
-            call = _coerce_call(item)
-            if call is not None:
-                calls.append(call)
-    return calls
+        calls = _calls_from_payload(payload)
+        if calls:
+            return calls
+    stripped = text.strip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        calls = _calls_from_payload(stripped)
+        if calls:
+            return calls
+    scanned = _first_json_value(text)
+    if isinstance(scanned, (dict, list)):
+        return _calls_from_payload(json.dumps(scanned))
+    return []
 
 
 def score_tool_prediction(prediction: str, gold: str) -> dict[str, float]:
@@ -198,17 +233,22 @@ def token_f1(prediction: str, gold: str) -> float:
     return 2 * precision * recall / (precision + recall)
 
 
-def best_span_scores(prediction: str, golds: list[str]) -> tuple[float, float]:
+def best_span_scores(prediction: str, golds: list[str]) -> tuple[float, float, float]:
+    """Exact match, token F1, and whether the normalized gold span appears in the reply."""
     if not golds:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
     em = 0.0
     f1 = 0.0
+    contained = 0.0
     pred_norm = _normalize_answer(prediction)
     for gold in golds:
-        if pred_norm == _normalize_answer(gold):
+        gold_norm = _normalize_answer(gold)
+        if gold_norm and gold_norm == pred_norm:
             em = 1.0
+        if gold_norm and gold_norm in pred_norm:
+            contained = 1.0
         f1 = max(f1, token_f1(prediction, gold))
-    return em, f1
+    return em, f1, contained
 
 
 def _canon_number(raw: str | None) -> str | None:

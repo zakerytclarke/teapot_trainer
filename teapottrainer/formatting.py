@@ -7,6 +7,7 @@ those pairs (one pair per assistant turn). The prompt is the supervised prefix.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 ABSTAIN_TEXT = "The context does not contain the answer."
@@ -50,6 +51,38 @@ def render_message_pairs(messages: list[dict] | None) -> list[tuple[str, str]]:
 
 def messages_format(row: dict) -> list[tuple[str, str]]:
     return render_message_pairs(row.get("messages") or [])
+
+
+def format_apigen_decision(row: dict) -> tuple[str, str]:
+    """Same decision prompt as When2Call, with APIGen's tools and gold call.
+
+    When2Call's training split has almost no positive tool calls. Putting
+    APIGen calls in this prompt gives the model a call example under the
+    prompt used at eval time.
+    """
+    messages = row.get("messages") or []
+    system = ""
+    user = ""
+    answer = ""
+    for message in messages:
+        role = message.get("role")
+        content = (message.get("content") or "").strip()
+        if role == "system" and content and not system:
+            system = content
+        elif role == "user" and content and not user:
+            user = content
+        elif role == "assistant" and content:
+            answer = content
+    tools = ""
+    match = re.search(r"<tools>(.*?)</tools>", system, re.DOTALL)
+    if match:
+        tools = match.group(1).strip()
+    prompt_system = (
+        f"{DECISION_RULES}\n\n"
+        f"You have access to the following tools:\n<tools>{tools}</tools>"
+    )
+    prompt = f"System: {prompt_system}\n\nUser: {user}\n\nAssistant:\n"
+    return prompt, answer
 
 
 def tools_blob(tools: Any) -> str:

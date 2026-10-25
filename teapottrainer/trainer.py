@@ -485,6 +485,8 @@ class TeapotTrainer:
         tokenizer = AutoTokenizer.from_pretrained(self.config.tokenizer, trust_remote_code=True)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
+        # Packing splits long documents. Silence the tokenizer's own length warning.
+        tokenizer.model_max_length = int(1e9)
 
         if init_from:
             print(f"Loading initial weights from {init_from} (method argument, not a config field)")
@@ -531,4 +533,5 @@ class TeapotTrainer:
             json.dump(self.phase_stats, handle, indent=2)
         print(f"Saved final weights to {self.output_dir}")
         self.writer.flush()
+        self.writer.close()
         return self.phase_stats

@@ -14,6 +14,7 @@ from teapottrainer import (
     HOTPOT_VAL,
     ModelConfig,
     SMOLTALK_APIGEN,
+    SMOLTALK_APIGEN_DECISION,
     SMOLTALK_APIGEN_TEST,
     SMOLTALK_CONSTRAINTS,
     SMOLTALK_CONSTRAINTS_TEST,
@@ -58,8 +59,10 @@ def build_config() -> TrainingConfig:
             DatasetSpec(source=SMOLTALK_SYSTEMCHATS, target_tokens=15_000_000, weight=1.0),
             DatasetSpec(source=SMOLTALK_SUMMARIZE, target_tokens=30_000_000, weight=1.0),
             DatasetSpec(source=SMOLTALK_REWRITE, target_tokens=15_000_000, weight=1.0),
-            # Tool use, including a minority of refusals.
-            DatasetSpec(source=SMOLTALK_APIGEN, target_tokens=50_000_000, weight=1.0),
+            # Tool use in APIGen's own prompt, including a minority of refusals.
+            DatasetSpec(source=SMOLTALK_APIGEN, target_tokens=40_000_000, weight=1.0),
+            # The same calls under the decision prompt shared with When2Call.
+            DatasetSpec(source=SMOLTALK_APIGEN_DECISION, target_tokens=20_000_000, weight=1.0),
             # Ask for missing arguments, or refuse when no tool fits.
             # Positive tool calls come from apigen; this split has almost none.
             DatasetSpec(source=WHEN2CALL, target_tokens=30_000_000, weight=1.0),

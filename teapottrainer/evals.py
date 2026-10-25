@@ -218,9 +218,9 @@ def evaluate_source(
     max_new = {
         "tools": 160,
         "when2call": 96,
-        "squad": 48,
-        "hotpot": 32,
-        "gsm8k": 160,
+        "squad": 64,
+        "hotpot": 48,
+        "gsm8k": 256,
         "constraints": 220,
         "sft_loss": 0,
     }.get(kind, 0)
@@ -292,7 +292,7 @@ def evaluate_source(
             metrics["tool_name"] = sum(name_hits) / len(name_hits)
 
     elif kind in {"squad", "hotpot"}:
-        answerable_em, answerable_f1, answerable_abstain = [], [], []
+        answerable_em, answerable_f1, answerable_contains, answerable_abstain = [], [], [], []
         unanswerable_abstain = []
         ems, f1s = [], []
         for (row, prompt, answer), prediction in zip(prepared, predictions):
@@ -304,11 +304,12 @@ def evaluate_source(
             if not golds:
                 unanswerable_abstain.append(1.0 if abstained else 0.0)
             else:
-                em, f1 = best_span_scores(prediction, golds)
+                em, f1, contained = best_span_scores(prediction, golds)
                 ems.append(em)
                 f1s.append(f1)
                 answerable_em.append(em)
                 answerable_f1.append(f1)
+                answerable_contains.append(contained)
                 answerable_abstain.append(1.0 if abstained else 0.0)
             if len(samples) < 3:
                 samples.append({
@@ -321,6 +322,7 @@ def evaluate_source(
             if answerable_f1:
                 metrics["answerable_em"] = sum(answerable_em) / len(answerable_em)
                 metrics["answerable_f1"] = sum(answerable_f1) / len(answerable_f1)
+                metrics["answerable_contains"] = sum(answerable_contains) / len(answerable_contains)
                 metrics["answerable_abstain"] = sum(answerable_abstain) / len(answerable_abstain)
                 metrics["support_answerable"] = float(len(answerable_f1))
             if unanswerable_abstain:
@@ -329,6 +331,7 @@ def evaluate_source(
         elif ems:
             metrics["em"] = sum(ems) / len(ems)
             metrics["f1"] = sum(f1s) / len(f1s)
+            metrics["contains"] = sum(answerable_contains) / len(answerable_contains)
             metrics["support"] = float(len(ems))
 
     elif kind == "gsm8k":
@@ -380,8 +383,10 @@ def selection_score(flat_metrics: dict[str, float]) -> float | None:
         "restraint",
         "decision_accuracy",
         "answerable_f1",
+        "answerable_contains",
         "unanswerable_abstain",
         "f1",
+        "contains",
         "numeric_em",
         "example_pass",
     )

@@ -1,6 +1,6 @@
 """Schema lock plus scorers that do not need a GPU."""
 
-from teapottrainer.config import ModelConfig, TrainingConfig
+from teapottrainer.config import DatasetSpec, ModelConfig, TrainingConfig
 from teapottrainer.datasets import (
     DatasetSourceConfig,
     GSM8K_TEST,
@@ -103,6 +103,27 @@ def test_tool_score_on_exact_call():
     assert leaked["restraint"] == 0.0
 
 
+def test_tool_parser_accepts_pretty_and_fenced_calls():
+    pretty = """<tool_call>[
+{"name": "max_divisor", "arguments": {"N": 48, "M": 18}},
+{"name": "max_divisor", "arguments": {"N": 54, "M": 24}}
+]</tool_call>"""
+    gold = (
+        '<tool_call>[{"name": "max_divisor", "arguments": {"N": 48, "M": 18}}, '
+        '{"name": "max_divisor", "arguments": {"N": 54, "M": 24}}]</tool_call>'
+    )
+    assert score_tool_prediction(pretty, gold)["args"] == 1.0
+    unclosed = pretty.replace("</tool_call>", "")
+    assert score_tool_prediction(unclosed, gold)["name"] == 1.0
+    fenced = """You can call it like this:
+```json
+{"name": "rotateImageAction", "arguments": {"degrees": 90}}
+```"""
+    assert extract_tool_calls(fenced)[0]["name"] == "rotateImageAction"
+    assert classify_decision(fenced) == "tool_call"
+    assert extract_tool_calls("None of the provided functions can be used to clean up the comment.") == []
+
+
 def test_tool_args_ignore_key_order_and_numeric_strings():
     gold = '<tool_call>[{"name": "lookup", "arguments": {"b": 2, "a": 1}}]</tool_call>'
     pred = '<tool_call>[{"name": "lookup", "arguments": {"a": "1", "b": "2"}}]</tool_call>'
@@ -119,7 +140,14 @@ def test_decision_labels():
 
 
 def test_squad_and_gsm_scores():
+    from teapottrainer.metrics import best_span_scores
+
     assert token_f1("in the late 1990s", "late 1990s") > 0.6
+    em, f1, contained = best_span_scores(
+        "Tivoli Gardens opened on 15 August 1843.",
+        ["15 August 1843"],
+    )
+    assert em == 0.0 and contained == 1.0 and f1 > 0.2
     assert is_abstention("The context does not contain the answer.")
     assert not is_abstention("Beyonce started in the late 1990s.")
     assert score_gsm("16 - 3 - 4 = 9\n#### 18", "She makes 18.\n#### 18") == 1.0
@@ -257,6 +285,23 @@ def test_messages_keep_system_and_every_assistant_turn():
     assert pairs[0][1] == "Hello"
     assert "Hello" in pairs[1][0]
     assert pairs[1][1] == "Sure"
+
+
+def test_apigen_decision_prompt_matches_when2call():
+    from datasets import load_dataset
+
+    from teapottrainer.datasets import SMOLTALK_APIGEN_DECISION
+    from teapottrainer.formatting import DECISION_RULES
+
+    row = next(iter(load_dataset("HuggingFaceTB/smoltalk", "apigen-80k", split="test", streaming=True)))
+    pairs = row_pairs(SMOLTALK_APIGEN_DECISION, row)
+    assert len(pairs) == 1
+    prompt, answer = pairs[0]
+    assert DECISION_RULES.split("\n", 1)[0] in prompt
+    assert "<tools>" in prompt
+    assert row["messages"][-1]["content"] == answer
+    if "<tool_call>" in answer:
+        assert score_tool_prediction(answer, answer)["args"] == 1.0
 
 
 def test_apigen_row_roundtrip_if_cached():

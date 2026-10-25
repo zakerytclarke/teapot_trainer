@@ -5,6 +5,7 @@ from-scratch script in train.py stays from-scratch. The run exists to see
 whether tool use, refusal, RAG answer, and RAG abstention move on real rows.
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from teapottrainer import (
     HOTPOT_VAL,
     ModelConfig,
     SMOLTALK_APIGEN,
+    SMOLTALK_APIGEN_DECISION,
     SMOLTALK_APIGEN_TEST,
     SMOLTALK_CONSTRAINTS,
     SMOLTALK_CONSTRAINTS_TEST,
@@ -45,8 +47,9 @@ def main():
         ),
         pretrain_datasets=[],
         sft_datasets=[
-            DatasetSpec(source=SMOLTALK_APIGEN, target_tokens=30_000, weight=1.0),
-            DatasetSpec(source=WHEN2CALL, target_tokens=24_000, weight=1.0),
+            DatasetSpec(source=SMOLTALK_APIGEN, target_tokens=16_000, weight=1.0),
+            DatasetSpec(source=SMOLTALK_APIGEN_DECISION, target_tokens=24_000, weight=1.0),
+            DatasetSpec(source=WHEN2CALL, target_tokens=16_000, weight=1.0),
             DatasetSpec(source=SQUAD_V2, target_tokens=24_000, weight=1.0),
             DatasetSpec(source=HOTPOT, target_tokens=16_000, weight=1.0),
             DatasetSpec(source=SMOLTALK_CONSTRAINTS, target_tokens=16_000, weight=1.0),
@@ -78,6 +81,9 @@ def main():
         init_from="Qwen/Qwen2.5-0.5B-Instruct",
     )
     print(f"metrics: {trainer.output_dir}/metrics.jsonl")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":

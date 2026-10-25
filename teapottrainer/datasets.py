@@ -15,6 +15,7 @@ from datasets import load_dataset
 
 from .formatting import (
     as_pairs,
+    format_apigen_decision,
     format_gsm8k,
     format_hotpot,
     format_squad,
@@ -110,6 +111,13 @@ SMOLTALK_APIGEN = DatasetSourceConfig(
     split="train",
     is_sft=True,
     chat_template_fn=messages_format,
+)
+SMOLTALK_APIGEN_DECISION = DatasetSourceConfig(
+    name="HuggingFaceTB/smoltalk",
+    subset="apigen-80k",
+    split="train",
+    is_sft=True,
+    chat_template_fn=format_apigen_decision,
 )
 SMOLTALK_METAMATH = DatasetSourceConfig(
     name="HuggingFaceTB/smoltalk",
@@ -255,7 +263,13 @@ def iterate_encoded(
         if rows is not None:
             yield from rows
             return
-        for row in open_dataset(src, streaming=True):
+        dataset = open_dataset(src, streaming=True)
+        if not is_eval:
+            # SQuAD v2's first ~2k rows are all answerable, so the buffer has to
+            # reach past them or a short run never sees an abstention.
+            buffer = 4096 if "squad" in (src.name or "") else 512
+            dataset = dataset.shuffle(seed=seed, buffer_size=buffer)
+        for row in dataset:
             yield row
 
     use_holdout = src.split == "train" and holdout_ratio > 0
