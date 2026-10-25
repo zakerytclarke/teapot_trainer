@@ -113,6 +113,8 @@ def build_agent_rows(seed: int = 0) -> tuple[list, list]:
             None,
         ))
         train.append(_tool_row(f"Write a two-line haiku about {city}. Do not use a tool.", None))
+        train.append(_tool_row(f"Don't check the weather in {city}. Just say good morning.", None))
+    train.append(_tool_row("List what you can do in one sentence and do not call a tool.", None))
 
     for city in EVAL_CITIES:
         called = _tool_row(f"What is the weather in {city}?", {"name": "get_weather", "arguments": {"city": city}})
@@ -176,6 +178,12 @@ def build_agent_rows(seed: int = 0) -> tuple[list, list]:
             other = f"{rng.choice(TRAIN_NAMES)} paints maps on Sundays."
             row = _rag_row([fact, other], f"What does {name} keep in the {place}?", fact)
             train.append(row)
+            missing = rng.choice([
+                "What is the capital of France?",
+                "Who wrote Hamlet?",
+                "When was the piano invented?",
+            ])
+            train.append(_rag_row([fact, other], missing, None))
     for name in EVAL_NAMES:
         for item, place in zip(EVAL_ITEMS, EVAL_PLACES):
             fact = f"{name} keeps a {item} in the {place}."

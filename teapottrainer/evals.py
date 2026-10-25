@@ -174,8 +174,15 @@ class TaskEval:
             scores = score_completion(completion, example["expect"])
             for key, value in scores.items():
                 buckets.setdefault(key, []).append(value)
-            if len(samples) < 4:
-                samples.append((prompt[-180:], completion.replace("\n", "\\n")))
+            if len(samples) < 6:
+                user = ""
+                for message in example["messages"]:
+                    if message.get("role") == "user":
+                        user = message["content"]
+                user = user.replace("\n", " ")
+                if len(user) > 160:
+                    user = user[:157] + "..."
+                samples.append((user or prompt[-160:], completion.replace("\n", "\\n")))
         metrics = {key: float(sum(values) / len(values)) for key, values in buckets.items()}
         return EvalOutput(metrics=metrics, samples=samples)
 
