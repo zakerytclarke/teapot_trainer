@@ -90,7 +90,7 @@ def _loss_on_array(model, tokens: np.ndarray, device, seq_len: int, batch: int) 
         block = tokens[start : start + batch * seq_len]
         if len(block) < batch * seq_len:
             break
-        rows = block.reshape(batch, seq_len)
+        rows = np.ascontiguousarray(block.reshape(batch, seq_len))
         x = torch.from_numpy(rows).to(device).long()
         autocast = device.type == "cuda"
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast):
