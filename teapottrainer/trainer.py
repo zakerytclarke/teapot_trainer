@@ -507,20 +507,34 @@ class TeapotTrainer:
             model.config.use_cache = False
             print("Gradient checkpointing enabled.")
 
-        if self.config.compile and hasattr(torch, "compile") and self.device.type == "cuda":
-            print("Compiling model with torch.compile().")
-            model = torch.compile(model)
-
         print(f"Run directory: {self.output_dir}")
         print(f"TensorBoard: {self.writer.log_dir}")
         global_step = 0
         pretrain = list(self.config.pretrain_datasets or [])
         sft = list(self.config.sft_datasets or [])
         if pretrain:
+            # Pretrain sequences are always seq_len, so one compiled graph is stable.
+            # SFT chats are not, and compile then asserts on a later padded width.
+            training_model = model
+            if self.config.compile and hasattr(torch, "compile") and self.device.type == "cuda":
+                print("Compiling model with torch.compile() for fixed-length pretraining.")
+                training_model = torch.compile(model)
             global_step = self._train_phase(
-                "pretrain", pretrain, model, tokenizer, global_step, peak_lr=self.config.lr, task_eval=False
+                "pretrain",
+                pretrain,
+                training_model,
+                tokenizer,
+                global_step,
+                peak_lr=self.config.lr,
+                task_eval=False,
             )
+            model = _unwrap(training_model)
         if sft:
+            if self.config.compile:
+                print(
+                    "SFT stays eager. Variable-length chats crash torch.compile "
+                    "after it specializes on the first padded width."
+                )
             sft_lr = self.config.lr * 0.2 if pretrain else self.config.lr
             if pretrain:
                 print(f"SFT peak lr is 0.2x config.lr ({sft_lr:.3e}) because this run already pretrained.")

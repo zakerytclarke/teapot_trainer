@@ -86,6 +86,8 @@ def build_config() -> TrainingConfig:
         lr=1e-3,
         weight_decay=0.1,
         eval_every_percent=10.0,
+        # Compile covers fixed-length pretraining only. The trainer leaves SFT
+        # eager, because a compiled graph dies when the next chat changes length.
         compile=True,
     )
 

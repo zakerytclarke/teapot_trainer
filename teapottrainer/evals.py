@@ -81,10 +81,19 @@ def _stratified(groups: dict[str, list], n: int, rng: random.Random) -> list:
     return picked
 
 
+# A full run scores the same slice many times. Keep the rows so Hotpot and
+# SQuAD are not reloaded from disk at every checkpoint.
+_ROW_CACHE: dict[tuple, list[dict]] = {}
+
+
 def load_task_rows(src: DatasetSourceConfig, n: int, seed: int, kind: str) -> list[dict]:
     """Load a small, class-balanced slice of an eval split."""
     if kind == "lm" or n <= 0:
         return []
+    key = (src.name, src.subset or "", src.split or "", int(n), int(seed), kind)
+    cached = _ROW_CACHE.get(key)
+    if cached is not None:
+        return cached
     dataset = open_dataset(src, streaming=False)
     rows = list(dataset)
     rng = random.Random(seed)
@@ -92,22 +101,30 @@ def load_task_rows(src: DatasetSourceConfig, n: int, seed: int, kind: str) -> li
         groups = defaultdict(list)
         for row in rows:
             groups[str(row.get("correct_answer"))].append(row)
-        return _stratified(groups, n, rng)
+        picked = _stratified(groups, n, rng)
+        _ROW_CACHE[key] = picked
+        return picked
     if kind == "squad":
         groups = {"answerable": [], "unanswerable": []}
         for row in rows:
             texts = (row.get("answers") or {}).get("text") or []
             groups["answerable" if texts else "unanswerable"].append(row)
-        return _stratified(groups, n, rng)
+        picked = _stratified(groups, n, rng)
+        _ROW_CACHE[key] = picked
+        return picked
     if kind == "tools":
         groups = {"call": [], "refuse": []}
         for row in rows:
             pairs = row_pairs(src, row)
             gold = pairs[-1][1] if pairs else ""
             groups["call" if extract_tool_calls(gold) else "refuse"].append(row)
-        return _stratified(groups, n, rng)
+        picked = _stratified(groups, n, rng)
+        _ROW_CACHE[key] = picked
+        return picked
     rng.shuffle(rows)
-    return rows[:n]
+    picked = rows[:n]
+    _ROW_CACHE[key] = picked
+    return picked
 
 
 def _generate(model, tokenizer, prompts: list[str], max_new: int, seq_len: int, device) -> list[str]:
