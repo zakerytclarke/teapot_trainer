@@ -90,7 +90,7 @@ def _loss_on_array(model, tokens: np.ndarray, device, seq_len: int, batch: int) 
         block = tokens[start : start + batch * seq_len]
         if len(block) < batch * seq_len:
             break
-        rows = np.ascontiguousarray(block.reshape(batch, seq_len))
+        rows = np.array(block.reshape(batch, seq_len), dtype=np.int32, copy=True)
         x = torch.from_numpy(rows).to(device).long()
         autocast = device.type == "cuda"
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast):
@@ -131,12 +131,15 @@ class GenerateEval:
     prompts: list[str]
     name: str = "generate"
     max_new_tokens: int = 32
+    temperature: float = 0.8
 
     def run(self, model, tokenizer, device, seq_len: int) -> EvalOutput:
         samples = []
-        for prompt in self.prompts:
-            text = _generate_one(model, tokenizer, device, prompt, self.max_new_tokens, seq_len)
-            samples.append((prompt, text))
+        texts = _generate_batch(
+            model, tokenizer, device, self.prompts, self.max_new_tokens, seq_len,
+            batch_size=1, temperature=self.temperature,
+        )
+        samples.extend(zip(self.prompts, texts))
         return EvalOutput(samples=samples)
 
 
@@ -177,13 +180,8 @@ class TaskEval:
         return EvalOutput(metrics=metrics, samples=samples)
 
 
-def _generate_one(model, tokenizer, device, prompt: str, max_new: int, seq_len: int) -> str:
-    outs = _generate_batch(model, tokenizer, device, [prompt], max_new, seq_len, batch_size=1)
-    return outs[0]
-
-
 @torch.no_grad()
-def _generate_batch(model, tokenizer, device, prompts, max_new: int, seq_len: int, batch_size: int):
+def _generate_batch(model, tokenizer, device, prompts, max_new: int, seq_len: int, batch_size: int, temperature: float = 0.0):
     model.eval()
     prev_cache = getattr(model.config, "use_cache", False)
     model.config.use_cache = True
@@ -203,14 +201,17 @@ def _generate_batch(model, tokenizer, device, prompts, max_new: int, seq_len: in
                 max_length=max(8, seq_len - max_new),
             )
             encoded = {k: v.to(device) for k, v in encoded.items()}
-            output = model.generate(
-                **encoded,
-                max_new_tokens=max_new,
-                do_sample=False,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-                use_cache=True,
-            )
+            gen_kwargs = {
+                "max_new_tokens": max_new,
+                "pad_token_id": tokenizer.pad_token_id,
+                "eos_token_id": tokenizer.eos_token_id,
+                "use_cache": True,
+            }
+            if temperature and temperature > 0:
+                gen_kwargs.update(do_sample=True, temperature=temperature, top_p=0.9)
+            else:
+                gen_kwargs["do_sample"] = False
+            output = model.generate(**encoded, **gen_kwargs)
             prompt_len = encoded["input_ids"].shape[1]
             for row in output:
                 texts.append(tokenizer.decode(row[prompt_len:], skip_special_tokens=True).strip())

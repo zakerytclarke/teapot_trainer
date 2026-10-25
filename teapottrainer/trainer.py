@@ -12,7 +12,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .config import Stage, TrainConfig
 from .evals import EvalOutput
-from .loss import chunked_cross_entropy, supervised_tokens
+from .loss import chunked_cross_entropy
 from .metrics import MetricLog, format_eval, human
 from .models import build_model, enable_checkpointing, param_count
 
@@ -262,10 +262,10 @@ class TeapotTrainer:
                 for _ in range(cfg.grad_accum):
                     pick = int(rng.choice(len(batchers), p=probs))
                     ids, labels, mask = batchers[pick].take(cfg.micro_batch)
+                    # Count on CPU. A GPU .item() here would sync every microbatch.
+                    micro_sup += int((labels[:, 1:] != -100).sum())
                     batch = self._to_device(ids, labels, mask)
-                    raw, sup = self._forward_backward(model, batch, cfg.grad_accum)
-                    micro_losses.append(raw)
-                    micro_sup += sup
+                    micro_losses.append(self._forward_backward(model, batch, cfg.grad_accum))
             except RuntimeError as exc:
                 if "out of memory" in str(exc).lower():
                     torch.cuda.empty_cache()
@@ -332,23 +332,26 @@ class TeapotTrainer:
         return {"params": n_params, "best": best, "tokens": tokens, "step": step}
 
     def _to_device(self, ids, labels, mask):
-        return {
+        # An all-ones mask disables the flash attention path. Pass one only
+        # when some positions are padding.
+        batch = {
             "input_ids": torch.from_numpy(np.ascontiguousarray(ids)).to(self.device).long(),
             "labels": torch.from_numpy(np.ascontiguousarray(labels)).to(self.device).long(),
-            "attention_mask": torch.from_numpy(np.ascontiguousarray(mask)).to(self.device).long(),
         }
+        if int(mask.min()) == 0:
+            batch["attention_mask"] = torch.from_numpy(np.ascontiguousarray(mask)).to(self.device).long()
+        return batch
 
-    def _forward_backward(self, model, batch, grad_accum: int) -> tuple[float, int]:
+    def _forward_backward(self, model, batch, grad_accum: int) -> float:
         autocast = self.device.type == "cuda"
+        kwargs = {"input_ids": batch["input_ids"], "use_cache": False}
+        if "attention_mask" in batch:
+            kwargs["attention_mask"] = batch["attention_mask"]
         with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=autocast):
-            logits = model(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                use_cache=False,
-            ).logits
+            logits = model(**kwargs).logits
             loss = chunked_cross_entropy(logits, batch["labels"])
         (loss / grad_accum).backward()
-        return float(loss.detach().item()), supervised_tokens(batch["labels"])
+        return float(loss.detach().item())
 
     def _evaluate(
         self, stage, model, tokenizer, seq_len, step, tokens, train_loss,
