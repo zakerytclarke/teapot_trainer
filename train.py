@@ -15,7 +15,7 @@ Full runs, once those metrics look right:
 
     python train.py --pretrain --model 100m --tokens 2000000000
     python train.py --pretrain --model 350m --tokens 20000000000
-    python train.py --sft --init runs/pretrain-100m/checkpoints/best --tokens 50000000
+    python train.py --sft --init runs/pretrain-100m/checkpoints/best --tokens 200000
 
 Pretrain reads ../teapot_foundation/tokenized, or TEAPOT_TOKEN_DIR.
 """
