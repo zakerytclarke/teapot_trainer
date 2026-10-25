@@ -1,10 +1,3 @@
-# TeapotTrainer
+# teapottrainer
 
-A clean, configuration-driven Python library for training Large Language Models.
-
-## Installation
-
-Install the package in editable mode for local development:
-
-```bash
-pip install -e .
+See the repository README for installation, the training script, and the run-folder layout.

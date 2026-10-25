@@ -1,526 +1,508 @@
-import hashlib
+"""Stage trainer: padded or windowed batches, bf16, cosine schedule, HF checkpoints."""
+from __future__ import annotations
+
 import json
-import os
-import sys
-import time
-import torch
 import math
-import random
-from tqdm import tqdm
+import time
+from pathlib import Path
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-torch.set_float32_matmul_precision('high')
+import numpy as np
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from torch.optim import AdamW
-from torch.utils.tensorboard import SummaryWriter
+from .config import Stage, TrainConfig
+from .evals import EvalOutput
+from .loss import chunked_cross_entropy, supervised_tokens
+from .metrics import MetricLog, format_eval, human
+from .models import build_model, enable_checkpointing, param_count
 
-from datasets.utils.logging import disable_progress_bar as disable_ds_progress
-from huggingface_hub.utils import disable_progress_bars as disable_hub_progress
-disable_ds_progress()
-disable_hub_progress()
 
-from datasets import load_dataset
-from transformers import (
-    AutoTokenizer, 
-    LlamaConfig, LlamaForCausalLM,
-    MistralConfig, MistralForCausalLM,
-    GPT2Config, GPT2LMHeadModel,
-    GemmaConfig, GemmaForCausalLM
-)
+def cosine_lr(step: int, total: int, peak: float, warmup: int, min_frac: float) -> float:
+    """Step is the number of optimizer steps already finished."""
+    if total <= 1:
+        return peak
+    warmup = max(0, min(int(warmup), total - 1))
+    if step < warmup:
+        return peak * (step + 1) / max(warmup, 1)
+    progress = (step - warmup) / max(total - warmup, 1)
+    progress = min(max(progress, 0.0), 1.0)
+    cos = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return peak * (min_frac + (1.0 - min_frac) * cos)
 
-from .config import TrainingConfig
-from .datasets import DatasetRegistry, DatasetSourceConfig
+
+def adamw_groups(model: torch.nn.Module, weight_decay: float) -> list[dict]:
+    decay, nodecay = [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        # 2D weights decay, including embeddings. Norms and biases do not.
+        if param.ndim < 2 or "norm" in name:
+            nodecay.append(param)
+        else:
+            decay.append(param)
+    groups = []
+    if decay:
+        groups.append({"params": decay, "weight_decay": weight_decay})
+    if nodecay:
+        groups.append({"params": nodecay, "weight_decay": 0.0})
+    return groups
+
+
+def max_positions(model) -> int:
+    cfg = model.config
+    for attr in ("max_position_embeddings", "n_positions"):
+        value = getattr(cfg, attr, None)
+        if value:
+            return int(value)
+    return 2048
+
+
+def estimate_step_tokens(batchers, micro_batch: int, grad_accum: int) -> int:
+    """Supervised tokens in one optimizer step, used only to size the LR horizon."""
+    per_source = []
+    for batcher in batchers:
+        labels = getattr(batcher, "labels", None)
+        if labels is not None and len(labels):
+            per_row = float((labels[:, 1:] != -100).sum()) / len(labels)
+            per_source.append(per_row * micro_batch)
+        else:
+            seq_len = int(getattr(batcher, "seq_len"))
+            per_source.append((seq_len - 1) * micro_batch)
+    mean = sum(per_source) / max(len(per_source), 1)
+    return max(1, int(mean * grad_accum))
+
+
+def selection_value(metrics: dict[str, float]) -> tuple[float | None, bool]:
+    """Loss is minimized. Any other metric mix is maximized."""
+    loss_keys = [key for key in metrics if key.endswith("loss")]
+    preferred = [key for key in loss_keys if "val" in key]
+    if preferred:
+        return metrics[preferred[0]], False
+    if loss_keys:
+        return metrics[loss_keys[0]], False
+    if metrics:
+        return sum(metrics.values()) / len(metrics), True
+    return None, False
 
 
 class TeapotTrainer:
-    """Advanced Modular Trainer supporting sequential pretrain -> SFT phases, custom loss masking, and full evaluation suites."""
-
-    def __init__(self, config: TrainingConfig):
+    def __init__(self, config: TrainConfig):
         self.config = config
-        self.m_cfg = config.model
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.output_dir = Path(config.output_dir)
+        self.log = MetricLog(self.output_dir)
+        self.ckpt_root = self.output_dir / "checkpoints"
+        self._pending_batcher_state = None
 
-        tokenizer_short = self.config.tokenizer.split("/")[-1]
-        
-        try:
-            safe_dict = self.config.model_dump(exclude_defaults=True, mode='json')
-            run_hash = hashlib.md5(json.dumps(safe_dict, default=str).encode()).hexdigest()[:6]
-        except Exception:
-            run_hash = hashlib.md5(repr(self.config).encode()).hexdigest()[:6]
-        
-        self.output_dir = f"./runs/teapot-{tokenizer_short}-{run_hash}"
-        
-        tb_log_path = self.config.logging_dir or os.path.join(self.output_dir, "runs")
-        self.writer = SummaryWriter(log_dir=tb_log_path)
+    def train(self, resume: str | None = None) -> dict:
+        cfg = self.config
+        self._seed(cfg.seed)
+        if self.device.type == "cuda":
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.set_float32_matmul_precision("high")
 
-        # Canned starting prompts for qualitative generation checks
-        self.canned_seeds = [
-            "The universe is",
-            "Once upon a time",
-            "User: Hello, how can you help me today?\nAssistant:",
-            "Python is a programming language that"
-        ]
-
-    def _build_model(self, vocab_size: int):
-        m_type = self.m_cfg.model_type.lower()
-
-        if m_type == "custom":
-            if not self.m_cfg.custom_config_cls or not self.m_cfg.custom_model_cls:
-                raise ValueError("When model_type='custom', you must provide custom_config_cls and custom_model_cls.")
-            
-            cfg = self.m_cfg.custom_config_cls(
-                vocab_size=vocab_size,
-                hidden_size=self.m_cfg.hidden_size,
-                num_hidden_layers=self.m_cfg.layers,
-                num_attention_heads=self.m_cfg.heads,
-                intermediate_size=self.m_cfg.intermediate,
-                max_position_embeddings=self.m_cfg.seq_len,
-            )
-            return self.m_cfg.custom_model_cls(cfg)
-
-        elif m_type == "llama":
-            cfg = LlamaConfig(
-                vocab_size=vocab_size,
-                hidden_size=self.m_cfg.hidden_size,
-                intermediate_size=self.m_cfg.intermediate,
-                num_hidden_layers=self.m_cfg.layers,
-                num_attention_heads=self.m_cfg.heads,
-                num_key_value_heads=self.m_cfg.kv_heads,
-                max_position_embeddings=self.m_cfg.seq_len,
-                rms_norm_eps=1e-5,
-            )
-            return LlamaForCausalLM(cfg)
-
-        elif m_type == "gpt2":
-            cfg = GPT2Config(
-                vocab_size=vocab_size,
-                n_embd=self.m_cfg.hidden_size,
-                n_layer=self.m_cfg.layers,
-                n_head=self.m_cfg.heads,
-                n_positions=self.m_cfg.seq_len,
-                n_ctx=self.m_cfg.seq_len,
-            )
-            return GPT2LMHeadModel(cfg)
-
-        else:
-            raise ValueError(f"Unsupported model_type: '{m_type}'")
-
-    def _print_model_summary(self, model):
-        """Analyzes and prints detailed parameter breakdowns by component."""
-        total_params = sum(p.numel() for p in model.parameters())
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-        breakdown = {}
-        for name, param in model.named_parameters():
-            num = param.numel()
-            if "embed_tokens" in name or "wte" in name or "word_embeddings" in name:
-                category = "Embeddings"
-            elif "lm_head" in name or "output" in name:
-                category = "LM Head / Output"
-            elif "self_attn" in name or "attn" in name:
-                category = "Self-Attention Blocks"
-            elif "mlp" in name or "feed_forward" in name or "h." in name and "mlp" not in name:
-                category = "Feed-Forward Networks (MLP)"
-            elif "norm" in name or "ln_" in name:
-                category = "Layer Normalizations"
-            else:
-                category = "Other / Miscellaneous"
-            
-            breakdown[category] = breakdown.get(category, 0) + num
-
-        print("\n" + "=" * 78)
-        print(" 🧠 MODEL ARCHITECTURE & PARAMETER BREAKDOWN")
-        print("=" * 78)
-        print(f" • Model Type           : {self.m_cfg.model_type.upper()}")
-        print(f" • Hidden Size (h)      : {self.m_cfg.hidden_size}")
-        print(f" • Hidden Layers (L)    : {self.m_cfg.layers}")
-        print(f" • Attention Heads      : {self.m_cfg.heads} (KV Heads: {self.m_cfg.kv_heads})")
-        print(f" • Intermediate Size    : {self.m_cfg.intermediate}")
-        print(f" • Max Context Window   : {self.m_cfg.seq_len} tokens")
-        print("-" * 78)
-        print(f" | Component Breakdown                      | Parameter Count | % of Total |")
-        print(f" | :---                                     | ---:            | ---:       |")
-        
-        for cat, count in sorted(breakdown.items(), key=lambda x: x[1], reverse=True):
-            pct = (count / total_params) * 100 if total_params > 0 else 0
-            print(f" | {cat:<40} | {count:>13,} | {pct:>9.2f}% |")
-        
-        print("-" * 78)
-        print(f" • **Total Parameters**     : {total_params:,}")
-        print(f" • **Trainable Parameters** : {trainable_params:,}")
-        print("=" * 78 + "\n")
-
-    @staticmethod
-    def _print_oom_guidance(batch_size, seq_len):
-        print("\n" + "═" * 78)
-        print(" 🚨 CUDA OUT OF MEMORY (OOM) ERROR DETECTED")
-        print("═" * 78)
-        print(f"   1. Lower your batch size: currently {batch_size} -> try reducing.")
-        print(f"   2. Shorten your sequence length: currently {seq_len} -> try reducing.")
-        print("   3. Disable model compilation by setting compile=False in your config.")
-        print("═" * 78 + "\n")
-
-    def _save_checkpoint(self, model, tokenizer, phase_name: str, global_step: int):
-        """Saves a model checkpoint snapshot into a dedicated checkpoints subfolder."""
-        checkpoint_dir = os.path.join(self.output_dir, "checkpoints", f"{phase_name}-step-{global_step}")
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        
-        unwrapped = model._orig_mod if hasattr(model, "_orig_mod") else model
-        unwrapped.save_pretrained(checkpoint_dir)
-        tokenizer.save_pretrained(checkpoint_dir)
-        print(f" 💾 [Checkpoint Saved]: {checkpoint_dir}")
-
-    def _generate_qualitative_samples(self, model, tokenizer, phase_name: str, active_sources: list):
-        """Generates qualitative text continuations from canned seeds and live dataset samples."""
-        unwrapped = model._orig_mod if hasattr(model, "_orig_mod") else model
-        unwrapped.eval()
-
-        print("\n" + "─" * 78)
-        print(f" ✍️ QUALITATIVE GENERATION SAMPLES [{phase_name.upper()}]")
-        print("─" * 78)
-
-        # 1. Canned Seed Generations
-        print(" [Canned Seeds Continuation]")
-        for seed in self.canned_seeds:
-            inputs = tokenizer(seed, return_tensors="pt").to(self.device)
-            try:
-                with torch.no_grad():
-                    gen_tokens = unwrapped.generate(
-                        **inputs,
-                        max_new_tokens=40,
-                        do_sample=True,
-                        temperature=0.7,
-                        pad_token_id=tokenizer.eos_token_id
-                    )
-                decoded = tokenizer.decode(gen_tokens[0], skip_special_tokens=True)
-                clean_single_line = decoded.replace("\n", "\\n")
-                if len(clean_single_line) > 120:
-                    clean_single_line = clean_single_line[:117] + "..."
-                print(f"   • Prompt: '{seed}'\n     Gen:    '{clean_single_line}'")
-            except Exception as e:
-                print(f"   • Prompt: '{seed}' -> Error generating: {e}")
-
-        # 2. Live Dataset Row Continuations (First 100 tokens prompt -> completion)
-        print("\n [Live Dataset Continuation Check]")
-        for src in active_sources:
-            try:
-                raw_ds = load_dataset(src.name, src.subset, split="train", streaming=True)
-                sample_item = next(iter(raw_ds))
-                
-                if src.preprocess_fn:
-                    sample_item = src.preprocess_fn(sample_item)
-
-                if src.is_sft and src.chat_template_fn:
-                    prompt_text, answer_text = src.chat_template_fn(sample_item)
-                    full_text = f"User: {prompt_text}\nAssistant: {answer_text}"
-                else:
-                    full_text = sample_item.get(src.text_column, sample_item.get("text", sample_item.get("content", "")))
-
-                if not full_text:
-                    continue
-
-                tokenized_ids = tokenizer.encode(full_text, add_special_tokens=False)
-                prompt_ids = tokenized_ids[:100]
-                prompt_str = tokenizer.decode(prompt_ids, skip_special_tokens=True)
-
-                inputs = tokenizer(prompt_str, return_tensors="pt").to(self.device)
-                with torch.no_grad():
-                    gen_tokens = unwrapped.generate(
-                        **inputs,
-                        max_new_tokens=48,
-                        do_sample=True,
-                        temperature=0.7,
-                        pad_token_id=tokenizer.eos_token_id
-                    )
-                decoded_full = tokenizer.decode(gen_tokens[0], skip_special_tokens=True)
-                clean_continuation = decoded_full.replace("\n", "\\n")
-                if len(clean_continuation) > 130:
-                    clean_continuation = clean_continuation[:127] + "..."
-
-                ds_short = src.name.split("/")[-1]
-                print(f"   • Dataset [{ds_short}]:\n     Cont:   '{clean_continuation}'")
-            except Exception as e:
-                print(f"   • Dataset [{src.name}] -> Skip sample check: {e}")
-
-        print("─" * 78 + "\n")
-        unwrapped.train()
-
-    def run_evaluation_suite(self, model, tokenizer, phase_name: str = "eval", global_step: int = 0, active_sources: list = None):
-        unwrapped = model._orig_mod if hasattr(model, "_orig_mod") else model
-        unwrapped.eval()
-        
-        print("\n" + "=" * 78)
-        print(f" 📊 EVALUATION SUITE [{phase_name.upper()}] (Global Step: {global_step})")
-        print("=" * 78)
-
-        eval_configs = []
-        for ds_spec in self.config.eval_datasets:
-            source_obj = ds_spec.source
-            if isinstance(source_obj, str):
-                eval_configs.append(DatasetSourceConfig(name=source_obj, split="test", is_sft=False))
-            else:
-                eval_configs.append(DatasetSourceConfig(
-                    name=source_obj.name,
-                    subset=source_obj.subset,
-                    split="test",
-                    is_sft=source_obj.is_sft,
-                    chat_template_fn=source_obj.chat_template_fn,
-                    preprocess_fn=source_obj.preprocess_fn
-                ))
-
-        if not eval_configs:
-            print(" [Eval Info] No evaluation datasets specified. Skipping evaluation suite.")
-            print("=" * 78 + "\n")
-            unwrapped.train()
-            return 0.0, 0.0, 0.0
-
-        eval_streams = DatasetRegistry.prepare_dataset_splits(
-            eval_configs, tokenizer, self.m_cfg.seq_len, is_eval=True, holdout_ratio=self.config.holdout_ratio
+        tokenizer = AutoTokenizer.from_pretrained(
+            cfg.tokenizer,
+            trust_remote_code=cfg.trust_remote_code,
+            local_files_only=cfg.local_files_only,
         )
-
-        dataset_metrics = []
-        all_losses = []
-        all_ems = []
-
-        with torch.no_grad():
-            for cfg, stream in zip(eval_configs, eval_streams):
-                ds_name_short = cfg.name.split("/")[-1]
-                ds_loss_sum = 0.0
-                ds_batches = 0
-                ds_ems = 0
-                ds_samples = 0
-
-                for batch_idx, sample in enumerate(stream):
-                    if batch_idx > 30:
-                        break
-                    
-                    input_ids = torch.tensor([sample["input_ids"]], dtype=torch.long).to(self.device)
-                    labels = torch.tensor([sample["labels"]], dtype=torch.long).to(self.device)
-
-                    outputs = unwrapped(input_ids=input_ids, labels=labels)
-                    loss = outputs.loss
-                    if not torch.isnan(loss):
-                        ds_loss_sum += loss.item()
-                        ds_batches += 1
-
-                    if sample.get("is_sft", False):
-                        try:
-                            gen_out = unwrapped.generate(
-                                input_ids=input_ids[:, :32],
-                                max_new_tokens=24,
-                                pad_token_id=tokenizer.eos_token_id
-                            )
-                            decoded_pred = tokenizer.decode(gen_out[0], skip_special_tokens=True)
-                            decoded_target = tokenizer.decode(input_ids[0], skip_special_tokens=True)
-                            
-                            if decoded_target.strip() in decoded_pred.strip():
-                                ds_ems += 1
-                        except Exception:
-                            pass
-                        ds_samples += 1
-
-                ds_avg_loss = ds_loss_sum / max(1, ds_batches)
-                ds_perplexity = math.exp(min(ds_avg_loss, 20.0))
-                ds_em_score = (ds_ems / max(1, ds_samples)) * 100.0 if ds_samples > 0 else 0.0
-
-                dataset_metrics.append({
-                    "dataset": ds_name_short,
-                    "loss": ds_avg_loss,
-                    "perplexity": ds_perplexity,
-                    "em": ds_em_score,
-                    "has_em": ds_samples > 0
-                })
-
-                all_losses.append(ds_avg_loss)
-                if ds_samples > 0:
-                    all_ems.append(ds_em_score)
-
-                self.writer.add_scalar(f"eval_{phase_name}/{ds_name_short}/loss", ds_avg_loss, global_step)
-                self.writer.add_scalar(f"eval_{phase_name}/{ds_name_short}/perplexity", ds_perplexity, global_step)
-                if ds_samples > 0:
-                    self.writer.add_scalar(f"eval_{phase_name}/{ds_name_short}/exact_match", ds_em_score, global_step)
-
-        overall_loss = sum(all_losses) / max(1, len(all_losses))
-        overall_perplexity = math.exp(min(overall_loss, 20.0))
-        overall_em = sum(all_ems) / max(1, len(all_ems)) if all_ems else 0.0
-
-        print("\n| Dataset | Loss | Perplexity | EM Score |")
-        print("| :--- | :---: | :---: | :---: |")
-        for m in dataset_metrics:
-            em_str = f"{m['em']:.2f}%" if m["has_em"] else "N/A"
-            print(f"| `{m['dataset']}` | {m['loss']:.4f} | {m['perplexity']:.2f} | {em_str} |")
-        print(f"| **[AGGREGATE]** | **{overall_loss:.4f}** | **{overall_perplexity:.2f}** | **{overall_em:.2f}%** |")
-        print("=" * 78 + "\n")
-
-        self.writer.add_scalar(f"eval_{phase_name}/loss", overall_loss, global_step)
-        self.writer.add_scalar(f"eval_{phase_name}/perplexity", overall_perplexity, global_step)
-        self.writer.add_scalar(f"eval_{phase_name}/exact_match", overall_em, global_step)
-
-        # Trigger qualitative sample generation and checkpoint saving
-        if active_sources:
-            self._generate_qualitative_samples(model, tokenizer, phase_name, active_sources)
-        
-        self._save_checkpoint(model, tokenizer, phase_name, global_step)
-
-        unwrapped.train()
-        return overall_loss, overall_perplexity, overall_em
-
-    def _train_phase(self, phase_name: str, dataset_specs, model, tokenizer, optimizer, starting_step: int):
-        if not dataset_specs:
-            return starting_step
-
-        phase_sources = []
-        for ds_spec in dataset_specs:
-            source_obj = ds_spec.source
-            if isinstance(source_obj, str):
-                base_cfg = DatasetSourceConfig(name=source_obj)
-            else:
-                base_cfg = DatasetSourceConfig(
-                    name=source_obj.name,
-                    subset=source_obj.subset,
-                    split=source_obj.split,
-                    is_sft=source_obj.is_sft,
-                    text_column=source_obj.text_column,
-                    preprocess_fn=source_obj.preprocess_fn,
-                    chat_template_fn=source_obj.chat_template_fn
-                )
-            base_cfg.target_tokens = ds_spec.target_tokens
-            base_cfg.weight = ds_spec.weight
-            phase_sources.append(base_cfg)
-
-        total_target_tokens = sum(s.target_tokens for s in phase_sources)
-        streams = DatasetRegistry.prepare_dataset_splits(
-            phase_sources, tokenizer, self.m_cfg.seq_len, is_eval=False, holdout_ratio=self.config.holdout_ratio
-        )
-        stream_weights = [s.weight for s in phase_sources]
-
-        model.train()
-        tokens_processed = 0
-        step = 0
-        global_step = starting_step
-        start_time = time.time()
-        next_eval_percent = self.config.eval_every_percent
-        iters = [iter(s) for s in streams]
-
-        pbar = tqdm(
-            total=total_target_tokens, 
-            desc=f"[{phase_name.upper()}]", 
-            unit="tok", 
-            unit_scale=True, 
-            dynamic_ncols=True
-        )
-
-        try:
-            while tokens_processed < total_target_tokens:
-                chosen_stream_idx = random.choices(range(len(iters)), weights=stream_weights, k=1)[0]
-                
-                try:
-                    sample = next(iters[chosen_stream_idx])
-                except StopIteration:
-                    streams[chosen_stream_idx] = iter(DatasetRegistry.prepare_dataset_splits(
-                        [phase_sources[chosen_stream_idx]], tokenizer, self.m_cfg.seq_len, is_eval=False, holdout_ratio=self.config.holdout_ratio
-                    )[0])
-                    iters[chosen_stream_idx] = iter(streams[chosen_stream_idx])
-                    sample = next(iters[chosen_stream_idx])
-
-                input_ids = torch.tensor(sample["input_ids"], dtype=torch.long).unsqueeze(0).to(self.device)
-                labels = torch.tensor(sample["labels"], dtype=torch.long).unsqueeze(0).to(self.device)
-
-                try:
-                    outputs = model(input_ids=input_ids, labels=labels)
-                    loss = outputs.loss / self.config.grad_accum
-                    loss.backward()
-                except RuntimeError as e:
-                    pbar.close()
-                    if "out of memory" in str(e).lower():
-                        torch.cuda.empty_cache()
-                        self._print_oom_guidance(self.config.batch_size, self.m_cfg.seq_len)
-                        sys.exit(1)
-                    else:
-                        raise e
-
-                batch_tokens = input_ids.numel()
-                tokens_processed += batch_tokens
-                pbar.update(batch_tokens)
-
-                if (step + 1) % self.config.grad_accum == 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
-                    optimizer.zero_grad()
-                    global_step += 1
-
-                    elapsed = time.time() - start_time
-                    tok_sec = tokens_processed / elapsed if elapsed > 0 else 0
-                    progress_pct = (tokens_processed / total_target_tokens) * 100
-                    current_loss = outputs.loss.item()
-
-                    self.writer.add_scalar(f"train_{phase_name}/loss", current_loss, global_step)
-                    self.writer.add_scalar(f"train_{phase_name}/tokens_per_sec", tok_sec, global_step)
-
-                    pbar.set_postfix(loss=f"{current_loss:.4f}", speed=f"{int(tok_sec)}tok/s")
-
-                    if progress_pct >= next_eval_percent and progress_pct < 100:
-                        pbar.write(f"\n[Triggering Milestone Evaluation, Generation & Checkpoint at {progress_pct:.1f}%]")
-                        self.run_evaluation_suite(model, tokenizer, phase_name=f"{phase_name}_mid_{int(progress_pct)}pct", global_step=global_step, active_sources=phase_sources)
-                        next_eval_percent += self.config.eval_every_percent
-
-                step += 1
-
-        finally:
-            pbar.close()
-
-        print(f"\n✔ Completed {phase_name.upper()} Phase! Running end-of-phase evaluation & checkpointing...")
-        self.run_evaluation_suite(model, tokenizer, phase_name=f"{phase_name}_end", global_step=global_step, active_sources=phase_sources)
-        
-        return global_step
-
-    def train(self, fresh: bool = True):
-        print(f"Loading tokenizer: {self.config.tokenizer}...")
-        tokenizer = AutoTokenizer.from_pretrained(self.config.tokenizer, trust_remote_code=True)
-        if tokenizer.pad_token is None:
+        if tokenizer.pad_token_id is None:
             tokenizer.pad_token = tokenizer.eos_token
 
-        model = self._build_model(vocab_size=len(tokenizer)).to(self.device)
-
-        self._print_model_summary(model)
-
-        if self.config.compile and hasattr(torch, "compile"):
-            print("Compiling model with torch.compile() for high-speed training...")
-            model = torch.compile(model)
-
-        optimizer = AdamW(model.parameters(), lr=self.config.lr, weight_decay=self.config.weight_decay)
-
-        print(f"TEAPOT | SEQUENTIAL PIPELINE INITIALIZED")
-        print(f"TensorBoard Logs: {self.writer.log_dir}")
-        print(f"💡 [TENSORBOARD]: Run: tensorboard --logdir runs/\n")
-
-        global_step = 0
-
-        if self.config.pretrain_datasets:
-            global_step = self._train_phase(
-                phase_name="pretrain",
-                dataset_specs=self.config.pretrain_datasets,
-                model=model,
-                tokenizer=tokenizer,
-                optimizer=optimizer,
-                starting_step=global_step
+        if cfg.init_from:
+            print(f"loading init weights: {cfg.init_from}", flush=True)
+            model = AutoModelForCausalLM.from_pretrained(
+                cfg.init_from,
+                torch_dtype=torch.float32,
+                trust_remote_code=cfg.trust_remote_code,
+                local_files_only=cfg.local_files_only,
             )
+        else:
+            model = build_model(cfg.model, len(tokenizer))
+        model.to(self.device)
+        if getattr(model.config, "use_cache", None) is not None:
+            model.config.use_cache = False
+        model.train()
+        if cfg.gradient_checkpointing and self.device.type == "cuda":
+            ok = enable_checkpointing(model)
+            print(f"gradient checkpointing: {'on' if ok else 'unsupported'}", flush=True)
 
-        if self.config.sft_datasets:
-            global_step = self._train_phase(
-                phase_name="sft",
-                dataset_specs=self.config.sft_datasets,
-                model=model,
-                tokenizer=tokenizer,
-                optimizer=optimizer,
-                starting_step=global_step
+        n_params = param_count(model)
+        print(
+            f"model: {n_params / 1e6:.2f}M params  device={self.device}  vocab={len(tokenizer)}",
+            flush=True,
+        )
+        opt = torch.optim.AdamW(
+            adamw_groups(model, cfg.weight_decay),
+            lr=cfg.lr,
+            betas=(cfg.beta1, cfg.beta2),
+        )
+        self.log.write_config({**cfg.public_dict(), "params": n_params, "vocab": len(tokenizer)})
+
+        state = {
+            "step": 0,
+            "stage_step": 0,
+            "stage_index": 0,
+            "stage_tokens": 0,
+            "best": None,
+            "best_higher": False,
+            "patience": 0,
+            "elapsed_s": 0.0,
+            "np_rng": None,
+        }
+        if resume:
+            state = self._load_resume(model, opt, resume, state)
+
+        summary = {"params": n_params, "best": None}
+        for index in range(state["stage_index"], len(cfg.stages)):
+            summary = self._run_stage(index, cfg.stages[index], model, tokenizer, opt, state, n_params)
+            if index < len(cfg.stages) - 1:
+                state["stage_index"] = index + 1
+                state["stage_tokens"] = 0
+                state["stage_step"] = 0
+                state["patience"] = 0
+                state["np_rng"] = None
+                self._pending_batcher_state = None
+        print(
+            f"done. last checkpoint: {self.ckpt_root / 'last'}\n"
+            f"best checkpoint: {self.ckpt_root / 'best'}\n"
+            f"metrics: {self.log.report_path}",
+            flush=True,
+        )
+        return summary
+
+    def _seed(self, seed: int) -> None:
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+    def _run_stage(self, index: int, stage: Stage, model, tokenizer, opt, state: dict, n_params: int) -> dict:
+        cfg = self.config
+        seq_len = stage.seq_len or cfg.seq_len or max_positions(model)
+        limit = max_positions(model)
+        if seq_len > limit:
+            raise ValueError(f"seq_len {seq_len} exceeds model max positions {limit}")
+        peak_lr = cfg.lr if stage.lr is None else stage.lr
+        warmup = cfg.warmup_steps if stage.warmup_steps is None else stage.warmup_steps
+
+        weights = [float(getattr(src, "weight", 1.0)) for src in stage.sources]
+        if any(weight <= 0 for weight in weights):
+            raise ValueError(f"stage {stage.name}: weights must be positive")
+        probs = np.asarray(weights, dtype=np.float64)
+        probs /= probs.sum()
+
+        resuming = self._pending_batcher_state is not None and int(state["stage_index"]) == index
+        batchers = []
+        for src_i, src in enumerate(stage.sources):
+            batcher = src.build(tokenizer, seq_len, stage.target_tokens, seed=cfg.seed + src_i)
+            batchers.append(batcher)
+            extra = ""
+            dropped = getattr(batcher, "dropped", 0)
+            if dropped:
+                extra = f"  (dropped {dropped} overlong)"
+            print(f"  data  {batcher.describe()}{extra}", flush=True)
+        if resuming:
+            for batcher, saved in zip(batchers, self._pending_batcher_state):
+                batcher.load_state_dict(saved)
+            self._pending_batcher_state = None
+
+        rng = np.random.default_rng(cfg.seed + 1000 + index)
+        if resuming and state.get("np_rng") is not None:
+            rng.bit_generator.state = state["np_rng"]
+
+        step_tokens = estimate_step_tokens(batchers, cfg.micro_batch, cfg.grad_accum)
+        horizon = max(1, math.ceil(stage.target_tokens / step_tokens))
+        print(
+            f"\nstage {stage.name}: target {human(stage.target_tokens)} supervised tokens  "
+            f"seq={seq_len}  micro={cfg.micro_batch}  accum={cfg.grad_accum}  "
+            f"~{human(step_tokens)} tok/step  ~{horizon} steps  lr={peak_lr:.3e}",
+            flush=True,
+        )
+
+        tokens = int(state["stage_tokens"]) if int(state["stage_index"]) == index else 0
+        stage_step = int(state["stage_step"]) if int(state["stage_index"]) == index else 0
+        step = int(state["step"])
+        best = state["best"]
+        best_higher = bool(state["best_higher"])
+        patience = int(state["patience"]) if int(state["stage_index"]) == index else 0
+        elapsed = float(state["elapsed_s"])
+        window_loss = 0.0
+        window_tokens = 0
+        ema = None
+        every = cfg.eval_every_tokens or max(stage.target_tokens // 5, 1)
+        next_eval = 0 if (cfg.eval_at_start and tokens == 0) else tokens + every
+        last_eval_tokens = -1
+
+        while tokens < stage.target_tokens:
+            if tokens >= next_eval:
+                train_loss = None if window_tokens == 0 else window_loss / window_tokens
+                lr_now = cosine_lr(stage_step, horizon, peak_lr, warmup, cfg.min_lr_frac)
+                best, best_higher, patience, stop = self._evaluate(
+                    stage, model, tokenizer, seq_len, step, tokens, train_loss,
+                    ema, lr_now, elapsed, best, best_higher, patience, n_params,
+                    opt, batchers, rng, index, stage_step,
+                )
+                window_loss = 0.0
+                window_tokens = 0
+                last_eval_tokens = tokens
+                next_eval = tokens + every
+                if stop:
+                    break
+
+            lr = cosine_lr(stage_step, horizon, peak_lr, warmup, cfg.min_lr_frac)
+            for group in opt.param_groups:
+                group["lr"] = lr
+
+            opt.zero_grad(set_to_none=True)
+            micro_losses = []
+            micro_sup = 0
+            started = time.time()
+            try:
+                for _ in range(cfg.grad_accum):
+                    pick = int(rng.choice(len(batchers), p=probs))
+                    ids, labels, mask = batchers[pick].take(cfg.micro_batch)
+                    batch = self._to_device(ids, labels, mask)
+                    raw, sup = self._forward_backward(model, batch, cfg.grad_accum)
+                    micro_losses.append(raw)
+                    micro_sup += sup
+            except RuntimeError as exc:
+                if "out of memory" in str(exc).lower():
+                    torch.cuda.empty_cache()
+                    raise SystemExit(
+                        "CUDA out of memory. Lower micro_batch or seq_len. "
+                        f"Resume with --resume {self.ckpt_root / 'last'}"
+                    ) from exc
+                raise
+            if micro_sup <= 0:
+                raise SystemExit("a step had no supervised tokens; check labels and seq_len")
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
+            opt.step()
+            dt = max(time.time() - started, 1e-6)
+            mean_loss = sum(micro_losses) / len(micro_losses)
+            if not math.isfinite(mean_loss):
+                raise SystemExit(f"non-finite loss at step {step + 1}: {mean_loss}")
+
+            tok_s = micro_sup / dt
+            ema = tok_s if ema is None else 0.9 * ema + 0.1 * tok_s
+            tokens += micro_sup
+            step += 1
+            stage_step += 1
+            elapsed += dt
+            window_loss += mean_loss * micro_sup
+            window_tokens += micro_sup
+            self.log.append_step(
+                {
+                    "stage": stage.name,
+                    "step": step,
+                    "tokens": tokens,
+                    "loss": mean_loss,
+                    "lr": lr,
+                    "tok_s": tok_s,
+                }
             )
+            if cfg.log_every and stage_step % cfg.log_every == 0:
+                print(
+                    f"[{stage.name}] step {stage_step}/{horizon}  "
+                    f"tokens {human(tokens)}/{human(stage.target_tokens)}  "
+                    f"loss {mean_loss:.4f}  {ema:,.0f} tok/s  lr {lr:.2e}",
+                    flush=True,
+                )
 
-        print("\nAll training phases complete! Running final comprehensive evaluation & checkpointing...")
-        self.run_evaluation_suite(model, tokenizer, phase_name="final", global_step=global_step, active_sources=self.config.sft_datasets or self.config.pretrain_datasets)
+        if last_eval_tokens != tokens:
+            train_loss = None if window_tokens == 0 else window_loss / window_tokens
+            lr_now = cosine_lr(stage_step, horizon, peak_lr, warmup, cfg.min_lr_frac)
+            best, best_higher, patience, _stop = self._evaluate(
+                stage, model, tokenizer, seq_len, step, tokens, train_loss,
+                ema, lr_now, elapsed, best, best_higher, patience, n_params,
+                opt, batchers, rng, index, stage_step, final=True,
+            )
+        state.update(
+            step=step,
+            stage_step=stage_step,
+            stage_index=index,
+            stage_tokens=tokens,
+            best=best,
+            best_higher=best_higher,
+            patience=patience,
+            elapsed_s=elapsed,
+            np_rng=rng.bit_generator.state,
+        )
+        return {"params": n_params, "best": best, "tokens": tokens, "step": step}
 
-        os.makedirs(self.output_dir, exist_ok=True)
-        unwrapped = model._orig_mod if hasattr(model, "_orig_mod") else model
-        unwrapped.save_pretrained(self.output_dir)
-        tokenizer.save_pretrained(self.output_dir)
-        print(f"Model successfully saved to final output directory: {self.output_dir}!")
+    def _to_device(self, ids, labels, mask):
+        return {
+            "input_ids": torch.from_numpy(np.ascontiguousarray(ids)).to(self.device).long(),
+            "labels": torch.from_numpy(np.ascontiguousarray(labels)).to(self.device).long(),
+            "attention_mask": torch.from_numpy(np.ascontiguousarray(mask)).to(self.device).long(),
+        }
+
+    def _forward_backward(self, model, batch, grad_accum: int) -> tuple[float, int]:
+        autocast = self.device.type == "cuda"
+        with torch.autocast(device_type=self.device.type, dtype=torch.bfloat16, enabled=autocast):
+            logits = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                use_cache=False,
+            ).logits
+            loss = chunked_cross_entropy(logits, batch["labels"])
+        (loss / grad_accum).backward()
+        return float(loss.detach().item()), supervised_tokens(batch["labels"])
+
+    def _evaluate(
+        self, stage, model, tokenizer, seq_len, step, tokens, train_loss,
+        tok_s, lr, elapsed, best, best_higher, patience, n_params,
+        opt, batchers, rng, stage_index, stage_step, final: bool = False,
+    ):
+        metrics: dict[str, float] = {}
+        samples: list[tuple[str, str]] = []
+        was_training = model.training
+        was_ckpt = bool(getattr(model, "is_gradient_checkpointing", False))
+        if was_ckpt and hasattr(model, "gradient_checkpointing_disable"):
+            model.gradient_checkpointing_disable()
+        try:
+            for ev in stage.evals:
+                output: EvalOutput = ev.run(model, tokenizer, self.device, seq_len)
+                metrics.update(output.metrics)
+                samples.extend(output.samples)
+        finally:
+            if was_ckpt:
+                enable_checkpointing(model)
+            if was_training:
+                model.train()
+            if getattr(model.config, "use_cache", None) is not None:
+                model.config.use_cache = False
+        text = format_eval(
+            stage=stage.name + (" final" if final else ""),
+            step=step,
+            tokens=tokens,
+            target=stage.target_tokens,
+            train_loss=train_loss,
+            metrics=metrics,
+            samples=samples,
+            tok_s=tok_s,
+            lr=lr,
+            elapsed_s=elapsed,
+        )
+        print(text, flush=True)
+        self.log.append_eval(
+            {
+                "stage": stage.name,
+                "step": step,
+                "tokens": tokens,
+                "train_loss": train_loss,
+                "lr": lr,
+                "tok_s": tok_s,
+                "metrics": metrics,
+                "final": final,
+            },
+            text,
+        )
+
+        value, higher = selection_value(metrics)
+        improved = False
+        if value is not None:
+            if best is None:
+                improved = True
+            elif higher and value > best + 1e-4:
+                improved = True
+            elif (not higher) and value < best - 1e-4:
+                improved = True
+        if improved:
+            best = value
+            best_higher = higher
+            patience = 0
+            self._save_hf(
+                model,
+                tokenizer,
+                self.ckpt_root / "best",
+                {
+                    "stage": stage.name,
+                    "step": step,
+                    "tokens": tokens,
+                    "metric": value,
+                    "higher_is_better": higher,
+                    "metrics": metrics,
+                    "params": n_params,
+                },
+            )
+            print(f"  saved best ({value:.4f}) -> {self.ckpt_root / 'best'}", flush=True)
+        elif value is not None:
+            patience += 1
+
+        self._save_hf(
+            model,
+            tokenizer,
+            self.ckpt_root / "last",
+            {"stage": stage.name, "step": step, "tokens": tokens, "metrics": metrics, "params": n_params},
+        )
+        self._save_resume(
+            model, opt, self.ckpt_root / "last" / "resume.pt",
+            step, stage_step, stage_index, tokens, best, best_higher, patience, elapsed, batchers, rng,
+        )
+        stop = self.config.patience_evals > 0 and patience >= self.config.patience_evals and tokens > 0
+        if stop:
+            print(f"early stop: {patience} evals without improvement on {stage.name}", flush=True)
+        return best, best_higher, patience, stop
+
+    def _save_hf(self, model, tokenizer, path: Path, extra: dict) -> None:
+        path.mkdir(parents=True, exist_ok=True)
+        state = {
+            key: value.detach().to(dtype=torch.bfloat16).cpu()
+            for key, value in model.state_dict().items()
+        }
+        model.save_pretrained(path, state_dict=state, safe_serialization=True)
+        tokenizer.save_pretrained(path)
+        (path / "extra.json").write_text(json.dumps(extra, indent=2) + "\n", encoding="utf-8")
+
+    def _save_resume(
+        self, model, opt, path, step, stage_step, stage_index, tokens,
+        best, best_higher, patience, elapsed, batchers, rng,
+    ) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        blob = {
+            "model": {key: value.detach().cpu() for key, value in model.state_dict().items()},
+            "opt": opt.state_dict(),
+            "step": step,
+            "stage_step": stage_step,
+            "stage_index": stage_index,
+            "stage_tokens": tokens,
+            "best": best,
+            "best_higher": best_higher,
+            "patience": patience,
+            "elapsed_s": elapsed,
+            "batchers": [batcher.state_dict() for batcher in batchers],
+            "np_rng": rng.bit_generator.state,
+            "torch_rng": torch.get_rng_state(),
+        }
+        tmp = path.with_suffix(".tmp")
+        torch.save(blob, tmp)
+        tmp.replace(path)
+
+    def _load_resume(self, model, opt, resume: str, state: dict) -> dict:
+        path = Path(resume)
+        if path.is_dir():
+            path = path / "resume.pt"
+        blob = torch.load(path, map_location="cpu", weights_only=False)
+        model.load_state_dict(blob["model"])
+        opt.load_state_dict(blob["opt"])
+        torch.set_rng_state(blob["torch_rng"])
+        state.update(
+            step=int(blob["step"]),
+            stage_step=int(blob.get("stage_step", blob["step"])),
+            stage_index=int(blob["stage_index"]),
+            stage_tokens=int(blob["stage_tokens"]),
+            best=blob["best"],
+            best_higher=bool(blob["best_higher"]),
+            patience=int(blob["patience"]),
+            elapsed_s=float(blob["elapsed_s"]),
+            np_rng=blob.get("np_rng"),
+        )
+        self._pending_batcher_state = blob.get("batchers")
+        print(
+            f"resumed {path}: step={state['step']} stage={state['stage_index']} "
+            f"tokens={state['stage_tokens']}",
+            flush=True,
+        )
+        return state
