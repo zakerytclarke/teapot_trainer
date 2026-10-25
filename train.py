@@ -342,7 +342,7 @@ def main():
             output=output,
             rows=rows,
             evals=evals,
-            seq_len=192,
+            seq_len=256,
             micro=8,
             accum=2 if short else 4,
         )
