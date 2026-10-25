@@ -62,7 +62,7 @@ python train.py --confidence-sft        # short SFT of Qwen2.5-0.5B-Instruct on 
 
 python train.py --pretrain --model 100m --tokens 2000000000
 python train.py --pretrain --model 350m --tokens 20000000000
-python train.py --sft --init runs/pretrain-100m/checkpoints/best --tokens 50000000
+python train.py --sft --init runs/pretrain-100m/checkpoints/best --tokens 200000
 ```
 
 Pretrain expects `../teapot_foundation/tokenized` (`train.bin`, `val.bin`, `test.bin`, `tokenizer/`) or `TEAPOT_TOKEN_DIR`. Resume a stopped run with `--resume runs/<name>/checkpoints/last`.

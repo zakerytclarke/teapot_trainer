@@ -337,7 +337,9 @@ def main():
     else:
         rows, evals = build_agent_rows()
         short = args.confidence_sft
-        tokens = args.tokens or (80_000 if short else 5_000_000)
+        # The built-in mix is a few hundred synthetic rows. Millions of tokens
+        # on it only memorizes them. Swap in real tool/RAG sources before a long SFT.
+        tokens = args.tokens or (80_000 if short else 200_000)
         output = args.output or ("runs/confidence-sft" if short else "runs/sft-agent")
         out = Path(output)
         out.mkdir(parents=True, exist_ok=True)
