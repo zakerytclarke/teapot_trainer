@@ -85,6 +85,7 @@ def build_config() -> TrainingConfig:
             DatasetSpec(source=TEAPOT_CHAT, target_tokens=200_000),
         ],
         tokenizer="gpt2",
+        init_from=str(INIT_FROM),
         batch_size=8,
         grad_accum=16,
         lr=5e-5,
@@ -100,7 +101,7 @@ def main():
     config = build_config()
     trainer = TeapotTrainer(config=config)
     trainer.eval_example_cap = 32
-    trainer.train(fresh=True, init_from=str(INIT_FROM))
+    trainer.train(fresh=True)
 
 
 if __name__ == "__main__":

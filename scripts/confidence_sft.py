@@ -1,8 +1,8 @@
 """Short SFT on a real mix, starting from Qwen2.5-0.5B-Instruct.
 
-This does not change TrainingConfig. init_from is a train() argument so the
-from-scratch script in train.py stays from-scratch. The run exists to see
-whether tool use, refusal, RAG answer, and RAG abstention move on real rows.
+init_from can be set on TrainingConfig or passed to train(). The weights
+must match the ModelConfig. This run exists to see whether tool use, refusal,
+RAG answer, and RAG abstention move on real rows.
 """
 
 import os

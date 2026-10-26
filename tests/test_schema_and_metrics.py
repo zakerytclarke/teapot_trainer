@@ -28,6 +28,7 @@ LOCKED_TRAINING_FIELDS = {
     "sft_datasets",
     "eval_datasets",
     "tokenizer",
+    "init_from",
     "batch_size",
     "grad_accum",
     "lr",
@@ -76,6 +77,8 @@ def test_train_script_uses_the_same_constructor():
     assert config.model.layers == 26
     assert config.model.hidden_size == 512
     assert config.tokenizer == "gpt2"
+    assert config.init_from.endswith("runs/teapot-gpt2-770ea2/checkpoints/best")
+    assert TrainingConfig().init_from is None
     assert config.pretrain_datasets == []
     assert config.lr == 5e-5
     names = []
@@ -398,6 +401,46 @@ def test_renamed_tool_call_matches_the_prompt():
     assert called and prompted
     assert called[0]["name"] == prompted[0]["name"]
     assert called[0]["arguments"]["origin"] == "Boston"
+
+
+def test_init_weights_must_match_the_model_config():
+    from types import SimpleNamespace
+
+    from teapottrainer.trainer import architecture_mismatches
+
+    wanted = ModelConfig(
+        model_type="llama",
+        hidden_size=512,
+        num_hidden_layers=26,
+        num_attention_heads=8,
+        num_key_value_heads=8,
+        intermediate_size=1408,
+        max_position_embeddings=2048,
+    )
+    same = SimpleNamespace(
+        hidden_size=512,
+        num_hidden_layers=26,
+        num_attention_heads=8,
+        num_key_value_heads=8,
+        intermediate_size=1408,
+        max_position_embeddings=2048,
+    )
+    longer_context = SimpleNamespace(**{**same.__dict__, "max_position_embeddings": 4096})
+    wrong_width = SimpleNamespace(**{**same.__dict__, "hidden_size": 768})
+    too_short = SimpleNamespace(**{**same.__dict__, "max_position_embeddings": 1024})
+    assert architecture_mismatches(same, wanted) == []
+    assert architecture_mismatches(longer_context, wanted) == []
+    assert any(item.startswith("hidden_size") for item in architecture_mismatches(wrong_width, wanted))
+    assert any(item.startswith("seq_len") for item in architecture_mismatches(too_short, wanted))
+    from teapottrainer.trainer import _resolve_init_from
+
+    assert _resolve_init_from("Qwen/Qwen2.5-0.5B-Instruct") == "Qwen/Qwen2.5-0.5B-Instruct"
+    try:
+        _resolve_init_from("runs/does-not-exist/weights")
+    except SystemExit as exc:
+        assert "does not exist" in str(exc)
+    else:
+        raise AssertionError("missing init_from should fail")
 
 
 def test_abstaining_on_an_answerable_question_lowers_the_score():

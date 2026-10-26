@@ -42,6 +42,51 @@ def _unwrap(model):
     return model._orig_mod if hasattr(model, "_orig_mod") else model
 
 
+def architecture_mismatches(hf_config, model_cfg) -> list[str]:
+    """Weight-shape differences between a loaded model and ``ModelConfig``.
+
+    Context may be shorter than the checkpoint. It may not be longer.
+    """
+    problems = []
+    if model_cfg.model_type.lower() == "gpt2":
+        compared = (
+            ("n_embd", "hidden_size", model_cfg.hidden_size),
+            ("n_layer", "layers", model_cfg.layers),
+            ("n_head", "heads", model_cfg.heads),
+        )
+        context_attr = "n_positions"
+    else:
+        compared = (
+            ("hidden_size", "hidden_size", model_cfg.hidden_size),
+            ("num_hidden_layers", "layers", model_cfg.layers),
+            ("num_attention_heads", "heads", model_cfg.heads),
+            ("num_key_value_heads", "kv_heads", model_cfg.kv_heads),
+            ("intermediate_size", "intermediate", model_cfg.intermediate),
+        )
+        context_attr = "max_position_embeddings"
+    for attr, label, want in compared:
+        got = getattr(hf_config, attr, None)
+        if got != want:
+            problems.append(f"{label}: checkpoint {got}, config {want}")
+    positions = getattr(hf_config, context_attr, None)
+    if positions is None or model_cfg.seq_len > positions:
+        problems.append(
+            f"seq_len: config {model_cfg.seq_len} is longer than checkpoint context {positions}"
+        )
+    return problems
+
+
+def _resolve_init_from(path: str) -> str:
+    """Return a local directory or a Hugging Face id. Missing local paths error."""
+    expanded = os.path.expanduser(path)
+    if os.path.exists(expanded):
+        return expanded
+    hub_id = path.count("/") == 1 and not path.startswith((".", "/", "~"))
+    if hub_id:
+        return path
+    raise SystemExit(f"init_from path does not exist: {path}")
+
+
 class TeapotTrainer:
     def __init__(self, config: TrainingConfig):
         self.config = config
@@ -489,13 +534,26 @@ class TeapotTrainer:
         # Packing splits long documents. Silence the tokenizer's own length warning.
         tokenizer.model_max_length = int(1e9)
 
-        if init_from:
-            print(f"Loading initial weights from {init_from} (method argument, not a config field)")
-            model = AutoModelForCausalLM.from_pretrained(init_from, dtype=torch.float32, trust_remote_code=True)
+        # A train() argument overrides the config field. Either one is used
+        # before pretrain or supervised training starts.
+        source = init_from if init_from is not None else self.config.init_from
+        if source:
+            source = _resolve_init_from(source)
+            print(f"Loading initial weights from {source} before training.")
+            model = AutoModelForCausalLM.from_pretrained(source, dtype=torch.float32, trust_remote_code=True)
+            mismatches = architecture_mismatches(model.config, self.m_cfg)
+            if mismatches:
+                detail = "\n  ".join(mismatches)
+                raise SystemExit(f"init_from does not match the model config:\n  {detail}")
             embedding = model.get_input_embeddings()
-            if embedding is not None and embedding.weight.shape[0] < len(tokenizer):
+            rows = None if embedding is None else embedding.weight.shape[0]
+            if rows is not None and rows < len(tokenizer):
+                print(f"Tokenizer is longer than the checkpoint embeddings ({len(tokenizer)} > {rows}). Resizing.")
                 model.resize_token_embeddings(len(tokenizer))
+            elif rows is not None and rows != len(tokenizer):
+                print(f"Checkpoint embeddings have {rows} rows and the tokenizer has {len(tokenizer)}. Leaving the matrix as stored.")
         else:
+            print("Building a new model from the config.")
             model = self._build_model(vocab_size=len(tokenizer))
         model.to(self.device)
         total_params = self._print_model_summary(model)

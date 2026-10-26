@@ -35,6 +35,8 @@ class TrainingConfig(BaseModel):
     eval_datasets: List[DatasetSpec] = Field(default_factory=list)
     
     tokenizer: str = "Qwen/Qwen2.5-0.5B"
+    # Hugging Face id or local directory. None builds a new model from the config.
+    init_from: Optional[str] = None
     batch_size: int = 4
     grad_accum: int = 32
     lr: float = 5e-4
