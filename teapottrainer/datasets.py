@@ -15,10 +15,15 @@ from datasets import load_dataset
 
 from .formatting import (
     as_pairs,
+    format_apigen_aliased,
     format_apigen_decision,
     format_gsm8k,
     format_hotpot,
     format_squad,
+    format_squad_answerable,
+    format_squad_unanswerable,
+    format_synthqa,
+    format_teapot_chat,
     format_when2call,
     messages_format,
 )
@@ -119,6 +124,13 @@ SMOLTALK_APIGEN_DECISION = DatasetSourceConfig(
     is_sft=True,
     chat_template_fn=format_apigen_decision,
 )
+SMOLTALK_APIGEN_ALIASED = DatasetSourceConfig(
+    name="HuggingFaceTB/smoltalk",
+    subset="apigen-80k",
+    split="train",
+    is_sft=True,
+    chat_template_fn=format_apigen_aliased,
+)
 SMOLTALK_METAMATH = DatasetSourceConfig(
     name="HuggingFaceTB/smoltalk",
     subset="metamathqa-50k",
@@ -130,6 +142,8 @@ SMOLTALK_METAMATH = DatasetSourceConfig(
 SMOLTALK_MAGPIE_TEST = SMOLTALK_MAGPIE.model_copy(update={"split": "test"})
 SMOLTALK_CONSTRAINTS_TEST = SMOLTALK_CONSTRAINTS.model_copy(update={"split": "test"})
 SMOLTALK_APIGEN_TEST = SMOLTALK_APIGEN.model_copy(update={"split": "test"})
+SMOLTALK_APIGEN_DECISION_TEST = SMOLTALK_APIGEN_DECISION.model_copy(update={"split": "test"})
+SMOLTALK_APIGEN_ALIASED_TEST = SMOLTALK_APIGEN_ALIASED.model_copy(update={"split": "test"})
 
 GSM8K = DatasetSourceConfig(
     name="gsm8k",
@@ -162,6 +176,8 @@ SQUAD_V2 = DatasetSourceConfig(
     chat_template_fn=format_squad,
 )
 SQUAD_V2_VAL = SQUAD_V2.model_copy(update={"split": "validation"})
+SQUAD_V2_ANSWERABLE = SQUAD_V2.model_copy(update={"chat_template_fn": format_squad_answerable})
+SQUAD_V2_UNANSWERABLE = SQUAD_V2.model_copy(update={"chat_template_fn": format_squad_unanswerable})
 
 HOTPOT = DatasetSourceConfig(
     name="hotpot_qa",
@@ -171,6 +187,21 @@ HOTPOT = DatasetSourceConfig(
     chat_template_fn=format_hotpot,
 )
 HOTPOT_VAL = HOTPOT.model_copy(update={"split": "validation"})
+
+SYNTHQA = DatasetSourceConfig(
+    name="teapotai/synthqa",
+    split="train",
+    is_sft=True,
+    chat_template_fn=format_synthqa,
+)
+SYNTHQA_TEST = SYNTHQA.model_copy(update={"split": "test"})
+
+TEAPOT_CHAT = DatasetSourceConfig(
+    name="teapotai/teapot-chat",
+    split="train",
+    is_sft=True,
+    chat_template_fn=format_teapot_chat,
+)
 
 
 def open_dataset(src: DatasetSourceConfig, streaming: bool):

@@ -76,12 +76,23 @@ def test_train_script_uses_the_same_constructor():
     assert config.model.layers == 26
     assert config.model.hidden_size == 512
     assert config.tokenizer == "gpt2"
-    assert config.pretrain_datasets[0].target_tokens == 2_000_000_000
+    assert config.pretrain_datasets == []
+    assert config.lr == 5e-5
     names = []
+    budgets = {}
     for spec in config.sft_datasets:
         names.append((spec.source.name, spec.source.subset))
+        budgets[(spec.source.name, spec.source.subset, spec.source.chat_template_fn)] = spec.target_tokens
     assert ("HuggingFaceTB/smoltalk", "all") not in names
     assert ("nvidia/When2Call", "train_sft") in names
+    assert ("teapotai/synthqa", None) in names
+    assert ("teapotai/teapot-chat", None) in names
+    answerable = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn.__name__ == "format_squad_answerable")
+    unanswerable = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn.__name__ == "format_squad_unanswerable")
+    assert answerable == 4 * unanswerable
+    eval_names = [(spec.source.name, spec.source.split) for spec in config.eval_datasets]
+    assert ("teapotai/synthqa", "test") in eval_names
+    assert ("teapotai/teapot-chat", "train") in eval_names
     assert GSM8K_TEST.split == "test"
     assert SMOLTALK_APIGEN_TEST.chat_template_fn is not None
 
@@ -153,9 +164,14 @@ def test_squad_and_gsm_scores():
     assert score_gsm("16 - 3 - 4 = 9\n#### 18", "She makes 18.\n#### 18") == 1.0
     assert score_gsm("The answer is 18.0", "#### 18") == 1.0
     assert score_gsm("#### 17", "#### 18") == 0.0
-    prompt, answer = format_gsm8k({"question": "What is 2+2?", "answer": "2+2=4\n#### 4"})
+    prompt, answer = format_gsm8k({"question": "What is 2+2?", "answer": "2+2=<<2+2=4>>4\n#### 4"})
     assert prompt.endswith("Assistant:\n")
-    assert "#### 4" in answer
+    assert "calculator" in prompt
+    assert '"expression": "2+2"' in answer
+    assert score_gsm(
+        '<tool_call>[{"name": "calculator", "arguments": {"expression": "2+2"}}]</tool_call>',
+        "#### 4",
+    ) == 1.0
     squad_prompt, squad_answer = format_squad(
         {"context": "The capital is Paris.", "question": "What is the capital?", "answers": {"text": []}}
     )
@@ -355,4 +371,70 @@ def test_constraint_gold_replies_pass_the_checker():
             scored.append(result["example_pass"])
     assert len(scored) >= 20
     assert sum(scored) / len(scored) >= 0.75
+
+
+def test_renamed_tool_call_matches_the_prompt():
+    from teapottrainer.formatting import format_apigen_aliased
+    from teapottrainer.metrics import extract_tool_calls
+
+    row = {
+        "messages": [
+            {
+                "role": "system",
+                "content": 'Tools:\n<tools>[{"name": "book_train", "description": "Book a train."}]</tools>',
+            },
+            {"role": "user", "content": "Book a train from Boston to Portland."},
+            {
+                "role": "assistant",
+                "content": '<tool_call>[{"name": "book_train", "arguments": {"origin": "Boston"}}]</tool_call>',
+            },
+        ]
+    }
+    prompt, answer = format_apigen_aliased(row)
+    assert "book_train" not in prompt
+    assert "book_train" not in answer
+    prompted = extract_tool_calls(prompt.split("<tools>", 1)[-1])
+    called = extract_tool_calls(answer)
+    assert called and prompted
+    assert called[0]["name"] == prompted[0]["name"]
+    assert called[0]["arguments"]["origin"] == "Boston"
+
+
+def test_abstaining_on_an_answerable_question_lowers_the_score():
+    from teapottrainer.evals import selection_score
+
+    abstain = selection_score({"squad/answerable_f1": 0.0, "squad/answerable_abstain": 1.0})
+    answer = selection_score({"squad/answerable_f1": 0.0, "squad/answerable_abstain": 0.0})
+    assert answer > abstain
+
+
+def test_synthqa_and_teapot_chat_prompts():
+    from teapottrainer.formatting import format_synthqa, format_teapot_chat
+
+    prompt, answer = format_synthqa({
+        "context": "The kiln opened in 1902.",
+        "question": "When did the kiln open?",
+        "type": "extraction",
+        "answer": "1902",
+    })
+    assert prompt.endswith("Assistant:\n")
+    assert "1902" == answer
+    assert "kiln opened in 1902" in prompt
+    skipped, abstain = format_synthqa({
+        "context": "The kiln opened in 1902.",
+        "question": "Who funded it?",
+        "type": "unanswerable",
+        "answer": None,
+    })
+    assert abstain == "The context does not contain the answer."
+    assert "Who funded it?" in skipped
+    chat_prompt, chat_answer = format_teapot_chat({
+        "system_prompt": "You are Teapot.",
+        "context": "",
+        "query": "who are you",
+        "response": "I am Teapot",
+    })
+    assert chat_prompt.endswith("Assistant:\n")
+    assert chat_answer == "I am Teapot"
+    assert "You are Teapot." in chat_prompt
 

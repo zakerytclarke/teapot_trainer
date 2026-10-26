@@ -281,9 +281,54 @@ def pred_gsm_number(text: str) -> str | None:
     return _canon_number(matches[-1])
 
 
+def _safe_arith(expression: str) -> str | None:
+    """Evaluate a calculator expression. Names and calls are rejected."""
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError:
+        return None
+    allowed = (
+        ast.Expression,
+        ast.BinOp,
+        ast.UnaryOp,
+        ast.Constant,
+        ast.Add,
+        ast.Sub,
+        ast.Mult,
+        ast.Div,
+        ast.FloorDiv,
+        ast.Mod,
+        ast.UAdd,
+        ast.USub,
+    )
+    for node in ast.walk(tree):
+        if not isinstance(node, allowed):
+            return None
+    try:
+        value = eval(compile(tree, "<calculator>", "eval"), {"__builtins__": {}}, {})
+    except (ZeroDivisionError, ValueError, OverflowError, TypeError):
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return _canon_number(str(value))
+
+
+def calculator_result(prediction: str) -> str | None:
+    calls = [call for call in extract_tool_calls(prediction) if call.get("name") == "calculator"]
+    if not calls:
+        return None
+    arguments = calls[-1].get("arguments") or {}
+    expression = arguments.get("expression")
+    if not isinstance(expression, str):
+        return None
+    return _safe_arith(expression)
+
+
 def score_gsm(prediction: str, gold_answer: str) -> float:
     gold = gold_gsm_number(gold_answer)
-    pred = pred_gsm_number(prediction)
+    pred = calculator_result(prediction)
+    if pred is None:
+        pred = pred_gsm_number(prediction)
     if gold is None or pred is None:
         return 0.0
     return 1.0 if gold == pred else 0.0

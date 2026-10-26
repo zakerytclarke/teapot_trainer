@@ -12,7 +12,7 @@ from collections import defaultdict
 
 import torch
 
-from .datasets import DatasetSourceConfig, encode_pair, open_dataset, row_pairs
+from .datasets import DatasetSourceConfig, encode_pair, holdout_membership, open_dataset, row_pairs
 from .formatting import ABSTAIN_TEXT
 from .metrics import (
     best_span_scores,
@@ -23,6 +23,7 @@ from .metrics import (
     score_constraints,
     score_gsm,
     score_tool_prediction,
+    token_f1,
 )
 
 
@@ -37,6 +38,10 @@ def task_kind(src: DatasetSourceConfig) -> str:
         return "hotpot"
     if name == "gsm8k" or name.endswith("/gsm8k"):
         return "gsm8k"
+    if "synthqa" in name:
+        return "synthqa"
+    if "teapot-chat" in name or "teapot_chat" in name:
+        return "chat"
     if "apigen" in subset:
         return "tools"
     if "constraint" in subset:
@@ -86,16 +91,32 @@ def _stratified(groups: dict[str, list], n: int, rng: random.Random) -> list:
 _ROW_CACHE: dict[tuple, list[dict]] = {}
 
 
-def load_task_rows(src: DatasetSourceConfig, n: int, seed: int, kind: str) -> list[dict]:
+def load_task_rows(
+    src: DatasetSourceConfig,
+    n: int,
+    seed: int,
+    kind: str,
+    holdout_ratio: float = 0.05,
+) -> list[dict]:
     """Load a small, class-balanced slice of an eval split."""
     if kind == "lm" or n <= 0:
         return []
-    key = (src.name, src.subset or "", src.split or "", int(n), int(seed), kind)
+    key = (src.name, src.subset or "", src.split or "", int(n), int(seed), kind, float(holdout_ratio))
     cached = _ROW_CACHE.get(key)
     if cached is not None:
         return cached
     dataset = open_dataset(src, streaming=False)
     rows = list(dataset)
+    if src.split == "train" and holdout_ratio > 0:
+        held = []
+        for row in rows:
+            pairs = row_pairs(src, row)
+            if not pairs:
+                continue
+            marker = pairs[-1][0] + "\n" + pairs[-1][1]
+            if holdout_membership(marker, holdout_ratio, seed):
+                held.append(row)
+        rows = held
     rng = random.Random(seed)
     if kind == "when2call" and rows and "correct_answer" in rows[0]:
         groups = defaultdict(list)
@@ -109,6 +130,13 @@ def load_task_rows(src: DatasetSourceConfig, n: int, seed: int, kind: str) -> li
         for row in rows:
             texts = (row.get("answers") or {}).get("text") or []
             groups["answerable" if texts else "unanswerable"].append(row)
+        picked = _stratified(groups, n, rng)
+        _ROW_CACHE[key] = picked
+        return picked
+    if kind == "synthqa":
+        groups = defaultdict(list)
+        for row in rows:
+            groups[str(row.get("type") or "qa")].append(row)
         picked = _stratified(groups, n, rng)
         _ROW_CACHE[key] = picked
         return picked
@@ -209,6 +237,7 @@ def evaluate_source(
     seq_len: int,
     max_examples: int,
     seed: int,
+    holdout_ratio: float = 0.05,
 ) -> dict:
     kind = task_kind(src)
     key = source_key(src)
@@ -217,7 +246,7 @@ def evaluate_source(
     if kind == "lm":
         return {"key": key, "kind": kind, "metrics": metrics, "samples": samples}
 
-    rows = load_task_rows(src, max_examples, seed, kind)
+    rows = load_task_rows(src, max_examples, seed, kind, holdout_ratio=holdout_ratio)
     prepared = []
     for row in rows:
         pairs = row_pairs(src, row)
@@ -237,8 +266,10 @@ def evaluate_source(
         "when2call": 96,
         "squad": 64,
         "hotpot": 48,
-        "gsm8k": 256,
+        "gsm8k": 160,
         "constraints": 220,
+        "synthqa": 160,
+        "chat": 160,
         "sft_loss": 0,
     }.get(kind, 0)
     predictions = [""] * len(prepared)
@@ -354,7 +385,7 @@ def evaluate_source(
     elif kind == "gsm8k":
         hits = []
         for (row, prompt, answer), prediction in zip(prepared, predictions):
-            hits.append(score_gsm(prediction, answer))
+            hits.append(score_gsm(prediction, str(row.get("answer") or answer)))
             if len(samples) < 3:
                 samples.append({
                     "task": "gsm8k",
@@ -365,6 +396,52 @@ def evaluate_source(
         if hits:
             metrics["numeric_em"] = sum(hits) / len(hits)
             metrics["support"] = float(len(hits))
+
+    elif kind == "synthqa":
+        answerable_f1, answerable_contains, answerable_abstain = [], [], []
+        unanswerable_abstain = []
+        for (row, prompt, answer), prediction in zip(prepared, predictions):
+            unanswerable = row.get("type") == "unanswerable" or is_abstention(answer)
+            abstained = is_abstention(prediction)
+            if unanswerable:
+                unanswerable_abstain.append(1.0 if abstained else 0.0)
+                gold = ABSTAIN_TEXT
+            else:
+                _em, f1, contained = best_span_scores(prediction, [answer])
+                answerable_f1.append(f1)
+                answerable_contains.append(contained)
+                answerable_abstain.append(1.0 if abstained else 0.0)
+                gold = answer
+            if len(samples) < 3:
+                samples.append({
+                    "task": "synthqa",
+                    "user": str(row.get("question") or "")[:240],
+                    "gold": gold[:200],
+                    "prediction": prediction[:200],
+                })
+        if answerable_f1:
+            metrics["answerable_f1"] = sum(answerable_f1) / len(answerable_f1)
+            metrics["answerable_contains"] = sum(answerable_contains) / len(answerable_contains)
+            metrics["answerable_abstain"] = sum(answerable_abstain) / len(answerable_abstain)
+            metrics["support_answerable"] = float(len(answerable_f1))
+        if unanswerable_abstain:
+            metrics["unanswerable_abstain"] = sum(unanswerable_abstain) / len(unanswerable_abstain)
+            metrics["support_unanswerable"] = float(len(unanswerable_abstain))
+
+    elif kind == "chat":
+        scores = []
+        for (row, prompt, answer), prediction in zip(prepared, predictions):
+            scores.append(token_f1(prediction, answer))
+            if len(samples) < 3:
+                samples.append({
+                    "task": "chat",
+                    "user": str(row.get("query") or "")[:240],
+                    "gold": answer[:200],
+                    "prediction": prediction[:200],
+                })
+        if scores:
+            metrics["chat_f1"] = sum(scores) / len(scores)
+            metrics["support"] = float(len(scores))
 
     elif kind == "constraints":
         check_scores, example_scores = [], []
@@ -406,6 +483,8 @@ def selection_score(flat_metrics: dict[str, float]) -> float | None:
         "contains",
         "numeric_em",
         "example_pass",
+        "chat_f1",
+        "answerable_abstain",
     )
     values = []
     for key, value in flat_metrics.items():
@@ -414,7 +493,11 @@ def selection_score(flat_metrics: dict[str, float]) -> float | None:
             # support_* leaves end with support_name, not the metric itself
             if leaf.startswith("support"):
                 continue
-            values.append(value)
+            # Abstaining on a question that has an answer lowers the score.
+            if leaf == "answerable_abstain":
+                values.append(1.0 - value)
+            else:
+                values.append(value)
     if not values:
         return None
     return sum(values) / len(values)

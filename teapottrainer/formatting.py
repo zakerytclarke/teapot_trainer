@@ -6,6 +6,7 @@ those pairs (one pair per assistant turn). The prompt is the supervised prefix.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from typing import Any
@@ -174,15 +175,158 @@ def format_hotpot(row: dict) -> tuple[str, str]:
     return prompt, answer
 
 
+_CALCULATOR_TOOLS = json.dumps(
+    [
+        {
+            "name": "calculator",
+            "description": "Evaluate one arithmetic expression.",
+            "parameters": {
+                "type": "object",
+                "properties": {"expression": {"type": "string"}},
+                "required": ["expression"],
+            },
+        }
+    ],
+    ensure_ascii=False,
+)
+
+_ALIAS_VERBS = (
+    "cork", "latch", "braid", "quilt", "hinge", "wick", "parcel", "kindle",
+    "frost", "scribe", "ladle", "notch", "plait", "rivet", "temper", "unveil",
+)
+_ALIAS_NOUNS = (
+    "glowworm", "kiln", "lantern", "marble", "cinder", "vellum", "thimble", "comet",
+    "cistern", "amber", "lodestone", "quill", "sconce", "keel", "mosaic", "spindle",
+)
+
+
+def _gsm_expressions(answer: str) -> list[str]:
+    found = []
+    for expr in re.findall(r"<<\s*([^=<>]+?)\s*=", answer or ""):
+        cleaned = expr.strip().replace(",", "")
+        if cleaned:
+            found.append(cleaned)
+    return found
+
+
 def format_gsm8k(row: dict) -> tuple[str, str]:
+    """Ask the calculator tool instead of a written solution."""
     question = str(row.get("question") or "").strip()
-    answer = str(row.get("answer") or "").strip()
+    exprs = _gsm_expressions(str(row.get("answer") or ""))
+    if not exprs:
+        exprs = ["0"]
+    calls = [{"name": "calculator", "arguments": {"expression": expr}} for expr in exprs]
+    answer = "<tool_call>" + json.dumps(calls, ensure_ascii=False) + "</tool_call>"
     prompt = (
-        "System: Solve the grade-school math problem. "
-        "Show brief reasoning, then end with a line of the form #### <number>.\n\n"
+        f"System: {DECISION_RULES}\n\n"
+        f"You have access to the following tools:\n<tools>{_CALCULATOR_TOOLS}</tools>\n\n"
         f"User: {question}\n\nAssistant:\n"
     )
     return prompt, answer
+
+
+def _alias_name(name: str, taken: set[str]) -> str:
+    digest = hashlib.sha256(name.encode()).digest()
+    base = f"{_ALIAS_VERBS[digest[0] % len(_ALIAS_VERBS)]}_{_ALIAS_NOUNS[digest[1] % len(_ALIAS_NOUNS)]}"
+    alias = base
+    suffix = 2
+    while alias in taken:
+        alias = f"{base}_{suffix}"
+        suffix += 1
+    taken.add(alias)
+    return alias
+
+
+def format_apigen_aliased(row: dict) -> tuple[str, str] | None:
+    """APIGen call under the shared tool template, with the function names replaced.
+
+    The gold call is renamed to match. The only way to be right is to read the
+    tool list in the prompt.
+    """
+    cloned = []
+    for message in row.get("messages") or []:
+        cloned.append(dict(message))
+    system_index = next((i for i, message in enumerate(cloned) if message.get("role") == "system"), None)
+    if system_index is None:
+        return format_apigen_decision({"messages": cloned})
+    system = str(cloned[system_index].get("content") or "")
+    match = re.search(r"<tools>(.*?)</tools>", system, re.DOTALL)
+    if match is None:
+        return format_apigen_decision({"messages": cloned})
+    try:
+        tools = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return format_apigen_decision({"messages": cloned})
+    if isinstance(tools, dict):
+        tools = [tools]
+    taken: set[str] = set()
+    mapping: dict[str, str] = {}
+    for tool in tools:
+        if isinstance(tool, dict) and isinstance(tool.get("name"), str):
+            old = tool["name"]
+            mapping.setdefault(old, _alias_name(old, taken))
+            tool["name"] = mapping[old]
+    system = system[: match.start(1)] + json.dumps(tools, ensure_ascii=False) + system[match.end(1) :]
+    for old, new in sorted(mapping.items(), key=lambda item: len(item[0]), reverse=True):
+        system = system.replace(f'"{old}"', f'"{new}"')
+    cloned[system_index]["content"] = system
+    for message in cloned:
+        if message.get("role") != "assistant":
+            continue
+        content = str(message.get("content") or "")
+        for old, new in sorted(mapping.items(), key=lambda item: len(item[0]), reverse=True):
+            content = content.replace(f'"{old}"', f'"{new}"')
+        message["content"] = content
+    return format_apigen_decision({"messages": cloned})
+
+
+def format_squad_answerable(row: dict) -> tuple[str, str] | None:
+    texts = (row.get("answers") or {}).get("text") or []
+    if not any(str(text).strip() for text in texts):
+        return None
+    return format_squad(row)
+
+
+def format_squad_unanswerable(row: dict) -> tuple[str, str] | None:
+    texts = (row.get("answers") or {}).get("text") or []
+    if any(str(text).strip() for text in texts):
+        return None
+    return format_squad(row)
+
+
+def _as_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return json.dumps(value, ensure_ascii=False)
+
+
+def format_synthqa(row: dict) -> tuple[str, str] | None:
+    context = _as_text(row.get("context"))
+    question = _as_text(row.get("question"))
+    if not context or not question:
+        return None
+    answer = _as_text(row.get("answer"))
+    if row.get("type") == "unanswerable" or not answer:
+        answer = ABSTAIN_TEXT
+    prompt = (
+        f"System: {RAG_SYSTEM}\n\n"
+        f"User: Context:\n{context}\n\nQuestion: {question}\n\nAssistant:\n"
+    )
+    return prompt, answer
+
+
+def format_teapot_chat(row: dict) -> tuple[str, str] | None:
+    system = _as_text(row.get("system_prompt")) or "You are Teapot. If a user asks who you are, reply \"I am Teapot\"."
+    query = _as_text(row.get("query"))
+    response = _as_text(row.get("response"))
+    if not query or not response:
+        return None
+    context = _as_text(row.get("context"))
+    user = f"Context:\n{context}\n\nQuestion: {query}" if context else query
+    prompt = f"System: {system}\n\nUser: {user}\n\nAssistant:\n"
+    return prompt, response
 
 
 def as_pairs(formatted: Any) -> list[tuple[str, str]]:

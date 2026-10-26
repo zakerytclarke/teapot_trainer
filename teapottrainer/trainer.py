@@ -292,6 +292,7 @@ class TeapotTrainer:
                 seq_len=self.m_cfg.seq_len,
                 max_examples=self.eval_example_cap,
                 seed=self.config.seed,
+                holdout_ratio=self.config.holdout_ratio,
             )
             for name, value in result["metrics"].items():
                 flat[f"{key}/{name}"] = value
@@ -529,6 +530,9 @@ class TeapotTrainer:
                 task_eval=False,
             )
             model = _unwrap(training_model)
+            pretrain_dir = os.path.join(self.output_dir, "checkpoints", "pretrain")
+            self._save_weights(model, tokenizer, pretrain_dir)
+            print(f"Saved pretrain weights to {pretrain_dir}")
         if sft:
             if self.config.compile:
                 print(

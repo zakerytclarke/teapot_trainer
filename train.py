@@ -1,9 +1,11 @@
-"""From-scratch assistant run.
+"""Corrective assistant run.
 
-The config object is the same TrainingConfig as before. Architecture, tokenizer,
-dataset mix, and token budgets are the values that target a small agent model.
-This file is the full run. Confidence checks live in scripts/ and do not call this.
+Starts from the finished pretrain-plus-SFT checkpoint and continues on one
+tool template, answerable-heavy passages, and a smaller chat replay.
+SynthQA and Teapot chat are in both the supervised mix and the evals.
 """
+
+from pathlib import Path
 
 from teapottrainer import (
     DatasetSpec,
@@ -13,30 +15,33 @@ from teapottrainer import (
     HOTPOT,
     HOTPOT_VAL,
     ModelConfig,
-    SMOLTALK_APIGEN,
+    SMOLTALK_APIGEN_ALIASED,
+    SMOLTALK_APIGEN_ALIASED_TEST,
     SMOLTALK_APIGEN_DECISION,
-    SMOLTALK_APIGEN_TEST,
+    SMOLTALK_APIGEN_DECISION_TEST,
     SMOLTALK_CONSTRAINTS,
     SMOLTALK_CONSTRAINTS_TEST,
-    SMOLTALK_EVERYDAY,
     SMOLTALK_MAGPIE,
-    SMOLTALK_OPENHERMES,
-    SMOLTALK_REWRITE,
-    SMOLTALK_SUMMARIZE,
-    SMOLTALK_SYSTEMCHATS,
-    SQUAD_V2,
+    SQUAD_V2_ANSWERABLE,
+    SQUAD_V2_UNANSWERABLE,
     SQUAD_V2_VAL,
+    SYNTHQA,
+    SYNTHQA_TEST,
+    TEAPOT_CHAT,
     TeapotTrainer,
     TrainingConfig,
     WHEN2CALL,
     WHEN2CALL_TEST,
 )
 
+# The best checkpoint from the 2B pretrain plus the first supervised run.
+INIT_FROM = Path(__file__).resolve().parent / "runs" / "teapot-gpt2-770ea2" / "checkpoints" / "best"
+
 
 def build_config() -> TrainingConfig:
-    # Deep-thin Llama, about 110M with tied embeddings and a gpt2 vocab.
-    # gpt2 stays the tokenizer so the run does not depend on another checkout.
-    # SmolTalk "all" is intentionally not used: it already contains apigen.
+    # Same 109M Llama. This run does not pretrain again.
+    # Tool calls, including renamed APIGen tools and GSM as calculator calls,
+    # share one system template. SQuAD answerable tokens are 4x the unanswerable ones.
     return TrainingConfig(
         model=ModelConfig(
             model_type="llama",
@@ -47,56 +52,55 @@ def build_config() -> TrainingConfig:
             intermediate_size=1408,
             max_position_embeddings=2048,
         ),
-        pretrain_datasets=[
-            DatasetSpec(source=FINEWEB_EDU, target_tokens=2_000_000_000, weight=1.0),
-        ],
+        pretrain_datasets=[],
         sft_datasets=[
-            # General assistant behavior.
-            DatasetSpec(source=SMOLTALK_MAGPIE, target_tokens=200_000_000, weight=1.0),
-            DatasetSpec(source=SMOLTALK_OPENHERMES, target_tokens=40_000_000, weight=1.0),
-            DatasetSpec(source=SMOLTALK_EVERYDAY, target_tokens=2_000_000, weight=1.0),
-            DatasetSpec(source=SMOLTALK_CONSTRAINTS, target_tokens=20_000_000, weight=1.0),
-            DatasetSpec(source=SMOLTALK_SYSTEMCHATS, target_tokens=15_000_000, weight=1.0),
-            DatasetSpec(source=SMOLTALK_SUMMARIZE, target_tokens=30_000_000, weight=1.0),
-            DatasetSpec(source=SMOLTALK_REWRITE, target_tokens=15_000_000, weight=1.0),
-            # Tool use in APIGen's own prompt, including a minority of refusals.
-            DatasetSpec(source=SMOLTALK_APIGEN, target_tokens=40_000_000, weight=1.0),
-            # The same calls under the decision prompt shared with When2Call.
-            DatasetSpec(source=SMOLTALK_APIGEN_DECISION, target_tokens=20_000_000, weight=1.0),
-            # Ask for missing arguments, or refuse when no tool fits.
-            # Positive tool calls come from apigen; this split has almost none.
-            DatasetSpec(source=WHEN2CALL, target_tokens=30_000_000, weight=1.0),
-            # Answer from a passage, and abstain when it is not in the passage.
-            DatasetSpec(source=SQUAD_V2, target_tokens=40_000_000, weight=1.0),
-            DatasetSpec(source=HOTPOT, target_tokens=40_000_000, weight=1.0),
-            DatasetSpec(source=GSM8K, target_tokens=10_000_000, weight=1.0),
+            # Positive calls on the shared decision template.
+            DatasetSpec(source=SMOLTALK_APIGEN_DECISION, target_tokens=36_000_000, weight=1.0),
+            # Same calls with the function names replaced, so the name has to be read.
+            DatasetSpec(source=SMOLTALK_APIGEN_ALIASED, target_tokens=12_000_000, weight=1.0),
+            # Ask or refuse. This split has almost no positive calls.
+            DatasetSpec(source=WHEN2CALL, target_tokens=8_000_000, weight=1.0),
+            # Grade-school problems as calculator calls.
+            DatasetSpec(source=GSM8K, target_tokens=6_000_000, weight=1.0),
+            # Passages. Answerable rows outnumber abstentions four to one.
+            DatasetSpec(source=SQUAD_V2_ANSWERABLE, target_tokens=16_000_000, weight=1.0),
+            DatasetSpec(source=SQUAD_V2_UNANSWERABLE, target_tokens=4_000_000, weight=1.0),
+            DatasetSpec(source=HOTPOT, target_tokens=8_000_000, weight=1.0),
+            DatasetSpec(source=SYNTHQA, target_tokens=6_000_000, weight=1.0),
+            # A smaller replay of the assistant voice.
+            DatasetSpec(source=SMOLTALK_MAGPIE, target_tokens=14_000_000, weight=1.0),
+            DatasetSpec(source=SMOLTALK_CONSTRAINTS, target_tokens=8_000_000, weight=1.0),
+            DatasetSpec(source=TEAPOT_CHAT, target_tokens=4_000_000, weight=1.0),
         ],
         eval_datasets=[
             DatasetSpec(source=FINEWEB_EDU, target_tokens=1_000_000),
             DatasetSpec(source=SMOLTALK_CONSTRAINTS_TEST, target_tokens=200_000),
-            DatasetSpec(source=SMOLTALK_APIGEN_TEST, target_tokens=200_000),
+            DatasetSpec(source=SMOLTALK_APIGEN_DECISION_TEST, target_tokens=200_000),
+            DatasetSpec(source=SMOLTALK_APIGEN_ALIASED_TEST, target_tokens=200_000),
             DatasetSpec(source=WHEN2CALL_TEST, target_tokens=200_000),
             DatasetSpec(source=SQUAD_V2_VAL, target_tokens=200_000),
             DatasetSpec(source=HOTPOT_VAL, target_tokens=200_000),
+            DatasetSpec(source=SYNTHQA_TEST, target_tokens=200_000),
             DatasetSpec(source=GSM8K_TEST, target_tokens=200_000),
+            DatasetSpec(source=TEAPOT_CHAT, target_tokens=200_000),
         ],
         tokenizer="gpt2",
         batch_size=8,
         grad_accum=16,
-        lr=1e-3,
-        weight_decay=0.1,
+        lr=5e-5,
+        weight_decay=0.0,
         eval_every_percent=10.0,
-        # Compile covers fixed-length pretraining only. The trainer leaves SFT
-        # eager, because a compiled graph dies when the next chat changes length.
         compile=True,
     )
 
 
 def main():
+    if not (INIT_FROM / "config.json").is_file():
+        raise SystemExit(f"Missing init checkpoint: {INIT_FROM}")
     config = build_config()
     trainer = TeapotTrainer(config=config)
     trainer.eval_example_cap = 32
-    trainer.train(fresh=True)
+    trainer.train(fresh=True, init_from=str(INIT_FROM))
 
 
 if __name__ == "__main__":
