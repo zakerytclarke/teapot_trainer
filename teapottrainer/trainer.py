@@ -17,6 +17,7 @@ import sys
 import time
 
 import torch
+import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -40,6 +41,26 @@ from .evals import evaluate_source, selection_score, source_key, task_kind
 
 def _unwrap(model):
     return model._orig_mod if hasattr(model, "_orig_mod") else model
+
+
+def weighted_cross_entropy(logits, labels, weights):
+    """Mean cross-entropy over supervised tokens, weighted per label.
+
+    ``weights`` lines up with ``labels``. Position ``t`` predicts ``labels[t]``
+    from ``logits[t - 1]``, so the weight that applies is ``weights[t]``.
+    """
+    shift_logits = logits[:, :-1, :].float().contiguous()
+    shift_labels = labels[:, 1:].contiguous()
+    shift_weights = weights[:, 1:].to(dtype=shift_logits.dtype)
+    token_loss = F.cross_entropy(
+        shift_logits.reshape(-1, shift_logits.size(-1)),
+        shift_labels.reshape(-1),
+        reduction="none",
+        ignore_index=-100,
+    ).view_as(shift_labels)
+    active = shift_labels.ne(-100).to(dtype=token_loss.dtype)
+    weighted = shift_weights * active
+    return (token_loss * weighted).sum() / weighted.sum().clamp(min=1.0)
 
 
 def architecture_mismatches(hf_config, model_cfg) -> list[str]:
@@ -211,6 +232,7 @@ class TeapotTrainer:
                     is_sft=source.is_sft,
                     preprocess_fn=source.preprocess_fn,
                     chat_template_fn=source.chat_template_fn,
+                    token_loss_weight_fn=source.token_loss_weight_fn,
                     target_tokens=spec.target_tokens,
                     weight=spec.weight,
                 )
@@ -222,26 +244,49 @@ class TeapotTrainer:
         if pad_id is None:
             pad_id = tokenizer.eos_token_id or 0
         width = max(len(sample["input_ids"]) for sample in batch)
-        ids, labels, mask = [], [], []
+        ids, labels, mask, weights = [], [], [], []
         real_tokens = 0
+        use_weights = False
         for sample in batch:
             length = len(sample["input_ids"])
             pad = width - length
             ids.append(sample["input_ids"] + [pad_id] * pad)
             labels.append(sample["labels"] + [-100] * pad)
             mask.append([1] * length + [0] * pad)
+            sample_weights = sample.get("loss_weights")
+            if sample_weights is None:
+                sample_weights = [1.0] * length
+            elif len(sample_weights) != length:
+                raise ValueError("loss_weights must have one value per input token.")
+            elif any(value != 1.0 for value in sample_weights):
+                use_weights = True
+            weights.append([float(value) for value in sample_weights] + [0.0] * pad)
             real_tokens += length
         input_ids = torch.tensor(ids, dtype=torch.long, device=self.device)
         label_tensor = torch.tensor(labels, dtype=torch.long, device=self.device)
-        kwargs = {"input_ids": input_ids, "labels": label_tensor}
+        kwargs = {"input_ids": input_ids}
+        if use_weights:
+            weight_tensor = torch.tensor(weights, dtype=torch.float32, device=self.device)
+        else:
+            kwargs["labels"] = label_tensor
         if any(row.count(0) for row in mask):
             kwargs["attention_mask"] = torch.tensor(mask, dtype=torch.long, device=self.device)
         try:
             if self.device.type == "cuda":
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    loss = model(**kwargs).loss
+                    output = model(**kwargs)
+                    loss = (
+                        weighted_cross_entropy(output.logits, label_tensor, weight_tensor)
+                        if use_weights
+                        else output.loss
+                    )
             else:
-                loss = model(**kwargs).loss
+                output = model(**kwargs)
+                loss = (
+                    weighted_cross_entropy(output.logits, label_tensor, weight_tensor)
+                    if use_weights
+                    else output.loss
+                )
             (loss / self.config.grad_accum).backward()
         except RuntimeError as exc:
             if "out of memory" in str(exc).lower():

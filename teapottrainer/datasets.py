@@ -1,8 +1,9 @@
 """Dataset presets and the streaming encoder.
 
-``DatasetSourceConfig`` fields are unchanged. New presets are additional
-constants. ``chat_template_fn`` may return one ``(prompt, answer)`` pair or a
-list of pairs (one per assistant turn).
+New presets are additional constants. ``chat_template_fn`` may return one
+``(prompt, answer)`` pair or a list of pairs (one per assistant turn).
+``token_loss_weight_fn`` is optional and, when set, returns one loss weight
+per label. The trainer applies those weights; it does not decide them.
 """
 
 from __future__ import annotations
@@ -42,8 +43,30 @@ class DatasetSourceConfig(BaseModel):
 
     preprocess_fn: Optional[Callable[[dict], dict]] = Field(default=None, exclude=True)
     chat_template_fn: Optional[Callable[[dict], tuple[str, str]]] = Field(default=None, exclude=True)
+    # Maps an encoded example to one weight per label. None means every token counts as 1.
+    token_loss_weight_fn: Optional[Callable[[dict, Any], list[float]]] = Field(default=None, exclude=True)
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
+
+
+# End-of-answer token, relative to a normal supervised token.
+STOP_TOKEN_LOSS_WEIGHT = 8.0
+
+
+def eos_loss_weight(weight: float = STOP_TOKEN_LOSS_WEIGHT) -> Callable[[dict, Any], list[float]]:
+    """Upweight the tokenizer end token. Every other label stays at 1."""
+
+    def apply(example: dict, tokenizer) -> list[float]:
+        eos_id = getattr(tokenizer, "eos_token_id", None)
+        return [
+            float(weight) if eos_id is not None and label == eos_id else 1.0
+            for label in example["labels"]
+        ]
+
+    return apply
+
+
+_STOP_WEIGHT = eos_loss_weight(STOP_TOKEN_LOSS_WEIGHT)
 
 
 FINEWEB_EDU = DatasetSourceConfig(
@@ -59,6 +82,7 @@ SMOLTALK = DatasetSourceConfig(
     split="train",
     is_sft=True,
     chat_template_fn=messages_format,
+    token_loss_weight_fn=_STOP_WEIGHT,
 )
 
 SMOLTALK_MAGPIE = DatasetSourceConfig(
@@ -67,6 +91,7 @@ SMOLTALK_MAGPIE = DatasetSourceConfig(
     split="train",
     is_sft=True,
     chat_template_fn=messages_format,
+    token_loss_weight_fn=_STOP_WEIGHT,
 )
 SMOLTALK_EVERYDAY = DatasetSourceConfig(
     name="HuggingFaceTB/smoltalk",
@@ -74,6 +99,7 @@ SMOLTALK_EVERYDAY = DatasetSourceConfig(
     split="train",
     is_sft=True,
     chat_template_fn=messages_format,
+    token_loss_weight_fn=_STOP_WEIGHT,
 )
 SMOLTALK_OPENHERMES = DatasetSourceConfig(
     name="HuggingFaceTB/smoltalk",
@@ -81,6 +107,7 @@ SMOLTALK_OPENHERMES = DatasetSourceConfig(
     split="train",
     is_sft=True,
     chat_template_fn=messages_format,
+    token_loss_weight_fn=_STOP_WEIGHT,
 )
 SMOLTALK_CONSTRAINTS = DatasetSourceConfig(
     name="HuggingFaceTB/smoltalk",
@@ -88,6 +115,7 @@ SMOLTALK_CONSTRAINTS = DatasetSourceConfig(
     split="train",
     is_sft=True,
     chat_template_fn=messages_format,
+    token_loss_weight_fn=_STOP_WEIGHT,
 )
 SMOLTALK_SYSTEMCHATS = DatasetSourceConfig(
     name="HuggingFaceTB/smoltalk",
@@ -95,6 +123,7 @@ SMOLTALK_SYSTEMCHATS = DatasetSourceConfig(
     split="train",
     is_sft=True,
     chat_template_fn=messages_format,
+    token_loss_weight_fn=_STOP_WEIGHT,
 )
 SMOLTALK_SUMMARIZE = DatasetSourceConfig(
     name="HuggingFaceTB/smoltalk",
@@ -102,6 +131,7 @@ SMOLTALK_SUMMARIZE = DatasetSourceConfig(
     split="train",
     is_sft=True,
     chat_template_fn=messages_format,
+    token_loss_weight_fn=_STOP_WEIGHT,
 )
 SMOLTALK_REWRITE = DatasetSourceConfig(
     name="HuggingFaceTB/smoltalk",
@@ -109,6 +139,7 @@ SMOLTALK_REWRITE = DatasetSourceConfig(
     split="train",
     is_sft=True,
     chat_template_fn=messages_format,
+    token_loss_weight_fn=_STOP_WEIGHT,
 )
 SMOLTALK_APIGEN = DatasetSourceConfig(
     name="HuggingFaceTB/smoltalk",
@@ -116,6 +147,7 @@ SMOLTALK_APIGEN = DatasetSourceConfig(
     split="train",
     is_sft=True,
     chat_template_fn=messages_format,
+    token_loss_weight_fn=_STOP_WEIGHT,
 )
 SMOLTALK_APIGEN_DECISION = DatasetSourceConfig(
     name="HuggingFaceTB/smoltalk",
@@ -123,6 +155,7 @@ SMOLTALK_APIGEN_DECISION = DatasetSourceConfig(
     split="train",
     is_sft=True,
     chat_template_fn=format_apigen_decision,
+    token_loss_weight_fn=_STOP_WEIGHT,
 )
 SMOLTALK_APIGEN_ALIASED = DatasetSourceConfig(
     name="HuggingFaceTB/smoltalk",
@@ -130,6 +163,7 @@ SMOLTALK_APIGEN_ALIASED = DatasetSourceConfig(
     split="train",
     is_sft=True,
     chat_template_fn=format_apigen_aliased,
+    token_loss_weight_fn=_STOP_WEIGHT,
 )
 SMOLTALK_METAMATH = DatasetSourceConfig(
     name="HuggingFaceTB/smoltalk",
@@ -137,6 +171,7 @@ SMOLTALK_METAMATH = DatasetSourceConfig(
     split="train",
     is_sft=True,
     chat_template_fn=messages_format,
+    token_loss_weight_fn=_STOP_WEIGHT,
 )
 
 SMOLTALK_MAGPIE_TEST = SMOLTALK_MAGPIE.model_copy(update={"split": "test"})
@@ -151,6 +186,7 @@ GSM8K = DatasetSourceConfig(
     split="train",
     is_sft=True,
     chat_template_fn=format_gsm8k,
+    token_loss_weight_fn=_STOP_WEIGHT,
 )
 GSM8K_TEST = GSM8K.model_copy(update={"split": "test"})
 
@@ -160,6 +196,7 @@ WHEN2CALL = DatasetSourceConfig(
     split="train",
     is_sft=True,
     chat_template_fn=format_when2call,
+    token_loss_weight_fn=_STOP_WEIGHT,
 )
 WHEN2CALL_TEST = DatasetSourceConfig(
     name="nvidia/When2Call",
@@ -167,6 +204,7 @@ WHEN2CALL_TEST = DatasetSourceConfig(
     split="mcq",
     is_sft=True,
     chat_template_fn=format_when2call,
+    token_loss_weight_fn=_STOP_WEIGHT,
 )
 
 SQUAD_V2 = DatasetSourceConfig(
@@ -174,6 +212,7 @@ SQUAD_V2 = DatasetSourceConfig(
     split="train",
     is_sft=True,
     chat_template_fn=format_squad,
+    token_loss_weight_fn=_STOP_WEIGHT,
 )
 SQUAD_V2_VAL = SQUAD_V2.model_copy(update={"split": "validation"})
 SQUAD_V2_ANSWERABLE = SQUAD_V2.model_copy(update={"chat_template_fn": format_squad_answerable})
@@ -185,6 +224,7 @@ HOTPOT = DatasetSourceConfig(
     split="train",
     is_sft=True,
     chat_template_fn=format_hotpot,
+    token_loss_weight_fn=_STOP_WEIGHT,
 )
 HOTPOT_VAL = HOTPOT.model_copy(update={"split": "validation"})
 
@@ -193,6 +233,7 @@ SYNTHQA = DatasetSourceConfig(
     split="train",
     is_sft=True,
     chat_template_fn=format_synthqa,
+    token_loss_weight_fn=_STOP_WEIGHT,
 )
 SYNTHQA_TEST = SYNTHQA.model_copy(update={"split": "test"})
 
@@ -201,6 +242,7 @@ TEAPOT_CHAT = DatasetSourceConfig(
     split="train",
     is_sft=True,
     chat_template_fn=format_teapot_chat,
+    token_loss_weight_fn=_STOP_WEIGHT,
 )
 
 
@@ -334,8 +376,11 @@ def iterate_encoded(
                 if held != is_eval:
                     continue
             encoded = encode_pair(tokenizer, prompt, answer, seq_len)
-            if encoded is not None:
-                yield encoded
+            if encoded is None:
+                continue
+            if src.token_loss_weight_fn is not None:
+                encoded["loss_weights"] = [float(value) for value in src.token_loss_weight_fn(encoded, tokenizer)]
+            yield encoded
 
 
 class DatasetRegistry:

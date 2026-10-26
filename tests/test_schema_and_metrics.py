@@ -2,9 +2,12 @@
 
 from teapottrainer.config import DatasetSpec, ModelConfig, TrainingConfig
 from teapottrainer.datasets import (
+    STOP_TOKEN_LOSS_WEIGHT,
     DatasetSourceConfig,
     GSM8K_TEST,
     SMOLTALK_APIGEN_TEST,
+    SQUAD_V2_ANSWERABLE,
+    eos_loss_weight,
     encode_pair,
     holdout_membership,
     iterate_encoded,
@@ -54,6 +57,7 @@ def test_training_config_fields_are_unchanged():
         "is_sft",
         "preprocess_fn",
         "chat_template_fn",
+        "token_loss_weight_fn",
     }
     assert set(ModelConfig.model_fields) == {
         "model_type",
@@ -480,4 +484,72 @@ def test_synthqa_and_teapot_chat_prompts():
     assert chat_prompt.endswith("Assistant:\n")
     assert chat_answer == "I am Teapot"
     assert "You are Teapot." in chat_prompt
+
+
+def test_dataset_can_upweight_the_stop_token():
+    class Tok(_CharTokenizer):
+        eos_token = "\x01"
+        eos_token_id = 2
+
+    source = DatasetSourceConfig(
+        name="short",
+        split="test",
+        is_sft=True,
+        chat_template_fn=lambda row: ("User: hi\n\nAssistant:\n", row["answer"]),
+        token_loss_weight_fn=eos_loss_weight(STOP_TOKEN_LOSS_WEIGHT),
+    )
+    encoded = next(iterate_encoded(source, Tok(), seq_len=64, rows=[{"answer": "yes"}]))
+    assert encoded["labels"][-1] == Tok.eos_token_id
+    assert encoded["loss_weights"][-1] == STOP_TOKEN_LOSS_WEIGHT
+    assert all(weight == 1.0 for weight, label in zip(encoded["loss_weights"], encoded["labels"]) if label != Tok.eos_token_id)
+    assert SQUAD_V2_ANSWERABLE.token_loss_weight_fn is not None
+    plain = DatasetSourceConfig(
+        name="plain",
+        split="test",
+        is_sft=True,
+        chat_template_fn=lambda row: ("User: hi\n\nAssistant:\n", row["answer"]),
+    )
+    unweighted = next(iterate_encoded(plain, Tok(), seq_len=64, rows=[{"answer": "yes"}]))
+    assert "loss_weights" not in unweighted
+
+
+def test_token_weight_changes_the_loss_and_survives_into_the_trainer():
+    import os
+    import tempfile
+
+    import torch
+
+    from teapottrainer.trainer import TeapotTrainer, weighted_cross_entropy
+
+    logits = torch.zeros(1, 3, 4)
+    logits[0, 0, 0] = 8.0
+    logits[0, 1, 2] = 8.0
+    labels = torch.tensor([[-100, 1, 2]])
+    even = weighted_cross_entropy(logits, labels, torch.ones(1, 3))
+    stop_heavier = weighted_cross_entropy(logits, labels, torch.tensor([[1.0, 8.0, 1.0]]))
+    content_heavier = weighted_cross_entropy(logits, labels, torch.tensor([[1.0, 1.0, 8.0]]))
+    assert stop_heavier > even > content_heavier
+
+    previous = os.getcwd()
+    workspace = tempfile.mkdtemp()
+    try:
+        os.chdir(workspace)
+        marked = DatasetSourceConfig(
+            name="marked",
+            split="train",
+            is_sft=True,
+            chat_template_fn=lambda row: ("User: hi\n\nAssistant:\n", "yes"),
+            token_loss_weight_fn=eos_loss_weight(5),
+        )
+        config = TrainingConfig(
+            model=ModelConfig(model_type="llama", hidden_size=32, layers=1, heads=4, kv_heads=4, intermediate=64, seq_len=32),
+            sft_datasets=[DatasetSpec(source=marked, target_tokens=32)],
+            tokenizer="gpt2",
+        )
+        trainer = TeapotTrainer(config)
+        materialized = trainer._materialize_sources(config.sft_datasets)
+        trainer.writer.close()
+    finally:
+        os.chdir(previous)
+    assert materialized[0].token_loss_weight_fn is marked.token_loss_weight_fn
 
