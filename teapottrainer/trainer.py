@@ -43,6 +43,21 @@ def _unwrap(model):
     return model._orig_mod if hasattr(model, "_orig_mod") else model
 
 
+def align_tokenizer_ids(model, tokenizer) -> None:
+    """Point the checkpoint's stop id at the tokenizer end token.
+
+    A freshly built Llama config uses eos id 2. With the GPT-2 tokenizer that
+    id is the character ``#``, while the trained end token is ``<|endoftext|>``.
+    """
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_id is None:
+        return
+    model.config.eos_token_id = eos_id
+    generation = getattr(model, "generation_config", None)
+    if generation is not None:
+        generation.eos_token_id = eos_id
+
+
 def weighted_cross_entropy(logits, labels, weights):
     """Mean cross-entropy over supervised tokens, weighted per label.
 
@@ -600,6 +615,7 @@ class TeapotTrainer:
         else:
             print("Building a new model from the config.")
             model = self._build_model(vocab_size=len(tokenizer))
+        align_tokenizer_ids(model, tokenizer)
         model.to(self.device)
         total_params = self._print_model_summary(model)
         self._checkpointing = total_params >= 50_000_000 and hasattr(model, "gradient_checkpointing_enable")

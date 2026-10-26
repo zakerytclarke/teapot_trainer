@@ -81,22 +81,26 @@ def test_train_script_uses_the_same_constructor():
     assert config.model.layers == 26
     assert config.model.hidden_size == 512
     assert config.tokenizer == "gpt2"
-    assert config.init_from.endswith("runs/teapot-gpt2-770ea2/checkpoints/best")
+    assert config.init_from is None
     assert TrainingConfig().init_from is None
-    assert config.pretrain_datasets == []
-    assert config.lr == 5e-5
+    assert config.pretrain_datasets[0].target_tokens == 2_000_000_000
+    assert config.lr == 1e-3
     names = []
-    budgets = {}
     for spec in config.sft_datasets:
         names.append((spec.source.name, spec.source.subset))
-        budgets[(spec.source.name, spec.source.subset, spec.source.chat_template_fn)] = spec.target_tokens
     assert ("HuggingFaceTB/smoltalk", "all") not in names
     assert ("nvidia/When2Call", "train_sft") in names
     assert ("teapotai/synthqa", None) in names
     assert ("teapotai/teapot-chat", None) in names
     answerable = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn.__name__ == "format_squad_answerable")
     unanswerable = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn.__name__ == "format_squad_unanswerable")
-    assert answerable == 4 * unanswerable
+    assert answerable == 28_000_000
+    assert unanswerable == 1_000_000
+    synth_answerable = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn.__name__ == "format_synthqa_answerable")
+    synth_unanswerable = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn.__name__ == "format_synthqa_unanswerable")
+    assert synth_answerable == 10_000_000
+    assert synth_unanswerable == 2_000_000
+    assert sum(spec.target_tokens for spec in config.sft_datasets) == 124_000_000
     eval_names = [(spec.source.name, spec.source.split) for spec in config.eval_datasets]
     assert ("teapotai/synthqa", "test") in eval_names
     assert ("teapotai/teapot-chat", "train") in eval_names
@@ -289,6 +293,7 @@ def test_hotpot_keeps_supporting_pages_near_the_question():
         },
     })
     assert answer == "yes"
+    assert "does not contain the answer" not in prompt
     assert prompt.index("Ada Lovelace") > prompt.index("Distractor City")
     assert prompt.index("Were they the same nationality?") > prompt.index("Ada Lovelace")
 
@@ -484,6 +489,49 @@ def test_synthqa_and_teapot_chat_prompts():
     assert chat_prompt.endswith("Assistant:\n")
     assert chat_answer == "I am Teapot"
     assert "You are Teapot." in chat_prompt
+    from teapottrainer.formatting import format_synthqa_answerable, format_synthqa_unanswerable
+
+    assert format_synthqa_answerable({
+        "context": "The kiln opened in 1902.",
+        "question": "Who funded it?",
+        "type": "unanswerable",
+        "answer": None,
+    }) is None
+    kept, kept_answer = format_synthqa_unanswerable({
+        "context": "The kiln opened in 1902.",
+        "question": "Who funded it?",
+        "type": "unanswerable",
+        "answer": None,
+    })
+    assert kept_answer == "The context does not contain the answer."
+    assert "Who funded it?" in kept
+
+
+def test_generation_stops_on_the_tokenizer_end_token():
+    from teapottrainer.evals import generation_stop_ids
+    from teapottrainer.trainer import align_tokenizer_ids
+
+    class Tok:
+        eos_token_id = 50256
+        pad_token_id = 50256
+
+    assert generation_stop_ids(Tok()) == {"pad_token_id": 50256, "eos_token_id": 50256}
+
+    class Config:
+        eos_token_id = 2
+
+    class Generation:
+        eos_token_id = 2
+
+    class Model:
+        def __init__(self):
+            self.config = Config()
+            self.generation_config = Generation()
+
+    model = Model()
+    align_tokenizer_ids(model, Tok())
+    assert model.config.eos_token_id == 50256
+    assert model.generation_config.eos_token_id == 50256
 
 
 def test_dataset_can_upweight_the_stop_token():

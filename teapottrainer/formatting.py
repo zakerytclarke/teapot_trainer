@@ -18,6 +18,9 @@ RAG_SYSTEM = (
     f"If the context does not contain the answer, reply exactly: {ABSTAIN_TEXT}"
 )
 
+# Hotpot rows all have an answer, so this prompt does not offer the abstention sentence.
+ANSWER_SYSTEM = "Answer the question using only the context. Reply with the answer only."
+
 DECISION_RULES = (
     "You are a careful assistant with access to tools.\n"
     "If a tool can satisfy the request and every required argument is present, "
@@ -169,7 +172,7 @@ def format_hotpot(row: dict) -> tuple[str, str]:
     question = str(row.get("question") or "").strip()
     answer = str(row.get("answer") or "").strip()
     prompt = (
-        f"System: {RAG_SYSTEM}\n\n"
+        f"System: {ANSWER_SYSTEM}\n\n"
         f"User: Context:\n{rendered}\n\nQuestion: {question}\n\nAssistant:\n"
     )
     return prompt, answer
@@ -300,6 +303,18 @@ def _as_text(value: Any) -> str:
     if isinstance(value, str):
         return value.strip()
     return json.dumps(value, ensure_ascii=False)
+
+
+def format_synthqa_answerable(row: dict) -> tuple[str, str] | None:
+    if row.get("type") == "unanswerable" or not _as_text(row.get("answer")):
+        return None
+    return format_synthqa(row)
+
+
+def format_synthqa_unanswerable(row: dict) -> tuple[str, str] | None:
+    if row.get("type") != "unanswerable" and _as_text(row.get("answer")):
+        return None
+    return format_synthqa(row)
 
 
 def format_synthqa(row: dict) -> tuple[str, str] | None:

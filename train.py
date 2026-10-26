@@ -1,11 +1,10 @@
-"""Corrective assistant run.
+"""Pretrain, then supervised assistant training.
 
-Starts from the finished pretrain-plus-SFT checkpoint and continues on one
-tool template, answerable-heavy passages, and a smaller chat replay.
-SynthQA and Teapot chat are in both the supervised mix and the evals.
+The first run's pretrain snapshot was overwritten by a later supervised
+checkpoint, so this script pretrains again and keeps that snapshot under
+``checkpoints/pretrain``. Supervised training then uses the answerable-heavy
+mix. Generation stops on the tokenizer end token.
 """
-
-from pathlib import Path
 
 from teapottrainer import (
     DatasetSpec,
@@ -25,8 +24,9 @@ from teapottrainer import (
     SQUAD_V2_ANSWERABLE,
     SQUAD_V2_UNANSWERABLE,
     SQUAD_V2_VAL,
-    SYNTHQA,
+    SYNTHQA_ANSWERABLE,
     SYNTHQA_TEST,
+    SYNTHQA_UNANSWERABLE,
     TEAPOT_CHAT,
     TeapotTrainer,
     TrainingConfig,
@@ -34,14 +34,11 @@ from teapottrainer import (
     WHEN2CALL_TEST,
 )
 
-# The best checkpoint from the 2B pretrain plus the first supervised run.
-INIT_FROM = Path(__file__).resolve().parent / "runs" / "teapot-gpt2-770ea2" / "checkpoints" / "best"
-
 
 def build_config() -> TrainingConfig:
-    # Same 109M Llama. This run does not pretrain again.
-    # Tool calls, including renamed APIGen tools and GSM as calculator calls,
-    # share one system template. SQuAD answerable tokens are 4x the unanswerable ones.
+    # Same 109M Llama. Pretrain lr is 1e-3; supervised lr is 0.2x that.
+    # Hotpot has no unanswerable rows, so its prompt does not mention abstention.
+    # SynthQA answerable and unanswerable are separate budgets.
     return TrainingConfig(
         model=ModelConfig(
             model_type="llama",
@@ -52,25 +49,27 @@ def build_config() -> TrainingConfig:
             intermediate_size=1408,
             max_position_embeddings=2048,
         ),
-        pretrain_datasets=[],
+        pretrain_datasets=[
+            DatasetSpec(source=FINEWEB_EDU, target_tokens=2_000_000_000, weight=1.0),
+        ],
         sft_datasets=[
-            # Positive calls on the shared decision template.
-            DatasetSpec(source=SMOLTALK_APIGEN_DECISION, target_tokens=36_000_000, weight=1.0),
-            # Same calls with the function names replaced, so the name has to be read.
-            DatasetSpec(source=SMOLTALK_APIGEN_ALIASED, target_tokens=12_000_000, weight=1.0),
-            # Ask or refuse. This split has almost no positive calls.
-            DatasetSpec(source=WHEN2CALL, target_tokens=8_000_000, weight=1.0),
+            # The call format is already easy. Renamed tools are the generalization.
+            DatasetSpec(source=SMOLTALK_APIGEN_DECISION, target_tokens=16_000_000, weight=1.0),
+            DatasetSpec(source=SMOLTALK_APIGEN_ALIASED, target_tokens=24_000_000, weight=1.0),
+            # Ask or refuse. This split has almost no positive calls, so keep it small.
+            DatasetSpec(source=WHEN2CALL, target_tokens=3_000_000, weight=1.0),
             # Grade-school problems as calculator calls.
-            DatasetSpec(source=GSM8K, target_tokens=6_000_000, weight=1.0),
-            # Passages. Answerable rows outnumber abstentions four to one.
-            DatasetSpec(source=SQUAD_V2_ANSWERABLE, target_tokens=16_000_000, weight=1.0),
-            DatasetSpec(source=SQUAD_V2_UNANSWERABLE, target_tokens=4_000_000, weight=1.0),
-            DatasetSpec(source=HOTPOT, target_tokens=8_000_000, weight=1.0),
-            DatasetSpec(source=SYNTHQA, target_tokens=6_000_000, weight=1.0),
-            # A smaller replay of the assistant voice.
-            DatasetSpec(source=SMOLTALK_MAGPIE, target_tokens=14_000_000, weight=1.0),
+            DatasetSpec(source=GSM8K, target_tokens=12_000_000, weight=1.0),
+            # Passages. The abstention sentence is a small slice, not the default answer.
+            DatasetSpec(source=SQUAD_V2_ANSWERABLE, target_tokens=28_000_000, weight=1.0),
+            DatasetSpec(source=SQUAD_V2_UNANSWERABLE, target_tokens=1_000_000, weight=1.0),
+            DatasetSpec(source=HOTPOT, target_tokens=10_000_000, weight=1.0),
+            DatasetSpec(source=SYNTHQA_ANSWERABLE, target_tokens=10_000_000, weight=1.0),
+            DatasetSpec(source=SYNTHQA_UNANSWERABLE, target_tokens=2_000_000, weight=1.0),
+            # Short assistant text. Long chat is only a small replay.
+            DatasetSpec(source=SMOLTALK_MAGPIE, target_tokens=4_000_000, weight=1.0),
             DatasetSpec(source=SMOLTALK_CONSTRAINTS, target_tokens=8_000_000, weight=1.0),
-            DatasetSpec(source=TEAPOT_CHAT, target_tokens=4_000_000, weight=1.0),
+            DatasetSpec(source=TEAPOT_CHAT, target_tokens=6_000_000, weight=1.0),
         ],
         eval_datasets=[
             DatasetSpec(source=FINEWEB_EDU, target_tokens=1_000_000),
@@ -85,19 +84,16 @@ def build_config() -> TrainingConfig:
             DatasetSpec(source=TEAPOT_CHAT, target_tokens=200_000),
         ],
         tokenizer="gpt2",
-        init_from=str(INIT_FROM),
         batch_size=8,
         grad_accum=16,
-        lr=5e-5,
-        weight_decay=0.0,
+        lr=1e-3,
+        weight_decay=0.1,
         eval_every_percent=10.0,
         compile=True,
     )
 
 
 def main():
-    if not (INIT_FROM / "config.json").is_file():
-        raise SystemExit(f"Missing init checkpoint: {INIT_FROM}")
     config = build_config()
     trainer = TeapotTrainer(config=config)
     trainer.eval_example_cap = 32

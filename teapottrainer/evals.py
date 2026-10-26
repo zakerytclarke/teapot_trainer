@@ -155,6 +155,18 @@ def load_task_rows(
     return picked
 
 
+def generation_stop_ids(tokenizer) -> dict:
+    """Stop on the tokenizer end token, not the architecture default."""
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_id is None:
+        pad_id = eos_id if eos_id is not None else 0
+    kwargs = {"pad_token_id": pad_id}
+    if eos_id is not None:
+        kwargs["eos_token_id"] = eos_id
+    return kwargs
+
+
 def _generate(model, tokenizer, prompts: list[str], max_new: int, seq_len: int, device) -> list[str]:
     if not prompts:
         return []
@@ -182,8 +194,8 @@ def _generate(model, tokenizer, prompts: list[str], max_new: int, seq_len: int, 
             attention_mask=mask_tensor,
             max_new_tokens=max_new,
             do_sample=False,
-            pad_token_id=pad_id,
             use_cache=True,
+            **generation_stop_ids(tokenizer),
         )
     model.config.use_cache = previous_cache
     if was_training:

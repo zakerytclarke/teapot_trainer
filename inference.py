@@ -11,6 +11,9 @@ import sys
 import torch
 from transformers import AutoTokenizer, LlamaForCausalLM
 
+from teapottrainer.evals import generation_stop_ids
+from teapottrainer.trainer import align_tokenizer_ids
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -168,6 +171,7 @@ def main():
         model_path,
         torch_dtype="auto",
     ).to(device)
+    align_tokenizer_ids(model, tokenizer)
     model.eval()
 
     inputs = tokenizer(
@@ -178,9 +182,9 @@ def main():
 
     generation_kwargs = {
         "max_new_tokens": args.max_new_tokens,
-        "pad_token_id": tokenizer.pad_token_id,
         "use_cache": True,
         "repetition_penalty": args.repetition_penalty,
+        **generation_stop_ids(tokenizer),
     }
 
     if args.temperature == 0:

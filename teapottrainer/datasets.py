@@ -24,6 +24,8 @@ from .formatting import (
     format_squad_answerable,
     format_squad_unanswerable,
     format_synthqa,
+    format_synthqa_answerable,
+    format_synthqa_unanswerable,
     format_teapot_chat,
     format_when2call,
     messages_format,
@@ -236,6 +238,8 @@ SYNTHQA = DatasetSourceConfig(
     token_loss_weight_fn=_STOP_WEIGHT,
 )
 SYNTHQA_TEST = SYNTHQA.model_copy(update={"split": "test"})
+SYNTHQA_ANSWERABLE = SYNTHQA.model_copy(update={"chat_template_fn": format_synthqa_answerable})
+SYNTHQA_UNANSWERABLE = SYNTHQA.model_copy(update={"chat_template_fn": format_synthqa_unanswerable})
 
 TEAPOT_CHAT = DatasetSourceConfig(
     name="teapotai/teapot-chat",
