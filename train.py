@@ -4,7 +4,9 @@ Tokenizer is HuggingFaceTB/SmolLM2-135M. It is a 49,152-word vocabulary
 trained on FineWeb-Edu, math, and code, and it keeps each digit as its own
 token, so a year in the passage and the same year in the answer are the same
 ids. The GPT-2 checkpoint cannot be loaded with this vocabulary, so pretraining
-starts over and is saved to checkpoints/pretrain.
+starts over and is saved to checkpoints/pretrain. Budgets match the last
+run's speed: about 73k tokens/s for pretraining and 24k for supervised
+training, so 3.1B tokens is 12 hours and 480M is 6 hours.
 """
 
 from teapottrainer import (
@@ -39,7 +41,7 @@ from teapottrainer import (
 def build_config() -> TrainingConfig:
     # Same 109M Llama. Pretrain lr is 1e-3; supervised lr is 0.2x that.
     # Passage answer and abstain budgets match. Ask-or-refuse matches the
-    # positive tool-call budgets. Hotpot has no unanswerable rows.
+    # renamed-tool budget. Hotpot has no unanswerable rows.
     return TrainingConfig(
         model=ModelConfig(
             model_type="llama",
@@ -51,21 +53,24 @@ def build_config() -> TrainingConfig:
             max_position_embeddings=2048,
         ),
         pretrain_datasets=[
-            DatasetSpec(source=FINEWEB_EDU, target_tokens=20_000_000_000, weight=1.0),
+            DatasetSpec(source=FINEWEB_EDU, target_tokens=3_100_000_000, weight=1.0),
         ],
         sft_datasets=[
-            DatasetSpec(source=SMOLTALK_APIGEN_DECISION, target_tokens=12_000_000, weight=1.0),
-            DatasetSpec(source=SMOLTALK_APIGEN_ALIASED, target_tokens=16_000_000, weight=1.0),
-            DatasetSpec(source=WHEN2CALL, target_tokens=24_000_000, weight=1.0),
-            DatasetSpec(source=GSM8K, target_tokens=4_000_000, weight=1.0),
-            DatasetSpec(source=SQUAD_V2_ANSWERABLE, target_tokens=14_000_000, weight=1.0),
-            DatasetSpec(source=SQUAD_V2_UNANSWERABLE, target_tokens=14_000_000, weight=1.0),
-            DatasetSpec(source=HOTPOT, target_tokens=6_000_000, weight=1.0),
-            DatasetSpec(source=SYNTHQA_ANSWERABLE, target_tokens=6_000_000, weight=1.0),
-            DatasetSpec(source=SYNTHQA_UNANSWERABLE, target_tokens=6_000_000, weight=1.0),
-            DatasetSpec(source=SMOLTALK_MAGPIE, target_tokens=2_000_000, weight=1.0),
-            DatasetSpec(source=SMOLTALK_CONSTRAINTS, target_tokens=6_000_000, weight=1.0),
-            DatasetSpec(source=TEAPOT_CHAT, target_tokens=6_000_000, weight=1.0),
+            # Positive calls. Renamed tools are the ones that have to be read.
+            DatasetSpec(source=SMOLTALK_APIGEN_DECISION, target_tokens=48_000_000, weight=1.0),
+            DatasetSpec(source=SMOLTALK_APIGEN_ALIASED, target_tokens=72_000_000, weight=1.0),
+            # Ask or refuse, same prompt, matched to the renamed-tool budget.
+            DatasetSpec(source=WHEN2CALL, target_tokens=72_000_000, weight=1.0),
+            DatasetSpec(source=GSM8K, target_tokens=8_000_000, weight=1.0),
+            # Answer and abstain are equal. Hotpot rows all have an answer.
+            DatasetSpec(source=SQUAD_V2_ANSWERABLE, target_tokens=60_000_000, weight=1.0),
+            DatasetSpec(source=SQUAD_V2_UNANSWERABLE, target_tokens=60_000_000, weight=1.0),
+            DatasetSpec(source=HOTPOT, target_tokens=24_000_000, weight=1.0),
+            DatasetSpec(source=SYNTHQA_ANSWERABLE, target_tokens=36_000_000, weight=1.0),
+            DatasetSpec(source=SYNTHQA_UNANSWERABLE, target_tokens=36_000_000, weight=1.0),
+            DatasetSpec(source=SMOLTALK_MAGPIE, target_tokens=8_000_000, weight=1.0),
+            DatasetSpec(source=SMOLTALK_CONSTRAINTS, target_tokens=28_000_000, weight=1.0),
+            DatasetSpec(source=TEAPOT_CHAT, target_tokens=28_000_000, weight=1.0),
         ],
         eval_datasets=[
             DatasetSpec(source=FINEWEB_EDU, target_tokens=1_000_000),
