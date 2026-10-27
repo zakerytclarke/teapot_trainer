@@ -80,10 +80,10 @@ def test_train_script_uses_the_same_constructor():
     assert dumped == LOCKED_TRAINING_FIELDS
     assert config.model.layers == 26
     assert config.model.hidden_size == 512
-    assert config.tokenizer == "gpt2"
+    assert config.tokenizer == "HuggingFaceTB/SmolLM2-135M"
     assert config.init_from is None
     assert TrainingConfig().init_from is None
-    assert config.pretrain_datasets[0].target_tokens == 2_000_000_000
+    assert config.pretrain_datasets[0].target_tokens == 20_000_000_000
     assert config.lr == 1e-3
     names = []
     for spec in config.sft_datasets:
@@ -94,13 +94,18 @@ def test_train_script_uses_the_same_constructor():
     assert ("teapotai/teapot-chat", None) in names
     answerable = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn.__name__ == "format_squad_answerable")
     unanswerable = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn.__name__ == "format_squad_unanswerable")
-    assert answerable == 28_000_000
-    assert unanswerable == 1_000_000
+    assert answerable == unanswerable == 14_000_000
     synth_answerable = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn.__name__ == "format_synthqa_answerable")
     synth_unanswerable = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn.__name__ == "format_synthqa_unanswerable")
-    assert synth_answerable == 10_000_000
-    assert synth_unanswerable == 2_000_000
-    assert sum(spec.target_tokens for spec in config.sft_datasets) == 124_000_000
+    assert synth_answerable == synth_unanswerable == 6_000_000
+    when2call = next(spec.target_tokens for spec in config.sft_datasets if spec.source.name == "nvidia/When2Call")
+    calls = sum(
+        spec.target_tokens
+        for spec in config.sft_datasets
+        if spec.source.chat_template_fn.__name__ in {"format_apigen_decision", "format_apigen_aliased"}
+    )
+    assert when2call >= calls * 0.8
+    assert sum(spec.target_tokens for spec in config.sft_datasets) == 116_000_000
     eval_names = [(spec.source.name, spec.source.split) for spec in config.eval_datasets]
     assert ("teapotai/synthqa", "test") in eval_names
     assert ("teapotai/teapot-chat", "train") in eval_names
