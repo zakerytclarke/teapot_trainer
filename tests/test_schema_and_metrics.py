@@ -81,27 +81,28 @@ def test_train_script_uses_the_same_constructor():
     assert config.model.layers == 26
     assert config.model.hidden_size == 512
     assert config.tokenizer == "HuggingFaceTB/SmolLM2-135M"
-    assert config.init_from is None
+    assert config.init_from.endswith("runs/teapot-SmolLM2-135M-39cacf/checkpoints/pretrain")
     assert TrainingConfig().init_from is None
-    assert config.pretrain_datasets[0].target_tokens == 3_100_000_000
-    assert config.lr == 1e-3
+    assert config.pretrain_datasets == []
+    assert config.lr == 5e-5
     names = []
     for spec in config.sft_datasets:
         names.append((spec.source.name, spec.source.subset))
     assert ("HuggingFaceTB/smoltalk", "all") not in names
+    assert ("HuggingFaceFW/fineweb-edu", None) in names
+    assert ("HuggingFaceTB/smoltalk", "everyday-conversations") in names
     assert ("nvidia/When2Call", "train_sft") in names
     assert ("teapotai/synthqa", None) in names
     assert ("teapotai/teapot-chat", None) in names
-    answerable = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn.__name__ == "format_squad_answerable")
-    unanswerable = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn.__name__ == "format_squad_unanswerable")
-    assert answerable == unanswerable == 60_000_000
-    synth_answerable = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn.__name__ == "format_synthqa_answerable")
-    synth_unanswerable = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn.__name__ == "format_synthqa_unanswerable")
-    assert synth_answerable == synth_unanswerable == 36_000_000
-    when2call = next(spec.target_tokens for spec in config.sft_datasets if spec.source.name == "nvidia/When2Call")
-    aliased = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn.__name__ == "format_apigen_aliased")
-    assert when2call == aliased == 72_000_000
-    assert sum(spec.target_tokens for spec in config.sft_datasets) == 480_000_000
+    answerable = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn and spec.source.chat_template_fn.__name__ == "format_squad_answerable")
+    unanswerable = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn and spec.source.chat_template_fn.__name__ == "format_squad_unanswerable")
+    assert answerable == 20_000_000
+    assert unanswerable == 5_000_000
+    synth_answerable = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn and spec.source.chat_template_fn.__name__ == "format_synthqa_answerable")
+    synth_unanswerable = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn and spec.source.chat_template_fn.__name__ == "format_synthqa_unanswerable")
+    assert synth_answerable == 12_000_000
+    assert synth_unanswerable == 3_000_000
+    assert sum(spec.target_tokens for spec in config.sft_datasets) == 120_000_000
     eval_names = [(spec.source.name, spec.source.split) for spec in config.eval_datasets]
     assert ("teapotai/synthqa", "test") in eval_names
     assert ("teapotai/teapot-chat", "train") in eval_names
@@ -552,6 +553,11 @@ def test_dataset_can_upweight_the_stop_token():
     assert encoded["loss_weights"][-1] == STOP_TOKEN_LOSS_WEIGHT
     assert all(weight == 1.0 for weight, label in zip(encoded["loss_weights"], encoded["labels"]) if label != Tok.eos_token_id)
     assert SQUAD_V2_ANSWERABLE.token_loss_weight_fn is not None
+
+    class Eos:
+        eos_token_id = 2
+
+    assert SQUAD_V2_ANSWERABLE.token_loss_weight_fn({"labels": [-100, 7, 2]}, Eos()) == [1.0, 4.0, 8.0]
     plain = DatasetSourceConfig(
         name="plain",
         split="test",

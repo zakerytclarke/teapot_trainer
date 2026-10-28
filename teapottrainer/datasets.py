@@ -70,6 +70,33 @@ def eos_loss_weight(weight: float = STOP_TOKEN_LOSS_WEIGHT) -> Callable[[dict, A
 
 _STOP_WEIGHT = eos_loss_weight(STOP_TOKEN_LOSS_WEIGHT)
 
+# Supervised answer tokens, relative to a masked prompt token. The end token stays higher.
+SPAN_TOKEN_LOSS_WEIGHT = 4.0
+
+
+def span_loss_weight(
+    answer_weight: float = SPAN_TOKEN_LOSS_WEIGHT,
+    eos_weight: float = STOP_TOKEN_LOSS_WEIGHT,
+) -> Callable[[dict, Any], list[float]]:
+    """Upweight the answer span, and upweight the end token further."""
+
+    def apply(example: dict, tokenizer) -> list[float]:
+        eos_id = getattr(tokenizer, "eos_token_id", None)
+        weights = []
+        for label in example["labels"]:
+            if eos_id is not None and label == eos_id:
+                weights.append(float(eos_weight))
+            elif label != -100:
+                weights.append(float(answer_weight))
+            else:
+                weights.append(1.0)
+        return weights
+
+    return apply
+
+
+_SPAN_WEIGHT = span_loss_weight()
+
 
 FINEWEB_EDU = DatasetSourceConfig(
     name="HuggingFaceFW/fineweb-edu",
@@ -214,7 +241,7 @@ SQUAD_V2 = DatasetSourceConfig(
     split="train",
     is_sft=True,
     chat_template_fn=format_squad,
-    token_loss_weight_fn=_STOP_WEIGHT,
+    token_loss_weight_fn=_SPAN_WEIGHT,
 )
 SQUAD_V2_VAL = SQUAD_V2.model_copy(update={"split": "validation"})
 SQUAD_V2_ANSWERABLE = SQUAD_V2.model_copy(update={"chat_template_fn": format_squad_answerable})
@@ -226,7 +253,7 @@ HOTPOT = DatasetSourceConfig(
     split="train",
     is_sft=True,
     chat_template_fn=format_hotpot,
-    token_loss_weight_fn=_STOP_WEIGHT,
+    token_loss_weight_fn=_SPAN_WEIGHT,
 )
 HOTPOT_VAL = HOTPOT.model_copy(update={"split": "validation"})
 
@@ -235,7 +262,7 @@ SYNTHQA = DatasetSourceConfig(
     split="train",
     is_sft=True,
     chat_template_fn=format_synthqa,
-    token_loss_weight_fn=_STOP_WEIGHT,
+    token_loss_weight_fn=_SPAN_WEIGHT,
 )
 SYNTHQA_TEST = SYNTHQA.model_copy(update={"split": "test"})
 SYNTHQA_ANSWERABLE = SYNTHQA.model_copy(update={"chat_template_fn": format_synthqa_answerable})
