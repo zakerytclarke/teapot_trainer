@@ -640,7 +640,100 @@ def test_resume_directory_falls_back_when_the_live_dir_is_incomplete():
         assert trainer._read_resume()["tokens"] == 12
 
 
-class _StopAfterCheckpoint(Exception):
+def test_eval_suite_records_task_scores_with_holdout_loss():
+    import json
+    import os
+    import shutil
+
+    import teapottrainer.trainer as trainer_mod
+    from teapottrainer.trainer import TeapotTrainer
+
+    config = TrainingConfig(
+        model=ModelConfig(
+            model_type="llama",
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            intermediate_size=64,
+            max_position_embeddings=8,
+        ),
+        pretrain_datasets=[],
+        sft_datasets=[],
+        eval_datasets=[
+            DatasetSpec(
+                source=DatasetSourceConfig(name="HuggingFaceFW/fineweb-edu", split="train", is_sft=False),
+                target_tokens=8,
+            ),
+            DatasetSpec(
+                source=DatasetSourceConfig(
+                    name="rajpurkar/squad_v2",
+                    split="validation",
+                    is_sft=True,
+                    chat_template_fn=lambda row: ("q", "a"),
+                ),
+                target_tokens=8,
+            ),
+        ],
+        tokenizer="local-test",
+        compile=False,
+        eval_every_percent=101,
+        holdout_ratio=0.0,
+        seed=1,
+    )
+    trainer = TeapotTrainer(config)
+    created = trainer.output_dir
+    trainer.writer.close()
+
+    class _Quiet:
+        def add_scalar(self, *args, **kwargs):
+            return None
+
+        def flush(self):
+            return None
+
+        def close(self):
+            return None
+
+    trainer.writer = _Quiet()
+    trainer._checkpointing = False
+    seen = []
+
+    def lm_loss(model, tokenizer, src):
+        seen.append(("lm", src.name))
+        return 2.5
+
+    def task_score(model, tokenizer, src, **kwargs):
+        seen.append(("task", src.name))
+        return {"metrics": {"answerable_f1": 0.25, "loss": 1.5, "support_answerable": 4.0}, "samples": []}
+
+    trainer._lm_loss = lm_loss
+    trainer._save_weights = lambda model, tokenizer, directory: os.makedirs(directory, exist_ok=True)
+    original = trainer_mod.evaluate_source
+    trainer_mod.evaluate_source = task_score
+
+    class _Model:
+        def train(self):
+            return None
+
+    try:
+        flat = trainer.run_evaluation_suite(_Model(), None, "pretrain_10pct", 3)
+        with open(os.path.join(created, "metrics.jsonl"), encoding="utf-8") as handle:
+            saved = json.loads(handle.read())
+        with open(os.path.join(created, "checkpoints", "best", "metrics.json"), encoding="utf-8") as handle:
+            best = json.load(handle)
+    finally:
+        trainer_mod.evaluate_source = original
+        trainer.writer.close()
+        shutil.rmtree(created, ignore_errors=True)
+    assert ("lm", "HuggingFaceFW/fineweb-edu") in seen
+    assert ("task", "rajpurkar/squad_v2") in seen
+    assert flat["fineweb-edu/train/loss"] == 2.5
+    assert flat["squad_v2/validation/answerable_f1"] == 0.25
+    assert flat["squad_v2/validation/loss"] == 1.5
+    assert saved["metrics"]["fineweb-edu/train/loss"] == 2.5
+    assert saved["metrics"]["squad_v2/validation/answerable_f1"] == 0.25
+    assert best["metrics"]["squad_v2/validation/answerable_f1"] == 0.25
     pass
 
 

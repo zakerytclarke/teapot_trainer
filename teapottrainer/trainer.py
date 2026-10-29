@@ -422,7 +422,8 @@ class TeapotTrainer:
             return None
         return sum(losses) / len(losses)
 
-    def run_evaluation_suite(self, model, tokenizer, phase_name: str, global_step: int, task_eval: bool):
+    def run_evaluation_suite(self, model, tokenizer, phase_name: str, global_step: int):
+        """Score every eval set. Text holdouts report loss. Task sets report loss and behavior."""
         unwrapped = _unwrap(model)
         flat: dict[str, float] = {}
         print("\n" + "=" * 78)
@@ -443,8 +444,6 @@ class TeapotTrainer:
                 if loss is not None:
                     flat[f"{key}/loss"] = loss
                     print(f" {key}  loss {loss:.4f}  ppl {math.exp(min(loss, 20)):.2f}")
-                continue
-            if not task_eval:
                 continue
             print(f" scoring {key} ({kind}) on up to {self.eval_example_cap} examples...")
             result = evaluate_source(
@@ -686,7 +685,7 @@ class TeapotTrainer:
             _unwrap(model).config.use_cache = False
 
         if task_eval and not resume:
-            self.run_evaluation_suite(model, tokenizer, f"{phase_name}_start", global_step, task_eval=True)
+            self.run_evaluation_suite(model, tokenizer, f"{phase_name}_start", global_step)
 
         started = time.time()
         resume_every = max(1, int(getattr(self, "resume_every_tokens", RESUME_EVERY_TOKENS)))
@@ -730,7 +729,7 @@ class TeapotTrainer:
                     if pct >= next_eval and pct < 100.0:
                         progress.write(f"\n[eval at {pct:.1f}%]")
                         self.run_evaluation_suite(
-                            model, tokenizer, f"{phase_name}_{int(pct)}pct", global_step, task_eval=task_eval
+                            model, tokenizer, f"{phase_name}_{int(pct)}pct", global_step
                         )
                         next_eval += self.config.eval_every_percent
                         model.train()
@@ -782,7 +781,7 @@ class TeapotTrainer:
             f" finished {phase_name}: {tokens:,} tokens, "
             f"loss {first_loss} -> {last_loss}, {trained_tokens / elapsed:,.0f} tok/s"
         )
-        self.run_evaluation_suite(model, tokenizer, f"{phase_name}_end", global_step, task_eval=task_eval)
+        self.run_evaluation_suite(model, tokenizer, f"{phase_name}_end", global_step)
         if phase_name not in self._completed_phases:
             self._completed_phases.append(phase_name)
         self._write_resume(
@@ -888,6 +887,7 @@ class TeapotTrainer:
                 tokenizer,
                 global_step if pretrain_resume else 0,
                 peak_lr=self.config.lr,
+                # No suite before the first token. Later suites score holdouts and tasks.
                 task_eval=False,
                 resume=pretrain_resume,
             )
