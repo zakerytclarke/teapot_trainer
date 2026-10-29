@@ -479,6 +479,305 @@ def test_init_weights_must_match_the_model_config():
         raise AssertionError("missing init_from should fail")
 
 
+def test_mixture_fast_forward_replays_the_same_samples():
+    import random
+
+    from teapottrainer.trainer import _python_random_state, take_mixture_sample
+
+    def play(count):
+        random.seed(7)
+        pools = [
+            [{"input_ids": [index]} for index in range(30)],
+            [{"input_ids": [100 + index]} for index in range(30)],
+        ]
+        produced = [0, 0]
+        retired = [False, False]
+        seen = []
+
+        def take(index):
+            if not pools[index]:
+                return None
+            return pools[index].pop(0)
+
+        while len(seen) < count:
+            drawn = take_mixture_sample([1.0, 1.0], [10_000, 10_000], produced, retired, take)
+            assert drawn not in (None, "retired")
+            seen.append(drawn[1]["input_ids"][0])
+        return seen, [list(produced), _python_random_state()]
+
+    full, _state = play(15)
+    prefix, checkpoint = play(8)
+    assert prefix == full[:8]
+    random.seed(7)
+    pools = [
+        [{"input_ids": [index]} for index in range(30)],
+        [{"input_ids": [100 + index]} for index in range(30)],
+    ]
+    produced = [0, 0]
+    retired = [False, False]
+    cursor = []
+
+    def take(index):
+        if not pools[index]:
+            return None
+        return pools[index].pop(0)
+
+    while len(cursor) < 8:
+        drawn = take_mixture_sample([1.0, 1.0], [10_000, 10_000], produced, retired, take)
+        cursor.append(drawn[1]["input_ids"][0])
+    assert produced == checkpoint[0]
+    assert _python_random_state() == checkpoint[1]
+    while len(cursor) < 15:
+        drawn = take_mixture_sample([1.0, 1.0], [10_000, 10_000], produced, retired, take)
+        cursor.append(drawn[1]["input_ids"][0])
+    assert cursor == full
+
+
+def test_fast_forward_rejects_a_cursor_that_does_not_match():
+    import json
+    import random
+    from types import SimpleNamespace
+
+    from teapottrainer.trainer import TeapotTrainer, _python_random_state, take_mixture_sample
+
+    def play(count):
+        random.seed(7)
+        pools = [
+            [{"input_ids": [index]} for index in range(30)],
+            [{"input_ids": [100 + index]} for index in range(30)],
+        ]
+        produced = [0, 0]
+        retired = [False, False]
+        restarts = [0, 0]
+        seen = []
+
+        def take(index):
+            random.choice([0, 1])
+            if not pools[index]:
+                return None
+            sample = pools[index].pop(0)
+            seen.append(sample["input_ids"][0])
+            return sample
+
+        while len(seen) < count:
+            drawn = take_mixture_sample([1.0, 1.0], [10_000, 10_000], produced, retired, take)
+            assert drawn not in (None, "retired")
+        return seen, produced, restarts, _python_random_state()
+
+    full, produced, restarts, state = play(6)
+    payload = json.loads(json.dumps({
+        "produced": produced,
+        "restarts": restarts,
+        "python_random": state,
+    }))
+    random.seed(7)
+    pools = [
+        [{"input_ids": [index]} for index in range(30)],
+        [{"input_ids": [100 + index]} for index in range(30)],
+    ]
+    produced = [0, 0]
+    retired = [False, False]
+    seen = []
+
+    def take(index):
+        random.choice([0, 1])
+        sample = pools[index].pop(0)
+        seen.append(sample["input_ids"][0])
+        return sample
+
+    holder = SimpleNamespace(_restarts=[0, 0])
+    TeapotTrainer._fast_forward(
+        holder, "pretrain", [1.0, 1.0], [10_000, 10_000], produced, retired, take,
+        6, payload["produced"], payload["restarts"], payload["python_random"],
+    )
+    assert seen == full
+    try:
+        TeapotTrainer._fast_forward(
+            holder, "pretrain", [1.0, 1.0], [10_000, 10_000], produced, retired, take,
+            6, [0, 0], [0, 0], payload["python_random"],
+        )
+    except SystemExit as exc:
+        assert "did not land" in str(exc)
+    else:
+        raise AssertionError("a mismatched cursor should stop the resume")
+
+
+def test_resume_directory_falls_back_when_the_live_dir_is_incomplete():
+    import json
+    import os
+    import shutil
+    import tempfile
+
+    from teapottrainer.trainer import TeapotTrainer
+
+    with tempfile.TemporaryDirectory() as tmp:
+        trainer = object.__new__(TeapotTrainer)
+        trainer.output_dir = tmp
+        trainer.best_loss = 1.25
+        trainer.best_behavior = None
+
+        def save_weights(model, tokenizer, directory):
+            os.makedirs(directory, exist_ok=True)
+            with open(os.path.join(directory, "config.json"), "w", encoding="utf-8") as handle:
+                handle.write('{"hidden_size": 8}')
+
+        trainer._save_weights = save_weights
+        trainer._write_resume(None, None, None, {"phase": "pretrain", "phase_done": False, "tokens": 12})
+        loaded = trainer._read_resume()
+        assert loaded["tokens"] == 12
+        assert loaded["dir"] == os.path.join(tmp, "checkpoints", "resume")
+        assert loaded["best_loss"] == 1.25
+        assert "dir" not in json.load(open(os.path.join(loaded["dir"], "trainer_state.json"), encoding="utf-8"))
+        live = trainer._resume_dir()
+        os.rename(live, live + ".old")
+        os.makedirs(live)
+        with open(os.path.join(live, "trainer_state.json"), "w", encoding="utf-8") as handle:
+            handle.write('{"tokens": 1}')
+        fallback = trainer._read_resume()
+        assert fallback["dir"] == live + ".old"
+        assert fallback["tokens"] == 12
+        shutil.rmtree(live)
+        assert trainer._read_resume()["tokens"] == 12
+
+
+class _StopAfterCheckpoint(Exception):
+    pass
+
+
+def test_resume_fast_forward_matches_an_uninterrupted_run():
+    """A tiny CPU phase, cut at the first checkpoint, lands on the same weights."""
+    import os
+    import random
+    import shutil
+
+    import torch
+
+    from teapottrainer.config import DatasetSpec, ModelConfig, TrainingConfig
+    from teapottrainer.trainer import TeapotTrainer, _capture_torch_rng, _restore_torch_rng
+
+    config = TrainingConfig(
+        model=ModelConfig(
+            model_type="llama",
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            intermediate_size=64,
+            max_position_embeddings=8,
+        ),
+        pretrain_datasets=[
+            DatasetSpec(source="left", target_tokens=96, weight=1.0),
+            DatasetSpec(source="right", target_tokens=96, weight=1.0),
+        ],
+        sft_datasets=[],
+        eval_datasets=[],
+        tokenizer="local-test",
+        batch_size=2,
+        grad_accum=1,
+        lr=1e-3,
+        weight_decay=0.0,
+        compile=False,
+        eval_every_percent=101,
+        holdout_ratio=0.0,
+        seed=7,
+    )
+    trainer = TeapotTrainer(config)
+    created = trainer.output_dir
+    trainer.device = torch.device("cpu")
+    trainer._checkpointing = False
+    trainer.resume_every_tokens = 64
+    trainer.writer.close()
+
+    class _Quiet:
+        def add_scalar(self, *args, **kwargs):
+            return None
+
+        def flush(self):
+            return None
+
+        def close(self):
+            return None
+
+    trainer.writer = _Quiet()
+
+    def open_iterators(bucket):
+        def _open(sources, tokenizer):
+            def gen(marker):
+                while True:
+                    extra = random.choice([0, 1])
+                    row = [marker] * 7 + [extra]
+                    bucket.append((marker, extra))
+                    yield {"input_ids": row, "labels": list(row)}
+
+            return [iter(gen(1)), iter(gen(2))]
+
+        return _open
+
+    class _Tok:
+        pad_token_id = 0
+        eos_token_id = 0
+
+        def save_pretrained(self, directory):
+            os.makedirs(directory, exist_ok=True)
+
+    try:
+        torch.manual_seed(7)
+        model = trainer._build_model(vocab_size=32)
+        initial = {name: value.detach().clone() for name, value in model.state_dict().items()}
+        rng_after_init = _capture_torch_rng()
+        full_draws = []
+        trainer._open_iterators = open_iterators(full_draws)
+        trainer._train_phase("pretrain", config.pretrain_datasets, model, _Tok(), 0, config.lr, False, None)
+        final = {name: value.detach().clone() for name, value in model.state_dict().items()}
+
+        model.load_state_dict(initial)
+        _restore_torch_rng(rng_after_init)
+        abort_draws = []
+        trainer._open_iterators = open_iterators(abort_draws)
+        real_write = trainer._write_resume
+
+        def abort_write(model, tokenizer, optimizer, state):
+            real_write(model, tokenizer, optimizer, state)
+            if not state.get("phase_done"):
+                raise _StopAfterCheckpoint()
+
+        trainer._write_resume = abort_write
+        try:
+            trainer._train_phase("pretrain", config.pretrain_datasets, model, _Tok(), 0, config.lr, False, None)
+        except _StopAfterCheckpoint:
+            pass
+        else:
+            raise AssertionError("the first checkpoint should have stopped this run")
+        trainer._write_resume = real_write
+        saved = trainer._read_resume()
+        assert saved["phase_done"] is False
+        assert saved["tokens"] == 64
+        assert saved["samples_taken"] == len(abort_draws)
+        assert abort_draws == full_draws[: len(abort_draws)]
+        assert os.path.isfile(os.path.join(saved["dir"], "optimizer.pt"))
+
+        from transformers import AutoModelForCausalLM
+
+        reloaded = AutoModelForCausalLM.from_pretrained(saved["dir"], dtype=torch.float32)
+        for name, value in model.state_dict().items():
+            assert torch.equal(reloaded.state_dict()[name], value), name
+
+        resume_draws = []
+        trainer._open_iterators = open_iterators(resume_draws)
+        trainer._train_phase(
+            "pretrain", config.pretrain_datasets, reloaded, _Tok(), 0, config.lr, False, saved,
+        )
+        model = reloaded
+        assert resume_draws == full_draws
+        for name, value in final.items():
+            assert torch.equal(model.state_dict()[name], value), name
+    finally:
+        trainer.writer.close()
+        shutil.rmtree(created, ignore_errors=True)
+        if os.path.isdir(created):
+            shutil.rmtree(created, ignore_errors=True)
+
+
 def test_contrastive_question_uses_an_entity_from_the_passage():
     from teapottrainer.formatting import (
         ABSTAIN_TEXT,

@@ -121,7 +121,9 @@ def main():
     config = build_config()
     trainer = TeapotTrainer(config=config)
     trainer.eval_example_cap = 32
-    trainer.train(fresh=True)
+    # fresh=False continues checkpoints/resume when a previous launch died.
+    # Replay starts at the first sample of that phase so the next draw matches.
+    trainer.train(fresh=False)
 
 
 if __name__ == "__main__":

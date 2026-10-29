@@ -1,6 +1,10 @@
 """Sequential pretrain then SFT.
 
 The public surface is still ``TeapotTrainer(TrainingConfig).train(fresh=True)``.
+``fresh=False`` continues from ``checkpoints/resume`` when that directory
+exists: weights, optimizer, and the exact sample cursor. The cursor is
+rebuilt by replaying the seeded mixture from the start of the phase, then
+checked against the saved counts and random state.
 Batch size, cosine schedule, bf16, and per-source token budgets are applied
 inside that call. ``init_from`` is an optional method argument for a
 confidence run that starts from an existing checkpoint; it is not a config field.
@@ -8,11 +12,13 @@ confidence run that starts from an existing checkpoint; it is not a config field
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import math
 import os
 import random
+import shutil
 import sys
 import time
 
@@ -41,6 +47,57 @@ from .evals import evaluate_source, selection_score, source_key, task_kind
 
 def _unwrap(model):
     return model._orig_mod if hasattr(model, "_orig_mod") else model
+
+
+# A resume re-reads the phase from the first sample so the shuffle buffer is
+# rebuilt the same way. This interval only bounds how much optimization is redone.
+RESUME_EVERY_TOKENS = 100_000_000
+
+
+def take_mixture_sample(weights, budgets, produced, retired, take):
+    """Draw the next training sample.
+
+    ``take(index)`` returns a sample or ``None`` when that source is exhausted.
+    ``None`` from this function means every source is finished. ``"retired"``
+    means this draw dropped a source and the caller should draw again.
+    """
+    alive = [index for index in range(len(weights)) if not retired[index] and produced[index] < budgets[index]]
+    if not alive:
+        return None
+    index = random.choices(alive, weights=[weights[i] for i in alive], k=1)[0]
+    sample = take(index)
+    if sample is None:
+        retired[index] = True
+        return "retired"
+    produced[index] += len(sample["input_ids"])
+    return index, sample
+
+
+def _python_random_state() -> dict:
+    version, state, gauss = random.getstate()
+    return {"version": version, "state": list(state), "gauss": gauss}
+
+
+def _set_python_random_state(payload: dict) -> None:
+    random.setstate((payload["version"], tuple(payload["state"]), payload["gauss"]))
+
+
+def _capture_torch_rng() -> dict:
+    payload = {
+        "cpu": base64.b64encode(bytes(int(value) for value in torch.get_rng_state().tolist())).decode("ascii")
+    }
+    if torch.cuda.is_available():
+        cuda_state = torch.cuda.get_rng_state()
+        payload["cuda"] = base64.b64encode(bytes(int(value) for value in cuda_state.tolist())).decode("ascii")
+    return payload
+
+
+def _restore_torch_rng(payload: dict) -> None:
+    cpu = torch.tensor(list(base64.b64decode(payload["cpu"])), dtype=torch.uint8)
+    torch.set_rng_state(cpu)
+    if payload.get("cuda") and torch.cuda.is_available():
+        cuda = torch.tensor(list(base64.b64decode(payload["cuda"])), dtype=torch.uint8)
+        torch.cuda.set_rng_state(cuda)
 
 
 def align_tokenizer_ids(model, tokenizer) -> None:
@@ -133,6 +190,7 @@ class TeapotTrainer:
         self.phase_stats: dict[str, dict] = {}
         self.best_behavior: float | None = None
         self.best_loss: float | None = None
+        self._completed_phases: list[str] = []
         self._checkpointing = False
 
         tokenizer_short = self.config.tokenizer.split("/")[-1]
@@ -439,6 +497,63 @@ class TeapotTrainer:
         unwrapped.train()
         return flat
 
+    def _resume_dir(self) -> str:
+        return os.path.join(self.output_dir, "checkpoints", "resume")
+
+    def _read_resume(self) -> dict | None:
+        for folder in (self._resume_dir(), self._resume_dir() + ".old"):
+            path = os.path.join(folder, "trainer_state.json")
+            if os.path.isfile(path) and os.path.isfile(os.path.join(folder, "config.json")):
+                with open(path, encoding="utf-8") as handle:
+                    state = json.load(handle)
+                state["dir"] = folder
+                return state
+        return None
+
+    def _restore_phase_boundary_rng(self) -> None:
+        """Put torch's generator back where the completed phase left it.
+
+        Supervised training reseeds Python's ``random`` itself. Torch stays
+        on the generator from the end of the previous phase, which a new
+        process would otherwise have reset with ``manual_seed``.
+        """
+        boundary = self._read_resume()
+        if not boundary or not boundary.get("phase_done") or not boundary.get("torch_rng"):
+            return
+        _restore_torch_rng(boundary["torch_rng"])
+
+    def _write_resume(self, model, tokenizer, optimizer, state: dict) -> None:
+        directory = self._resume_dir()
+        temporary = directory + ".tmp"
+        # Capture before the save. Writing weights must not move the cursor,
+        # so the same state is restored when this call returns.
+        python_random = _python_random_state()
+        torch_rng = _capture_torch_rng()
+        if os.path.isdir(temporary):
+            shutil.rmtree(temporary)
+        os.makedirs(temporary, exist_ok=True)
+        self._save_weights(model, tokenizer, temporary)
+        if optimizer is not None:
+            torch.save(optimizer.state_dict(), os.path.join(temporary, "optimizer.pt"))
+        payload = dict(state)
+        payload.pop("dir", None)
+        payload["python_random"] = python_random
+        payload["torch_rng"] = torch_rng
+        payload["best_loss"] = self.best_loss
+        payload["best_behavior"] = self.best_behavior
+        with open(os.path.join(temporary, "trainer_state.json"), "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        previous = directory + ".old"
+        if os.path.isdir(previous):
+            shutil.rmtree(previous)
+        if os.path.isdir(directory):
+            os.rename(directory, previous)
+        os.rename(temporary, directory)
+        if os.path.isdir(previous):
+            shutil.rmtree(previous)
+        _set_python_random_state(python_random)
+        _restore_torch_rng(torch_rng)
+
     def _next_sample(self, index, sources, iterators, restarts):
         try:
             return next(iterators[index])
@@ -461,24 +576,8 @@ class TeapotTrainer:
             except StopIteration:
                 return None
 
-    def _train_phase(self, phase_name: str, dataset_specs, model, tokenizer, starting_step: int, peak_lr: float, task_eval: bool):
-        if not dataset_specs:
-            return starting_step
-        sources = self._materialize_sources(dataset_specs)
-        budgets = [max(1, spec.target_tokens) for spec in dataset_specs]
-        weights = [max(spec.weight, 0.0) or 1.0 for spec in dataset_specs]
-        total_tokens = sum(budgets)
-        produced = [0 for _ in sources]
-        restarts = [0 for _ in sources]
-        retired = [False for _ in sources]
-        self._tokenizer = tokenizer
-        print(
-            f"\n{phase_name}: target {total_tokens:,} tokens, peak lr {peak_lr:.3e}, "
-            f"batch {self.config.batch_size} x accum {self.config.grad_accum}"
-        )
-        for src, budget in zip(sources, budgets):
-            print(f"  {source_key(src)}: {budget:,} tokens")
-        iterators = [
+    def _open_iterators(self, sources, tokenizer):
+        return [
             iter(
                 DatasetRegistry.prepare_dataset_splits(
                     [src],
@@ -491,43 +590,120 @@ class TeapotTrainer:
             )
             for src in sources
         ]
-        optimizer = self._optimizer(model, peak_lr)
-        model.train()
-        if self._checkpointing:
-            _unwrap(model).config.use_cache = False
 
-        if task_eval:
-            self.run_evaluation_suite(model, tokenizer, f"{phase_name}_start", starting_step, task_eval=True)
+    def _fast_forward(self, phase_name, weights, budgets, produced, retired, take, samples_target, produced_target, restarts_target, random_target):
+        print(
+            f"Fast-forwarding {phase_name} through {samples_target:,} samples "
+            f"({sum(produced_target):,} tokens) with the original seed."
+        )
+        taken = 0
+        progress = tqdm(total=samples_target, desc=f"[{phase_name} fast-forward]", unit="sample", unit_scale=True, dynamic_ncols=True)
+        try:
+            while taken < samples_target:
+                drawn = take_mixture_sample(weights, budgets, produced, retired, take)
+                if drawn is None:
+                    raise SystemExit(
+                        f"Resume fast-forward for {phase_name} ran out of data at sample {taken:,} "
+                        f"of {samples_target:,}."
+                    )
+                if drawn == "retired":
+                    continue
+                taken += 1
+                progress.update(1)
+        finally:
+            progress.close()
+        if produced != list(produced_target) or list(self._restarts) != list(restarts_target):
+            raise SystemExit(
+                f"Resume fast-forward for {phase_name} did not land on the checkpoint cursor.\n"
+                f"  produced now {produced}, checkpoint {list(produced_target)}\n"
+                f"  restarts now {list(self._restarts)}, checkpoint {list(restarts_target)}"
+            )
+        if _python_random_state() != random_target:
+            raise SystemExit(f"Resume fast-forward for {phase_name} did not land on the checkpoint random state.")
+        print(f"Fast-forward complete at {sum(produced):,} tokens.")
+
+    def _train_phase(self, phase_name: str, dataset_specs, model, tokenizer, starting_step: int, peak_lr: float, task_eval: bool, resume: dict | None = None):
+        if not dataset_specs:
+            return starting_step
+        sources = self._materialize_sources(dataset_specs)
+        budgets = [max(1, spec.target_tokens) for spec in dataset_specs]
+        weights = [max(spec.weight, 0.0) or 1.0 for spec in dataset_specs]
+        total_tokens = sum(budgets)
+        produced = [0 for _ in sources]
+        restarts = [0 for _ in sources]
+        retired = [False for _ in sources]
+        self._restarts = restarts
+        self._tokenizer = tokenizer
+        print(
+            f"\n{phase_name}: target {total_tokens:,} tokens, peak lr {peak_lr:.3e}, "
+            f"batch {self.config.batch_size} x accum {self.config.grad_accum}"
+        )
+        for src, budget in zip(sources, budgets):
+            print(f"  {source_key(src)}: {budget:,} tokens")
+        # Reseed immediately before the mixture so resume replays the same draws.
+        random.seed(self.config.seed)
+        iterators = self._open_iterators(sources, tokenizer)
+
+        def take(index):
+            return self._next_sample(index, sources, iterators, restarts)
 
         tokens = 0
+        samples_taken = 0
         micro_steps = 0
         global_step = starting_step
         first_loss = None
         last_loss = None
-        started = time.time()
         next_eval = self.config.eval_every_percent
-        progress = tqdm(total=total_tokens, desc=f"[{phase_name}]", unit="tok", unit_scale=True, dynamic_ncols=True)
+        if resume:
+            tokens = int(resume["tokens"])
+            samples_target = int(resume["samples_taken"])
+            self._fast_forward(
+                phase_name,
+                weights,
+                budgets,
+                produced,
+                retired,
+                take,
+                samples_target,
+                resume["produced"],
+                resume["restarts"],
+                resume["python_random"],
+            )
+            _restore_torch_rng(resume["torch_rng"])
+            global_step = int(resume["global_step"])
+            micro_steps = int(resume["micro_steps"])
+            next_eval = float(resume["next_eval"])
+            first_loss = resume.get("first_loss")
+            samples_taken = samples_target
+        optimizer = self._optimizer(_unwrap(model), peak_lr)
+        optimizer_path = os.path.join(resume["dir"], "optimizer.pt") if resume else ""
+        if resume and os.path.isfile(optimizer_path):
+            optimizer.load_state_dict(torch.load(optimizer_path, map_location=self.device, weights_only=False))
+            print("Loaded optimizer state from the resume checkpoint.")
+        self._set_lr(optimizer, min(tokens / total_tokens, 1.0) if total_tokens else 0.0, peak_lr)
+        model.train()
+        if self._checkpointing:
+            _unwrap(model).config.use_cache = False
+
+        if task_eval and not resume:
+            self.run_evaluation_suite(model, tokenizer, f"{phase_name}_start", global_step, task_eval=True)
+
+        started = time.time()
+        resume_every = max(1, int(getattr(self, "resume_every_tokens", RESUME_EVERY_TOKENS)))
+        next_resume_tokens = (tokens // resume_every + 1) * resume_every
+        progress = tqdm(total=total_tokens, initial=tokens, desc=f"[{phase_name}]", unit="tok", unit_scale=True, dynamic_ncols=True)
         try:
             while tokens < total_tokens:
-                alive = [
-                    index
-                    for index in range(len(sources))
-                    if not retired[index] and produced[index] < budgets[index]
-                ]
-                if not alive:
-                    break
                 batch = []
-                while len(batch) < self.config.batch_size and alive:
-                    index = random.choices(alive, weights=[weights[i] for i in alive], k=1)[0]
-                    sample = self._next_sample(index, sources, iterators, restarts)
-                    if sample is None:
-                        retired[index] = True
-                        alive = [i for i in alive if i != index]
+                while len(batch) < self.config.batch_size:
+                    drawn = take_mixture_sample(weights, budgets, produced, retired, take)
+                    if drawn is None:
+                        break
+                    if drawn == "retired":
                         continue
-                    produced[index] += len(sample["input_ids"])
+                    _index, sample = drawn
                     batch.append(sample)
-                    if produced[index] >= budgets[index]:
-                        alive = [i for i in alive if i != index]
+                    samples_taken += 1
                 if not batch:
                     break
                 loss, real_tokens = self._forward_backward(model, batch, tokenizer)
@@ -544,7 +720,8 @@ class TeapotTrainer:
                     optimizer.zero_grad(set_to_none=True)
                     global_step += 1
                     elapsed = max(time.time() - started, 1e-6)
-                    speed = tokens / elapsed
+                    trained_tokens = tokens - (int(resume["tokens"]) if resume else 0)
+                    speed = trained_tokens / elapsed
                     self.writer.add_scalar(f"train_{phase_name}/loss", loss, global_step)
                     self.writer.add_scalar(f"train_{phase_name}/lr", lr, global_step)
                     self.writer.add_scalar(f"train_{phase_name}/tokens_per_sec", speed, global_step)
@@ -557,6 +734,29 @@ class TeapotTrainer:
                         )
                         next_eval += self.config.eval_every_percent
                         model.train()
+                    # After eval, so the saved generator and eval cursor include it.
+                    if tokens >= next_resume_tokens:
+                        self._write_resume(
+                            model,
+                            tokenizer,
+                            optimizer,
+                            {
+                                "phase": phase_name,
+                                "phase_done": False,
+                                "completed_phases": list(self._completed_phases),
+                                "tokens": tokens,
+                                "samples_taken": samples_taken,
+                                "produced": list(produced),
+                                "restarts": list(restarts),
+                                "global_step": global_step,
+                                "micro_steps": micro_steps,
+                                "next_eval": next_eval,
+                                "first_loss": first_loss,
+                                "peak_lr": peak_lr,
+                            },
+                        )
+                        progress.write(f"\n[resume checkpoint at {tokens:,} tokens]")
+                        next_resume_tokens = (tokens // resume_every + 1) * resume_every
             if micro_steps % self.config.grad_accum != 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 self._set_lr(optimizer, min(tokens / total_tokens, 1.0), peak_lr)
@@ -567,6 +767,8 @@ class TeapotTrainer:
             progress.close()
 
         elapsed = max(time.time() - started, 1e-6)
+        resumed_tokens = int(resume["tokens"]) if resume else 0
+        trained_tokens = max(tokens - resumed_tokens, 0)
         self.phase_stats[phase_name] = {
             "first_loss": first_loss,
             "last_loss": last_loss,
@@ -574,19 +776,41 @@ class TeapotTrainer:
             "tokens_per_source": {
                 source_key(src): count for src, count in zip(sources, produced)
             },
-            "tok_per_sec": tokens / elapsed,
+            "tok_per_sec": trained_tokens / elapsed,
         }
         print(
             f" finished {phase_name}: {tokens:,} tokens, "
-            f"loss {first_loss} -> {last_loss}, {tokens / elapsed:,.0f} tok/s"
+            f"loss {first_loss} -> {last_loss}, {trained_tokens / elapsed:,.0f} tok/s"
         )
         self.run_evaluation_suite(model, tokenizer, f"{phase_name}_end", global_step, task_eval=task_eval)
+        if phase_name not in self._completed_phases:
+            self._completed_phases.append(phase_name)
+        self._write_resume(
+            model,
+            tokenizer,
+            None,
+            {
+                "phase": phase_name,
+                "phase_done": True,
+                "completed_phases": list(self._completed_phases),
+                "tokens": tokens,
+                "samples_taken": samples_taken,
+                "produced": list(produced),
+                "restarts": list(restarts),
+                "global_step": global_step,
+                "micro_steps": micro_steps,
+                "next_eval": next_eval,
+                "first_loss": first_loss,
+                "peak_lr": peak_lr,
+            },
+        )
         return global_step
 
     def train(self, fresh: bool = True, init_from: str | None = None):
-        del fresh  # resume is intentionally not wired until a long run needs it
         random.seed(self.config.seed)
         torch.manual_seed(self.config.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(self.config.seed)
         print(f"Loading tokenizer: {self.config.tokenizer}")
         tokenizer = AutoTokenizer.from_pretrained(self.config.tokenizer, trust_remote_code=True)
         if tokenizer.pad_token is None:
@@ -594,10 +818,27 @@ class TeapotTrainer:
         # Packing splits long documents. Silence the tokenizer's own length warning.
         tokenizer.model_max_length = int(1e9)
 
+        resume = None if fresh else self._read_resume()
+        self._completed_phases = []
+        if resume:
+            self._completed_phases = list(resume.get("completed_phases") or [])
+            if resume.get("best_loss") is not None:
+                self.best_loss = resume["best_loss"]
+            if resume.get("best_behavior") is not None:
+                self.best_behavior = resume["best_behavior"]
+            finished = " finished" if resume.get("phase_done") else ""
+            print(
+                f"Resuming from {resume['dir']} "
+                f"({resume.get('phase')}{finished}, {int(resume.get('tokens') or 0):,} tokens)."
+            )
+            model = AutoModelForCausalLM.from_pretrained(resume["dir"], dtype=torch.float32, trust_remote_code=True)
+            mismatches = architecture_mismatches(model.config, self.m_cfg)
+            if mismatches:
+                detail = "\n  ".join(mismatches)
+                raise SystemExit(f"resume checkpoint does not match the model config:\n  {detail}")
         # A train() argument overrides the config field. Either one is used
         # before pretrain or supervised training starts.
-        source = init_from if init_from is not None else self.config.init_from
-        if source:
+        elif (source := init_from if init_from is not None else self.config.init_from):
             source = _resolve_init_from(source)
             print(f"Loading initial weights from {source} before training.")
             model = AutoModelForCausalLM.from_pretrained(source, dtype=torch.float32, trust_remote_code=True)
@@ -629,29 +870,34 @@ class TeapotTrainer:
 
         print(f"Run directory: {self.output_dir}")
         print(f"TensorBoard: {self.writer.log_dir}")
-        global_step = 0
+        global_step = int(resume["global_step"]) if resume else 0
         pretrain = list(self.config.pretrain_datasets or [])
         sft = list(self.config.sft_datasets or [])
-        if pretrain:
+        if pretrain and "pretrain" not in self._completed_phases:
             # Pretrain sequences are always seq_len, so one compiled graph is stable.
             # SFT chats are not, and compile then asserts on a later padded width.
             training_model = model
             if self.config.compile and hasattr(torch, "compile") and self.device.type == "cuda":
                 print("Compiling model with torch.compile() for fixed-length pretraining.")
                 training_model = torch.compile(model)
+            pretrain_resume = resume if resume and not resume.get("phase_done") and resume.get("phase") == "pretrain" else None
             global_step = self._train_phase(
                 "pretrain",
                 pretrain,
                 training_model,
                 tokenizer,
-                global_step,
+                global_step if pretrain_resume else 0,
                 peak_lr=self.config.lr,
                 task_eval=False,
+                resume=pretrain_resume,
             )
             model = _unwrap(training_model)
             pretrain_dir = os.path.join(self.output_dir, "checkpoints", "pretrain")
             self._save_weights(model, tokenizer, pretrain_dir)
             print(f"Saved pretrain weights to {pretrain_dir}")
+        elif resume and "pretrain" in self._completed_phases:
+            print("Pretrain is already complete in the resume checkpoint.")
+            model = _unwrap(model)
         if sft:
             if self.config.compile:
                 print(
@@ -661,9 +907,22 @@ class TeapotTrainer:
             sft_lr = self.config.lr * 0.2 if pretrain else self.config.lr
             if pretrain:
                 print(f"SFT peak lr is 0.2x config.lr ({sft_lr:.3e}) because this run already pretrained.")
-            global_step = self._train_phase(
-                "sft", sft, model, tokenizer, global_step, peak_lr=sft_lr, task_eval=True
-            )
+            if "sft" in self._completed_phases:
+                print("Supervised training is already complete in the resume checkpoint.")
+            else:
+                sft_resume = resume if resume and not resume.get("phase_done") and resume.get("phase") == "sft" else None
+                if sft_resume is None:
+                    self._restore_phase_boundary_rng()
+                global_step = self._train_phase(
+                    "sft",
+                    sft,
+                    model,
+                    tokenizer,
+                    global_step,
+                    peak_lr=sft_lr,
+                    task_eval=True,
+                    resume=sft_resume,
+                )
 
         self._save_weights(model, tokenizer, self.output_dir)
         with open(os.path.join(self.output_dir, "phase_stats.json"), "w", encoding="utf-8") as handle:
