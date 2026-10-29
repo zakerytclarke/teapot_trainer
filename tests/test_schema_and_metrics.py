@@ -722,6 +722,8 @@ def test_eval_suite_records_task_scores_with_holdout_loss():
             saved = json.loads(handle.read())
         with open(os.path.join(created, "checkpoints", "best", "metrics.json"), encoding="utf-8") as handle:
             best = json.load(handle)
+        with open(os.path.join(created, "checkpoints", "pretrain_10pct", "metrics.json"), encoding="utf-8") as handle:
+            snapshot = json.load(handle)
     finally:
         trainer_mod.evaluate_source = original
         trainer.writer.close()
@@ -734,7 +736,9 @@ def test_eval_suite_records_task_scores_with_holdout_loss():
     assert saved["metrics"]["fineweb-edu/train/loss"] == 2.5
     assert saved["metrics"]["squad_v2/validation/answerable_f1"] == 0.25
     assert best["metrics"]["squad_v2/validation/answerable_f1"] == 0.25
-    pass
+    assert snapshot["phase"] == "pretrain_10pct"
+    assert snapshot["step"] == 3
+    assert snapshot["metrics"]["squad_v2/validation/answerable_f1"] == 0.25
 
 
 def test_resume_fast_forward_matches_an_uninterrupted_run():

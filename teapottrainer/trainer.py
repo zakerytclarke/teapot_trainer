@@ -485,6 +485,13 @@ class TeapotTrainer:
         elif behavior is None and mean_loss is not None and (self.best_loss is None or mean_loss <= self.best_loss):
             self.best_loss = mean_loss
             improved = True
+        if flat:
+            # Keep every eval's weights. best/ is only the single best score.
+            snapshot_dir = os.path.join(self.output_dir, "checkpoints", phase_name)
+            self._save_weights(model, tokenizer, snapshot_dir)
+            with open(os.path.join(snapshot_dir, "metrics.json"), "w", encoding="utf-8") as handle:
+                json.dump({"phase": phase_name, "step": global_step, "metrics": flat}, handle, indent=2)
+            print(f" saved eval checkpoint to {snapshot_dir}")
         if improved and flat:
             best_dir = os.path.join(self.output_dir, "checkpoints", "best")
             self._save_weights(model, tokenizer, best_dir)
