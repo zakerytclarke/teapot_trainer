@@ -1,10 +1,11 @@
-"""From-scratch week run in the SmolLM2-135M shape.
+"""From-scratch week run in a 12-layer Llama shape.
 
-Pretrain is 40B tokens, about six and a half days at the speed this machine
-already measured, then a few hours of supervised training. The supervised mix
-pairs each passage with an unanswerable question about an entity in it, and
-draws a new tool name on every example. config.lr is the pretrain peak.
-After a pretrain phase the trainer uses 0.2x that value for supervised training.
+Hidden size 768, 12 query heads, 4 key/value heads, SwiGLU width 2048.
+The tokenizer stays SmolLM2-135M. Pretrain is 40B tokens, then supervised
+training. The supervised mix pairs each passage with an unanswerable question
+about an entity in it, and draws a new tool name on every example. config.lr
+is the pretrain peak. After a pretrain phase the trainer uses 0.2x that value
+for supervised training.
 """
 
 from teapottrainer import (
@@ -51,16 +52,17 @@ from teapottrainer import (
 
 
 def build_config() -> TrainingConfig:
-    # SmolLM2-135M width: 576 hidden, 30 layers, 9 heads, 3 key-value heads.
-    # Sequence length stays 2048 so a week of tokens fits on one 5090.
+    # 12 layers, hidden 768, 12 query heads, 4 key/value heads.
+    # Feed-forward 2048 is 8/3 of the hidden size, the low end of 2048–2304.
+    # Sequence length stays 2048. The SmolLM2 tokenizer is unchanged.
     return TrainingConfig(
         model=ModelConfig(
             model_type="llama",
-            hidden_size=576,
-            num_hidden_layers=30,
-            num_attention_heads=9,
-            num_key_value_heads=3,
-            intermediate_size=1536,
+            hidden_size=768,
+            num_hidden_layers=12,
+            num_attention_heads=12,
+            num_key_value_heads=4,
+            intermediate_size=2048,
             max_position_embeddings=2048,
         ),
         pretrain_datasets=[

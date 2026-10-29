@@ -78,11 +78,11 @@ def test_train_script_uses_the_same_constructor():
     config = build_config()
     dumped = set(config.model_dump().keys())
     assert dumped == LOCKED_TRAINING_FIELDS
-    assert config.model.layers == 30
-    assert config.model.hidden_size == 576
-    assert config.model.heads == 9
-    assert config.model.kv_heads == 3
-    assert config.model.intermediate == 1536
+    assert config.model.layers == 12
+    assert config.model.hidden_size == 768
+    assert config.model.heads == 12
+    assert config.model.kv_heads == 4
+    assert config.model.intermediate == 2048
     assert config.model.hidden_size % config.model.heads == 0
     assert config.tokenizer == "HuggingFaceTB/SmolLM2-135M"
     assert config.init_from is None
