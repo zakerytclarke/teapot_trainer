@@ -18,16 +18,23 @@ from .formatting import (
     as_pairs,
     format_apigen_aliased,
     format_apigen_decision,
+    format_apigen_missing_argument,
+    format_apigen_unrelated_tool,
     format_gsm8k,
     format_hotpot,
+    format_hotpot_contrastive,
     format_squad,
     format_squad_answerable,
+    format_squad_contrastive,
     format_squad_unanswerable,
     format_synthqa,
     format_synthqa_answerable,
+    format_synthqa_contrastive,
     format_synthqa_unanswerable,
     format_teapot_chat,
     format_when2call,
+    format_when2call_ask,
+    format_when2call_refuse,
     messages_format,
 )
 
@@ -100,6 +107,51 @@ _SPAN_WEIGHT = span_loss_weight()
 
 FINEWEB_EDU = DatasetSourceConfig(
     name="HuggingFaceFW/fineweb-edu",
+    split="train",
+    is_sft=False,
+    text_column="text",
+)
+
+
+def _keep_strong_dclm(row: dict) -> dict:
+    """SmolLM2-135M improved when DCLM-Edu pages scored below 3 were left out."""
+    score = row.get("edu_int_score")
+    if isinstance(score, (int, float)) and int(score) < 3:
+        return {**row, "text": ""}
+    return row
+
+
+DCLM_EDU = DatasetSourceConfig(
+    name="HuggingFaceTB/dclm-edu",
+    split="train",
+    is_sft=False,
+    text_column="text",
+    preprocess_fn=_keep_strong_dclm,
+)
+# Official Stack-Edu rows are Software Heritage ids. This copy includes the file text.
+STACK_EDU = DatasetSourceConfig(
+    name="utter-project/stack-edu-HF",
+    split="train",
+    is_sft=False,
+    text_column="text",
+)
+FINEMATH = DatasetSourceConfig(
+    name="HuggingFaceTB/finemath",
+    subset="finemath-4plus",
+    split="train",
+    is_sft=False,
+    text_column="text",
+)
+INFIWEBMATH = DatasetSourceConfig(
+    name="HuggingFaceTB/finemath",
+    subset="infiwebmath-4plus",
+    split="train",
+    is_sft=False,
+    text_column="text",
+)
+COSMOPEDIA_V2 = DatasetSourceConfig(
+    name="HuggingFaceTB/smollm-corpus",
+    subset="cosmopedia-v2",
     split="train",
     is_sft=False,
     text_column="text",
@@ -194,6 +246,12 @@ SMOLTALK_APIGEN_ALIASED = DatasetSourceConfig(
     chat_template_fn=format_apigen_aliased,
     token_loss_weight_fn=_STOP_WEIGHT,
 )
+SMOLTALK_APIGEN_MISSING = SMOLTALK_APIGEN_ALIASED.model_copy(
+    update={"chat_template_fn": format_apigen_missing_argument}
+)
+SMOLTALK_APIGEN_UNRELATED = SMOLTALK_APIGEN_ALIASED.model_copy(
+    update={"chat_template_fn": format_apigen_unrelated_tool}
+)
 SMOLTALK_METAMATH = DatasetSourceConfig(
     name="HuggingFaceTB/smoltalk",
     subset="metamathqa-50k",
@@ -235,6 +293,8 @@ WHEN2CALL_TEST = DatasetSourceConfig(
     chat_template_fn=format_when2call,
     token_loss_weight_fn=_STOP_WEIGHT,
 )
+WHEN2CALL_ASK = WHEN2CALL.model_copy(update={"chat_template_fn": format_when2call_ask})
+WHEN2CALL_REFUSE = WHEN2CALL.model_copy(update={"chat_template_fn": format_when2call_refuse})
 
 SQUAD_V2 = DatasetSourceConfig(
     name="rajpurkar/squad_v2",
@@ -246,6 +306,7 @@ SQUAD_V2 = DatasetSourceConfig(
 SQUAD_V2_VAL = SQUAD_V2.model_copy(update={"split": "validation"})
 SQUAD_V2_ANSWERABLE = SQUAD_V2.model_copy(update={"chat_template_fn": format_squad_answerable})
 SQUAD_V2_UNANSWERABLE = SQUAD_V2.model_copy(update={"chat_template_fn": format_squad_unanswerable})
+SQUAD_V2_CONTRASTIVE = SQUAD_V2.model_copy(update={"chat_template_fn": format_squad_contrastive})
 
 HOTPOT = DatasetSourceConfig(
     name="hotpot_qa",
@@ -256,6 +317,7 @@ HOTPOT = DatasetSourceConfig(
     token_loss_weight_fn=_SPAN_WEIGHT,
 )
 HOTPOT_VAL = HOTPOT.model_copy(update={"split": "validation"})
+HOTPOT_CONTRASTIVE = HOTPOT.model_copy(update={"chat_template_fn": format_hotpot_contrastive})
 
 SYNTHQA = DatasetSourceConfig(
     name="teapotai/synthqa",
@@ -267,6 +329,7 @@ SYNTHQA = DatasetSourceConfig(
 SYNTHQA_TEST = SYNTHQA.model_copy(update={"split": "test"})
 SYNTHQA_ANSWERABLE = SYNTHQA.model_copy(update={"chat_template_fn": format_synthqa_answerable})
 SYNTHQA_UNANSWERABLE = SYNTHQA.model_copy(update={"chat_template_fn": format_synthqa_unanswerable})
+SYNTHQA_CONTRASTIVE = SYNTHQA.model_copy(update={"chat_template_fn": format_synthqa_contrastive})
 
 TEAPOT_CHAT = DatasetSourceConfig(
     name="teapotai/teapot-chat",

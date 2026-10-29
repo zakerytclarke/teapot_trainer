@@ -78,13 +78,24 @@ def test_train_script_uses_the_same_constructor():
     config = build_config()
     dumped = set(config.model_dump().keys())
     assert dumped == LOCKED_TRAINING_FIELDS
-    assert config.model.layers == 26
-    assert config.model.hidden_size == 512
+    assert config.model.layers == 30
+    assert config.model.hidden_size == 576
+    assert config.model.heads == 9
+    assert config.model.kv_heads == 3
+    assert config.model.intermediate == 1536
+    assert config.model.hidden_size % config.model.heads == 0
     assert config.tokenizer == "HuggingFaceTB/SmolLM2-135M"
-    assert config.init_from.endswith("runs/teapot-SmolLM2-135M-39cacf/checkpoints/pretrain")
+    assert config.init_from is None
     assert TrainingConfig().init_from is None
-    assert config.pretrain_datasets == []
-    assert config.lr == 5e-5
+    assert config.lr == 3e-3
+    assert sum(spec.target_tokens for spec in config.pretrain_datasets) == 40_000_000_000
+    pretrain_names = [(spec.source.name, spec.source.subset) for spec in config.pretrain_datasets]
+    assert ("HuggingFaceTB/dclm-edu", None) in pretrain_names
+    assert ("HuggingFaceFW/fineweb-edu", None) in pretrain_names
+    assert ("utter-project/stack-edu-HF", None) in pretrain_names
+    assert ("HuggingFaceTB/finemath", "finemath-4plus") in pretrain_names
+    assert ("HuggingFaceTB/finemath", "infiwebmath-4plus") in pretrain_names
+    assert ("HuggingFaceTB/smollm-corpus", "cosmopedia-v2") in pretrain_names
     names = []
     for spec in config.sft_datasets:
         names.append((spec.source.name, spec.source.subset))
@@ -96,13 +107,15 @@ def test_train_script_uses_the_same_constructor():
     assert ("teapotai/teapot-chat", None) in names
     answerable = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn and spec.source.chat_template_fn.__name__ == "format_squad_answerable")
     unanswerable = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn and spec.source.chat_template_fn.__name__ == "format_squad_unanswerable")
-    assert answerable == 20_000_000
-    assert unanswerable == 5_000_000
+    contrastive = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn and spec.source.chat_template_fn.__name__ == "format_squad_contrastive")
+    assert answerable == 12_000_000
+    assert unanswerable == 4_000_000
+    assert contrastive == 8_000_000
     synth_answerable = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn and spec.source.chat_template_fn.__name__ == "format_synthqa_answerable")
     synth_unanswerable = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn and spec.source.chat_template_fn.__name__ == "format_synthqa_unanswerable")
-    assert synth_answerable == 12_000_000
-    assert synth_unanswerable == 3_000_000
-    assert sum(spec.target_tokens for spec in config.sft_datasets) == 120_000_000
+    assert synth_answerable == 8_000_000
+    assert synth_unanswerable == 4_000_000
+    assert sum(spec.target_tokens for spec in config.sft_datasets) == 148_000_000
     eval_names = [(spec.source.name, spec.source.split) for spec in config.eval_datasets]
     assert ("teapotai/synthqa", "test") in eval_names
     assert ("teapotai/teapot-chat", "train") in eval_names
@@ -329,7 +342,11 @@ def test_apigen_decision_prompt_matches_when2call():
     prompt, answer = pairs[0]
     assert DECISION_RULES.split("\n", 1)[0] in prompt
     assert "<tools>" in prompt
-    assert row["messages"][-1]["content"] == answer
+    from teapottrainer.formatting import rewrite_missing_tools_claim
+
+    raw = row["messages"][-1]["content"]
+    tools = prompt.split("<tools>", 1)[-1].split("</tools>", 1)[0]
+    assert answer == rewrite_missing_tools_claim(raw, tools)
     if "<tool_call>" in answer:
         assert score_tool_prediction(answer, answer)["args"] == 1.0
 
@@ -412,6 +429,14 @@ def test_renamed_tool_call_matches_the_prompt():
     assert called and prompted
     assert called[0]["name"] == prompted[0]["name"]
     assert called[0]["arguments"]["origin"] == "Boston"
+    again, _again_answer = format_apigen_aliased(row)
+    assert "book_train" not in again
+    # A fresh draw each call. One collision in 256 names is not enough to fail this.
+    names = set()
+    for _ in range(8):
+        prompted_again = format_apigen_aliased(row)[0]
+        names.add(extract_tool_calls(prompted_again.split("<tools>", 1)[-1])[0]["name"])
+    assert len(names) > 1
 
 
 def test_init_weights_must_match_the_model_config():
@@ -452,6 +477,77 @@ def test_init_weights_must_match_the_model_config():
         assert "does not exist" in str(exc)
     else:
         raise AssertionError("missing init_from should fail")
+
+
+def test_contrastive_question_uses_an_entity_from_the_passage():
+    from teapottrainer.formatting import (
+        ABSTAIN_TEXT,
+        contrastive_question,
+        format_synthqa_contrastive,
+    )
+
+    context = "The kiln in Harbor Town opened in 1902. It closed during the 1944 storm."
+    question = contrastive_question(context, "1902")
+    assert question
+    assert "Harbor Town" in question
+    assert "1902" not in question
+    prompt, answer = format_synthqa_contrastive({
+        "context": context,
+        "question": "When did the kiln open?",
+        "type": "extraction",
+        "answer": "1902",
+    })
+    assert answer == ABSTAIN_TEXT
+    assert "Harbor Town" in prompt
+    assert "When did the kiln open?" not in prompt
+    assert format_synthqa_contrastive({
+        "context": context,
+        "question": "Who funded it?",
+        "type": "unanswerable",
+        "answer": None,
+    }) is None
+
+
+def test_missing_argument_asks_and_unrelated_tool_refuses():
+    from teapottrainer.formatting import (
+        TOOLS_PRESENT_REFUSAL,
+        format_apigen_missing_argument,
+        format_apigen_unrelated_tool,
+        rewrite_missing_tools_claim,
+    )
+    from teapottrainer.metrics import extract_tool_calls
+
+    row = {
+        "messages": [
+            {
+                "role": "system",
+                "content": 'Tools:\n<tools>[{"name": "book_train", "description": "Book a train.", "parameters": {"type": "object", "properties": {"origin": {"type": "string"}}, "required": ["origin"]}}]</tools>',
+            },
+            {"role": "user", "content": "Book a train from Boston to Portland."},
+            {
+                "role": "assistant",
+                "content": '<tool_call>[{"name": "book_train", "arguments": {"origin": "Boston"}}]</tool_call>',
+            },
+        ]
+    }
+    prompt, answer = format_apigen_missing_argument(row)
+    assert "<tool_call>" not in answer
+    assert answer.endswith("?")
+    assert "Boston" not in prompt.split("User:", 1)[-1]
+    assert extract_tool_calls(prompt.split("<tools>", 1)[-1])
+    refused_prompt, refused = format_apigen_unrelated_tool(row)
+    assert refused == TOOLS_PRESENT_REFUSAL
+    assert "no tools were provided" not in refused.lower()
+    assert "celsius" in refused_prompt
+    assert "book_train" not in refused_prompt
+    assert rewrite_missing_tools_claim(
+        "The query cannot be answered, no tools were provided.",
+        '[{"name": "cork_glowworm"}]',
+    ) == TOOLS_PRESENT_REFUSAL
+    assert "no tools were provided" in rewrite_missing_tools_claim(
+        "The query cannot be answered, no tools were provided.",
+        "[]",
+    )
 
 
 def test_abstaining_on_an_answerable_question_lowers_the_score():
