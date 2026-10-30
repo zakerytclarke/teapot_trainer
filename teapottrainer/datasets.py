@@ -15,14 +15,19 @@ from pydantic import BaseModel, ConfigDict, Field
 from datasets import load_dataset
 
 from .formatting import (
+    NO_REFERENCE,
     as_pairs,
+    format_alpaca_eval,
     format_apigen_aliased,
     format_apigen_decision,
     format_apigen_missing_argument,
     format_apigen_unrelated_tool,
     format_gsm8k,
+    format_arena_hard,
     format_hotpot,
     format_hotpot_contrastive,
+    format_ifeval,
+    format_mt_bench,
     format_squad,
     format_squad_answerable,
     format_squad_contrastive,
@@ -339,9 +344,57 @@ TEAPOT_CHAT = DatasetSourceConfig(
     token_loss_weight_fn=_STOP_WEIGHT,
 )
 
+# Chat benchmarks. They are not part of the running mix. The published files
+# use a train split; these presets say test or eval so the train-split holdout
+# does not drop most of the benchmark. open_dataset reads the published file.
+IFEVAL = DatasetSourceConfig(
+    name="google/IFEval",
+    split="test",
+    is_sft=True,
+    chat_template_fn=format_ifeval,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+MT_BENCH = DatasetSourceConfig(
+    name="HuggingFaceH4/mt_bench_prompts",
+    split="test",
+    is_sft=True,
+    chat_template_fn=format_mt_bench,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+ALPACA_EVAL = DatasetSourceConfig(
+    name="tatsu-lab/alpaca_eval",
+    split="eval",
+    is_sft=True,
+    chat_template_fn=format_alpaca_eval,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+ARENA_HARD = DatasetSourceConfig(
+    name="lmarena-ai/arena-hard-auto-v0.1",
+    split="test",
+    is_sft=True,
+    chat_template_fn=format_arena_hard,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+
 
 def open_dataset(src: DatasetSourceConfig, streaming: bool):
+    # The AlpacaEval loader is a dataset script. Current `datasets` will not run it.
+    if src.name == "tatsu-lab/alpaca_eval":
+        return load_dataset(
+            "json",
+            data_files="https://huggingface.co/datasets/tatsu-lab/alpaca_eval/resolve/main/alpaca_eval.json",
+            split="train",
+            streaming=streaming,
+        )
     kwargs = {"split": src.split, "streaming": streaming}
+    # These benchmarks publish one train split. The preset split stays test so
+    # eval sees the benchmark instead of a 5% train holdout.
+    if src.split == "test" and src.name in {
+        "google/IFEval",
+        "HuggingFaceH4/mt_bench_prompts",
+        "lmarena-ai/arena-hard-auto-v0.1",
+    }:
+        kwargs["split"] = "train"
     try:
         if src.subset:
             return load_dataset(src.name, src.subset, **kwargs)
@@ -363,6 +416,8 @@ def holdout_membership(key: str, ratio: float, seed: int) -> bool:
 
 def encode_pair(tokenizer, prompt: str, answer: str, seq_len: int) -> dict | None:
     """Mask the prompt. Left-truncate so the supervised answer still fits."""
+    if answer == NO_REFERENCE:
+        return None
     answer = (answer or "").strip()
     prompt = prompt or ""
     if not answer or not prompt.strip():

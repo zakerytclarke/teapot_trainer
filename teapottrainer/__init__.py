@@ -48,6 +48,10 @@ from .datasets import (
     SQUAD_V2_CONTRASTIVE,
     HOTPOT_CONTRASTIVE,
     SYNTHQA_CONTRASTIVE,
+    IFEVAL,
+    MT_BENCH,
+    ALPACA_EVAL,
+    ARENA_HARD,
 )
 
 __version__ = "0.2.0"
@@ -103,4 +107,8 @@ __all__ = [
     "SQUAD_V2_CONTRASTIVE",
     "HOTPOT_CONTRASTIVE",
     "SYNTHQA_CONTRASTIVE",
+    "IFEVAL",
+    "MT_BENCH",
+    "ALPACA_EVAL",
+    "ARENA_HARD",
 ]
