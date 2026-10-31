@@ -685,9 +685,11 @@ def test_eval_suite_records_task_scores_with_holdout_loss():
     created = trainer.output_dir
     trainer.writer.close()
 
+    scalars = []
+
     class _Quiet:
-        def add_scalar(self, *args, **kwargs):
-            return None
+        def add_scalar(self, tag, value, step, *args, **kwargs):
+            scalars.append((tag, value, step))
 
         def flush(self):
             return None
@@ -733,6 +735,9 @@ def test_eval_suite_records_task_scores_with_holdout_loss():
     assert flat["fineweb-edu/train/loss"] == 2.5
     assert flat["squad_v2/validation/answerable_f1"] == 0.25
     assert flat["squad_v2/validation/loss"] == 1.5
+    assert flat["loss"] == 2.0
+    assert ("eval/loss", 2.0, 3) in scalars
+    assert saved["metrics"]["loss"] == 2.0
     assert saved["metrics"]["fineweb-edu/train/loss"] == 2.5
     assert saved["metrics"]["squad_v2/validation/answerable_f1"] == 0.25
     assert best["metrics"]["squad_v2/validation/answerable_f1"] == 0.25
