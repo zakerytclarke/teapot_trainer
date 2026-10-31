@@ -13,7 +13,8 @@ from collections import defaultdict
 import torch
 
 from .datasets import DatasetSourceConfig, encode_pair, holdout_membership, open_dataset, row_pairs
-from .formatting import ABSTAIN_TEXT
+from .formatting import ABSTAIN_TEXT, NO_REFERENCE
+from .ifeval import score_ifeval
 from .metrics import (
     best_span_scores,
     classify_decision,
@@ -30,6 +31,14 @@ from .metrics import (
 def task_kind(src: DatasetSourceConfig) -> str:
     name = (src.name or "").lower()
     subset = (src.subset or "").lower()
+    if "ifeval" in name:
+        return "ifeval"
+    if "mt_bench" in name:
+        return "mtbench"
+    if "alpaca_eval" in name:
+        return "alpaca"
+    if "arena-hard" in name or "arena_hard" in name:
+        return "arena"
     if "when2call" in name:
         return "when2call"
     if "squad" in name:
@@ -269,7 +278,8 @@ def evaluate_source(
     if not prepared:
         return {"key": key, "kind": kind, "metrics": metrics, "samples": samples}
 
-    loss = _mean_loss(model, tokenizer, [(p, a) for _, p, a in prepared], seq_len, device)
+    loss_pairs = [(prompt, answer) for _, prompt, answer in prepared if answer != NO_REFERENCE]
+    loss = _mean_loss(model, tokenizer, loss_pairs, seq_len, device)
     if loss is not None:
         metrics["loss"] = loss
 
@@ -282,6 +292,10 @@ def evaluate_source(
         "constraints": 220,
         "synthqa": 160,
         "chat": 160,
+        "ifeval": 512,
+        "mtbench": 384,
+        "alpaca": 384,
+        "arena": 384,
         "sft_loss": 0,
     }.get(kind, 0)
     predictions = [""] * len(prepared)
@@ -455,6 +469,72 @@ def evaluate_source(
             metrics["chat_f1"] = sum(scores) / len(scores)
             metrics["support"] = float(len(scores))
 
+    elif kind == "ifeval":
+        buckets = {"prompt_strict": [], "prompt_loose": [], "instruction_strict": [], "instruction_loose": []}
+        for (row, prompt, answer), prediction in zip(prepared, predictions):
+            scored = score_ifeval(row, prediction)
+            for name, value in scored.items():
+                buckets[name].append(value)
+            if len(samples) < 3:
+                samples.append({
+                    "task": "ifeval",
+                    "user": str(row.get("prompt") or "")[:240],
+                    "gold": ",".join(row.get("instruction_id_list") or [])[:200],
+                    "prediction": prediction[:220],
+                    "prompt_strict": scored["prompt_strict"],
+                })
+        for name, values in buckets.items():
+            if values:
+                metrics[name] = sum(values) / len(values)
+                metrics[f"support_{name}"] = float(len(values))
+
+    elif kind == "mtbench":
+        scores = []
+        for (row, prompt, answer), prediction in zip(prepared, predictions):
+            if answer != NO_REFERENCE:
+                scores.append(token_f1(prediction, answer))
+            if len(samples) < 3:
+                samples.append({
+                    "task": "mtbench",
+                    "user": prompt[:240],
+                    "gold": "" if answer == NO_REFERENCE else answer[:200],
+                    "prediction": prediction[:220],
+                })
+        if scores:
+            metrics["reference_f1"] = sum(scores) / len(scores)
+            metrics["support_reference"] = float(len(scores))
+        metrics["support"] = float(len(prepared))
+
+    elif kind == "alpaca":
+        scores = []
+        for (row, prompt, answer), prediction in zip(prepared, predictions):
+            scores.append(token_f1(prediction, answer))
+            if len(samples) < 3:
+                samples.append({
+                    "task": "alpaca",
+                    "user": str(row.get("instruction") or "")[:240],
+                    "gold": answer[:200],
+                    "prediction": prediction[:220],
+                })
+        if scores:
+            metrics["reference_f1"] = sum(scores) / len(scores)
+            metrics["support"] = float(len(scores))
+
+    elif kind == "arena":
+        for (row, prompt, answer), prediction in zip(prepared, predictions):
+            if len(samples) < 3:
+                user = ""
+                turns = row.get("turns") or []
+                if turns and isinstance(turns[0], dict):
+                    user = str(turns[0].get("content") or "")
+                samples.append({
+                    "task": "arena",
+                    "user": user[:240],
+                    "gold": "",
+                    "prediction": prediction[:220],
+                })
+        metrics["support"] = float(len(prepared))
+
     elif kind == "constraints":
         check_scores, example_scores = [], []
         for (row, prompt, answer), prediction in zip(prepared, predictions):
@@ -497,6 +577,7 @@ def selection_score(flat_metrics: dict[str, float]) -> float | None:
         "example_pass",
         "chat_f1",
         "answerable_abstain",
+        "prompt_strict",
     )
     values = []
     for key, value in flat_metrics.items():

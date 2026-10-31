@@ -685,9 +685,11 @@ def test_eval_suite_records_task_scores_with_holdout_loss():
     created = trainer.output_dir
     trainer.writer.close()
 
+    scalars = []
+
     class _Quiet:
-        def add_scalar(self, *args, **kwargs):
-            return None
+        def add_scalar(self, tag, value, step, *args, **kwargs):
+            scalars.append((tag, value, step))
 
         def flush(self):
             return None
@@ -733,6 +735,9 @@ def test_eval_suite_records_task_scores_with_holdout_loss():
     assert flat["fineweb-edu/train/loss"] == 2.5
     assert flat["squad_v2/validation/answerable_f1"] == 0.25
     assert flat["squad_v2/validation/loss"] == 1.5
+    assert flat["loss"] == 2.0
+    assert ("eval/loss", 2.0, 3) in scalars
+    assert saved["metrics"]["loss"] == 2.0
     assert saved["metrics"]["fineweb-edu/train/loss"] == 2.5
     assert saved["metrics"]["squad_v2/validation/answerable_f1"] == 0.25
     assert best["metrics"]["squad_v2/validation/answerable_f1"] == 0.25
@@ -1099,4 +1104,65 @@ def test_token_weight_changes_the_loss_and_survives_into_the_trainer():
     finally:
         os.chdir(previous)
     assert materialized[0].token_loss_weight_fn is marked.token_loss_weight_fn
+
+
+def test_chat_benchmarks_stay_out_of_the_running_mix():
+    from train import build_config
+    from teapottrainer import ALPACA_EVAL, ARENA_HARD, IFEVAL, MT_BENCH
+    from teapottrainer.datasets import encode_pair
+    from teapottrainer.evals import task_kind
+    from teapottrainer.formatting import NO_REFERENCE, format_alpaca_eval, format_arena_hard, format_ifeval, format_mt_bench
+    from teapottrainer.ifeval import score_ifeval
+
+    config = build_config()
+    used = {spec.source.name for spec in config.pretrain_datasets + config.sft_datasets + config.eval_datasets}
+    presets = (IFEVAL, MT_BENCH, ALPACA_EVAL, ARENA_HARD)
+    assert {src.name for src in presets}.isdisjoint(used)
+    assert [task_kind(src) for src in presets] == ["ifeval", "mtbench", "alpaca", "arena"]
+
+    prompt, answer = format_ifeval({"prompt": "Write a note without commas."})
+    assert prompt.startswith("User: Write a note")
+    assert answer == NO_REFERENCE
+    assert encode_pair(_CharTokenizer(), prompt, answer, 64) is None
+
+    turns = format_mt_bench({
+        "prompt": ["What is two plus two?", "Now add one."],
+        "reference": ["Four.", "Five."],
+    })
+    assert len(turns) == 2
+    assert "Four." in turns[1][0]
+    assert turns[1][1] == "Five."
+    assert format_mt_bench({"prompt": ["Hello"], "reference": []})[0][1] == NO_REFERENCE
+
+    alpaca_prompt, alpaca_answer = format_alpaca_eval({"instruction": "Name a color.", "output": "Blue."})
+    assert "Name a color." in alpaca_prompt
+    assert alpaca_answer == "Blue."
+    arena_prompt, arena_answer = format_arena_hard({"turns": [{"content": "How do I grep?"}]})
+    assert "How do I grep?" in arena_prompt
+    assert arena_answer == NO_REFERENCE
+
+    followed = score_ifeval(
+        {
+            "instruction_id_list": ["punctuation:no_comma", "detectable_format:number_bullet_lists"],
+            "kwargs": [{}, {"num_bullets": 2}],
+        },
+        "Walk every day\n* Stretch gently\n* Sleep enough",
+    )
+    assert followed["prompt_strict"] == 1.0
+    quoted = score_ifeval(
+        {"instruction_id_list": ["startend:quotation"], "kwargs": [{}]},
+        "Sure.\n\"A quoted answer.\"",
+    )
+    assert quoted["prompt_strict"] == 0.0
+    assert quoted["prompt_loose"] == 1.0
+    korean = score_ifeval(
+        {"instruction_id_list": ["language:response_language"], "kwargs": [{"language": "ko"}]},
+        "안녕하세요 친구",
+    )
+    assert korean["prompt_strict"] == 1.0
+    capitals = score_ifeval(
+        {"instruction_id_list": ["change_case:english_capital"], "kwargs": [{}]},
+        "ПРИВЕТ",
+    )
+    assert capitals["prompt_strict"] == 0.0
 

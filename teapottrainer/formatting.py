@@ -13,6 +13,8 @@ import re
 from typing import Any
 
 ABSTAIN_TEXT = "The context does not contain the answer."
+# Benchmark prompts that have no reference reply. Loss is not trained against this.
+NO_REFERENCE = "<no_reference>"
 TOOLS_PRESENT_REFUSAL = "I cannot answer that with the available tools."
 
 RAG_SYSTEM = (
@@ -561,6 +563,66 @@ def format_teapot_chat(row: dict) -> tuple[str, str] | None:
     return prompt, response
 
 
+def _chat_prompt(user: str) -> str:
+    return f"User: {user.strip()}\n\nAssistant:\n"
+
+
+def format_ifeval(row: dict) -> tuple[str, str] | None:
+    prompt = _as_text(row.get("prompt"))
+    if not prompt:
+        return None
+    return _chat_prompt(prompt), NO_REFERENCE
+
+
+def format_mt_bench(row: dict) -> list[tuple[str, str]] | None:
+    """One pair per turn. A turn without a reference stops the chain.
+
+    Later turns include the dataset's earlier reference answers. They do not
+    include a previous model generation, which the official second-turn judge
+    would use.
+    """
+    prompts = [_as_text(prompt) for prompt in (row.get("prompt") or [])]
+    prompts = [prompt for prompt in prompts if prompt]
+    if not prompts:
+        return None
+    references = list(row.get("reference") or [])
+    pairs = []
+    history: list[str] = []
+    for index, user in enumerate(prompts):
+        reference = ""
+        if index < len(references) and isinstance(references[index], str):
+            reference = references[index].strip()
+        history.append(f"User: {user}")
+        prompt = "\n\n".join(history + ["Assistant:"]) + "\n"
+        pairs.append((prompt, reference if reference else NO_REFERENCE))
+        if not reference:
+            break
+        history.append(f"Assistant: {reference}")
+    return pairs
+
+
+def format_alpaca_eval(row: dict) -> tuple[str, str] | None:
+    instruction = _as_text(row.get("instruction"))
+    output = _as_text(row.get("output"))
+    if not instruction or not output:
+        return None
+    return _chat_prompt(instruction), output
+
+
+def format_arena_hard(row: dict) -> tuple[str, str] | None:
+    turns = row.get("turns") or []
+    content = ""
+    if turns:
+        first = turns[0]
+        if isinstance(first, dict):
+            content = _as_text(first.get("content"))
+        else:
+            content = _as_text(first)
+    if not content:
+        return None
+    return _chat_prompt(content), NO_REFERENCE
+
+
 def as_pairs(formatted: Any) -> list[tuple[str, str]]:
     """Accept the original ``(prompt, answer)`` tuple or a list of them."""
     if formatted is None:
@@ -571,7 +633,8 @@ def as_pairs(formatted: Any) -> list[tuple[str, str]]:
         and isinstance(formatted[0], str)
         and isinstance(formatted[1], str)
     ):
-        prompt, answer = formatted[0].strip(), formatted[1].strip()
+        prompt = formatted[0].strip()
+        answer = formatted[1] if formatted[1] == NO_REFERENCE else formatted[1].strip()
         if prompt and answer:
             return [(prompt if prompt.endswith("\n") else prompt + "\n", answer)]
         return []

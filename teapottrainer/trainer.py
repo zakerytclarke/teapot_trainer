@@ -471,6 +471,9 @@ class TeapotTrainer:
         behavior = selection_score(flat)
         losses = [value for name, value in flat.items() if name.endswith("/loss")]
         mean_loss = sum(losses) / len(losses) if losses else None
+        if mean_loss is not None:
+            # One series for every eval set. Each set counts once, whatever its size.
+            flat["loss"] = mean_loss
         if behavior is not None:
             print(f" behavior_score: {behavior:.3f}")
         if mean_loss is not None:
