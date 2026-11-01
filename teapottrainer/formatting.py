@@ -13,6 +13,8 @@ import re
 from typing import Any
 
 ABSTAIN_TEXT = "The context does not contain the answer."
+# Benchmark prompts that have no reference reply. Loss is not trained against this.
+NO_REFERENCE = "<no_reference>"
 TOOLS_PRESENT_REFUSAL = "I cannot answer that with the available tools."
 
 RAG_SYSTEM = (
@@ -561,6 +563,284 @@ def format_teapot_chat(row: dict) -> tuple[str, str] | None:
     return prompt, response
 
 
+def _chat_prompt(user: str) -> str:
+    return f"User: {user.strip()}\n\nAssistant:\n"
+
+
+def format_ifeval(row: dict) -> tuple[str, str] | None:
+    prompt = _as_text(row.get("prompt"))
+    if not prompt:
+        return None
+    return _chat_prompt(prompt), NO_REFERENCE
+
+
+def format_mt_bench(row: dict) -> list[tuple[str, str]] | None:
+    """One pair per turn. A turn without a reference stops the chain.
+
+    Later turns include the dataset's earlier reference answers. They do not
+    include a previous model generation, which the official second-turn judge
+    would use.
+    """
+    prompts = [_as_text(prompt) for prompt in (row.get("prompt") or [])]
+    prompts = [prompt for prompt in prompts if prompt]
+    if not prompts:
+        return None
+    references = list(row.get("reference") or [])
+    pairs = []
+    history: list[str] = []
+    for index, user in enumerate(prompts):
+        reference = ""
+        if index < len(references) and isinstance(references[index], str):
+            reference = references[index].strip()
+        history.append(f"User: {user}")
+        prompt = "\n\n".join(history + ["Assistant:"]) + "\n"
+        pairs.append((prompt, reference if reference else NO_REFERENCE))
+        if not reference:
+            break
+        history.append(f"Assistant: {reference}")
+    return pairs
+
+
+def format_alpaca_eval(row: dict) -> tuple[str, str] | None:
+    instruction = _as_text(row.get("instruction"))
+    output = _as_text(row.get("output"))
+    if not instruction or not output:
+        return None
+    return _chat_prompt(instruction), output
+
+
+def format_arena_hard(row: dict) -> tuple[str, str] | None:
+    turns = row.get("turns") or []
+    content = ""
+    if turns:
+        first = turns[0]
+        if isinstance(first, dict):
+            content = _as_text(first.get("content"))
+        else:
+            content = _as_text(first)
+    if not content:
+        return None
+    return _chat_prompt(content), NO_REFERENCE
+
+
+def _choice_prompt(stem: str, options: list[str]) -> str:
+    letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    lines = [f"{letters[index]}. {text}" for index, text in enumerate(options)]
+    user = stem.strip() + "\n\n" + "\n".join(lines) + "\n\nReply with the correct option only."
+    return _chat_prompt(user)
+
+
+def _choice_index(raw: Any) -> int | None:
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _choice_view(stem: str, options: list[str], index: int | None) -> tuple[str, str, list[str], int] | None:
+    cleaned = [text.strip() for text in options]
+    if index is None or index < 0 or index >= len(cleaned) or len(cleaned) < 2:
+        return None
+    if not cleaned[index] or not stem.strip():
+        return None
+    return _choice_prompt(stem, cleaned), cleaned[index], cleaned, index
+
+
+def multiple_choice_view(name: str, row: dict) -> tuple[str, str, list[str], int] | None:
+    """Prompt, correct option text, every option, and the correct index."""
+    lowered = (name or "").lower()
+    if "ai2_arc" in lowered:
+        choices = row.get("choices") or {}
+        texts = [str(text) for text in (choices.get("text") or [])]
+        labels = [str(label).strip() for label in (choices.get("label") or [])]
+        key = str(row.get("answerKey") or "").strip()
+        if key not in labels:
+            return None
+        return _choice_view(_as_text(row.get("question")), texts, labels.index(key))
+    if "hellaswag" in lowered:
+        endings = [str(text) for text in (row.get("endings") or [])]
+        stem = "Complete the sentence.\n\n" + _as_text(row.get("ctx"))
+        return _choice_view(stem, endings, _choice_index(row.get("label")))
+    if "piqa" in lowered:
+        options = [_as_text(row.get("sol1")), _as_text(row.get("sol2"))]
+        return _choice_view(_as_text(row.get("goal")), options, _choice_index(row.get("label")))
+    if "winogrande" in lowered:
+        sentence = _as_text(row.get("sentence"))
+        options = [_as_text(row.get("option1")), _as_text(row.get("option2"))]
+        index = _choice_index(row.get("answer"))
+        if index is not None:
+            index -= 1
+        return _choice_view(f"Fill in the blank.\n\n{sentence}", options, index)
+    return None
+
+
+def _format_choice(name: str, row: dict) -> tuple[str, str] | None:
+    viewed = multiple_choice_view(name, row)
+    if viewed is None:
+        return None
+    prompt, gold, _options, _index = viewed
+    return prompt, gold
+
+
+def format_arc(row: dict) -> tuple[str, str] | None:
+    return _format_choice("allenai/ai2_arc", row)
+
+
+def format_hellaswag(row: dict) -> tuple[str, str] | None:
+    return _format_choice("Rowan/hellaswag", row)
+
+
+def format_piqa(row: dict) -> tuple[str, str] | None:
+    return _format_choice("ybisk/piqa", row)
+
+
+def format_winogrande(row: dict) -> tuple[str, str] | None:
+    return _format_choice("allenai/winogrande", row)
+
+
+def format_coqa(row: dict) -> list[tuple[str, str]] | None:
+    """One pair per question. Later turns include the earlier answers."""
+    story = _as_text(row.get("story"))
+    questions = [_as_text(question) for question in (row.get("questions") or [])]
+    answers = [_as_text(answer) for answer in ((row.get("answers") or {}).get("input_text") or [])]
+    if not story or not questions or not answers:
+        return None
+    pairs = []
+    earlier: list[str] = []
+    for question, answer in zip(questions, answers):
+        if not question or not answer:
+            break
+        prior = "\n\n".join(earlier)
+        user = f"Context:\n{story}\n\n{prior}\n\nQuestion: {question}" if prior else f"Context:\n{story}\n\nQuestion: {question}"
+        prompt = f"System: {RAG_SYSTEM}\n\nUser: {user}\n\nAssistant:\n"
+        pairs.append((prompt, answer))
+        earlier.append(f"Question: {question}\nAnswer: {answer}")
+    return pairs or None
+
+
+def format_drop(row: dict) -> tuple[str, str] | None:
+    spans = [_as_text(span) for span in ((row.get("answers_spans") or {}).get("spans") or [])]
+    spans = [span for span in spans if span]
+    passage = _as_text(row.get("passage"))
+    question = _as_text(row.get("question"))
+    if not spans or not passage or not question:
+        return None
+    return _rag_prompt(passage, question, ANSWER_SYSTEM), spans[0]
+
+
+_TOOL_TAGS = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE)
+
+
+def _calls_from_tags(text: str) -> list[dict]:
+    calls = []
+    for payload in _TOOL_TAGS.findall(text or ""):
+        try:
+            value = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        items = value if isinstance(value, list) else [value]
+        for item in items:
+            if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+                continue
+            arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+            calls.append({"name": item["name"].strip(), "arguments": arguments})
+    return calls
+
+
+def _tool_call_text(calls: list[dict]) -> str:
+    rendered = []
+    for call in calls:
+        arguments = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
+        rendered.append({
+            "name": call["name"],
+            "arguments": {str(key): arguments[key] for key in sorted(arguments, key=str)},
+        })
+    return "<tool_call>" + json.dumps(rendered, ensure_ascii=False) + "</tool_call>"
+
+
+def format_hermes(row: dict) -> list[tuple[str, str]] | None:
+    """Hermes traces rewritten into the library tool-call format.
+
+    Tool results stay in the next prompt, so the following answer is conditioned
+    on them. The dataset's own system text is replaced by the shared tool rules.
+    """
+    tools = _as_text(row.get("tools"))
+    system = DECISION_RULES if not tools else f"{DECISION_RULES}\nAvailable tools:\n{tools}"
+    lines = [f"System: {system}"]
+    pairs = []
+    for message in row.get("conversations") or []:
+        who = str(message.get("from") or "").lower()
+        value = _as_text(message.get("value"))
+        if not value or who == "system":
+            continue
+        if who == "human":
+            lines.append(f"User: {value}")
+            continue
+        if who == "tool":
+            lines.append(f"User: Tool result:\n{value}")
+            continue
+        if who != "gpt":
+            continue
+        calls = _calls_from_tags(value)
+        answer = _tool_call_text(calls) if calls else value
+        prompt = "\n\n".join(lines + ["Assistant:"]) + "\n"
+        pairs.append((prompt, answer))
+        lines.append(f"Assistant: {answer}")
+    return pairs or None
+
+
+def bfcl_concrete_calls(ground_truth: Any) -> list[dict]:
+    """One call per ground-truth entry, using the first listed value of each argument.
+
+    An acceptable value of ``""`` means the argument may be omitted. A training
+    target still fills the argument when any other value is listed.
+    """
+    if not isinstance(ground_truth, list):
+        return []
+    calls = []
+    for entry in ground_truth:
+        if not isinstance(entry, dict) or len(entry) != 1:
+            continue
+        name, params = next(iter(entry.items()))
+        if not isinstance(name, str) or not isinstance(params, dict):
+            continue
+        arguments = {}
+        for key, options in params.items():
+            if not isinstance(options, list):
+                arguments[str(key)] = options
+                continue
+            chosen = next((option for option in options if option not in ("", None)), None)
+            if chosen is None:
+                continue
+            arguments[str(key)] = chosen
+        calls.append({"name": name, "arguments": arguments})
+    return calls
+
+
+def format_bfcl(row: dict) -> tuple[str, str] | None:
+    """BFCL question plus the first acceptable call, or a refusal when no call is valid."""
+    users = []
+    for turn in row.get("question") or []:
+        messages = turn if isinstance(turn, list) else [turn]
+        for message in messages:
+            if isinstance(message, dict) and message.get("role") == "user":
+                text = _as_text(message.get("content"))
+                if text:
+                    users.append(text)
+    if not users:
+        return None
+    tools = json.dumps(row.get("function") or [], ensure_ascii=False)
+    system = f"{DECISION_RULES}\nAvailable tools:\n{tools}"
+    user = users[0] if len(users) == 1 else "\n".join(users)
+    prompt = f"System: {system}\n\nUser: {user}\n\nAssistant:\n"
+    calls = bfcl_concrete_calls(row.get("ground_truth"))
+    if not calls:
+        return prompt, TOOLS_PRESENT_REFUSAL
+    return prompt, _tool_call_text(calls)
+
+
 def as_pairs(formatted: Any) -> list[tuple[str, str]]:
     """Accept the original ``(prompt, answer)`` tuple or a list of them."""
     if formatted is None:
@@ -571,7 +851,8 @@ def as_pairs(formatted: Any) -> list[tuple[str, str]]:
         and isinstance(formatted[0], str)
         and isinstance(formatted[1], str)
     ):
-        prompt, answer = formatted[0].strip(), formatted[1].strip()
+        prompt = formatted[0].strip()
+        answer = formatted[1] if formatted[1] == NO_REFERENCE else formatted[1].strip()
         if prompt and answer:
             return [(prompt if prompt.endswith("\n") else prompt + "\n", answer)]
         return []

@@ -9,20 +9,37 @@ per label. The trainer applies those weights; it does not decide them.
 from __future__ import annotations
 
 import hashlib
+import json
+import random
+import urllib.request
+import zipfile
+from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 from datasets import load_dataset
 
 from .formatting import (
+    NO_REFERENCE,
     as_pairs,
+    format_alpaca_eval,
+    format_arc,
+    format_bfcl,
+    format_coqa,
+    format_drop,
+    format_hellaswag,
+    format_hermes,
+    format_piqa,
     format_apigen_aliased,
     format_apigen_decision,
     format_apigen_missing_argument,
     format_apigen_unrelated_tool,
     format_gsm8k,
+    format_arena_hard,
     format_hotpot,
     format_hotpot_contrastive,
+    format_ifeval,
+    format_mt_bench,
     format_squad,
     format_squad_answerable,
     format_squad_contrastive,
@@ -35,6 +52,7 @@ from .formatting import (
     format_when2call,
     format_when2call_ask,
     format_when2call_refuse,
+    format_winogrande,
     messages_format,
 )
 
@@ -339,9 +357,219 @@ TEAPOT_CHAT = DatasetSourceConfig(
     token_loss_weight_fn=_STOP_WEIGHT,
 )
 
+# Chat benchmarks. They are not part of the running mix. The published files
+# use a train split; these presets say test or eval so the train-split holdout
+# does not drop most of the benchmark. open_dataset reads the published file.
+IFEVAL = DatasetSourceConfig(
+    name="google/IFEval",
+    split="test",
+    is_sft=True,
+    chat_template_fn=format_ifeval,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+MT_BENCH = DatasetSourceConfig(
+    name="HuggingFaceH4/mt_bench_prompts",
+    split="test",
+    is_sft=True,
+    chat_template_fn=format_mt_bench,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+ALPACA_EVAL = DatasetSourceConfig(
+    name="tatsu-lab/alpaca_eval",
+    split="eval",
+    is_sft=True,
+    chat_template_fn=format_alpaca_eval,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+ARENA_HARD = DatasetSourceConfig(
+    name="lmarena-ai/arena-hard-auto-v0.1",
+    split="test",
+    is_sft=True,
+    chat_template_fn=format_arena_hard,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+
+# Small-model checks, conversational reading, and tool traces. Not in train.py.
+ARC_EASY = DatasetSourceConfig(
+    name="allenai/ai2_arc",
+    subset="ARC-Easy",
+    split="train",
+    is_sft=True,
+    chat_template_fn=format_arc,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+ARC_EASY_VAL = ARC_EASY.model_copy(update={"split": "validation"})
+HELLASWAG = DatasetSourceConfig(
+    name="Rowan/hellaswag",
+    split="train",
+    is_sft=True,
+    chat_template_fn=format_hellaswag,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+HELLASWAG_VAL = HELLASWAG.model_copy(update={"split": "validation"})
+PIQA = DatasetSourceConfig(
+    name="ybisk/piqa",
+    split="train",
+    is_sft=True,
+    chat_template_fn=format_piqa,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+PIQA_VAL = PIQA.model_copy(update={"split": "validation"})
+WINOGRANDE = DatasetSourceConfig(
+    name="allenai/winogrande",
+    subset="winogrande_xl",
+    split="train",
+    is_sft=True,
+    chat_template_fn=format_winogrande,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+WINOGRANDE_VAL = WINOGRANDE.model_copy(update={"split": "validation"})
+COQA = DatasetSourceConfig(
+    name="stanfordnlp/coqa",
+    split="train",
+    is_sft=True,
+    chat_template_fn=format_coqa,
+    token_loss_weight_fn=_SPAN_WEIGHT,
+)
+COQA_VAL = COQA.model_copy(update={"split": "validation"})
+DROP = DatasetSourceConfig(
+    name="ucinlp/drop",
+    split="train",
+    is_sft=True,
+    chat_template_fn=format_drop,
+    token_loss_weight_fn=_SPAN_WEIGHT,
+)
+DROP_VAL = DROP.model_copy(update={"split": "validation"})
+HERMES_FUNCTION_CALLING = DatasetSourceConfig(
+    name="NousResearch/hermes-function-calling-v1",
+    subset="func_calling",
+    split="train",
+    is_sft=True,
+    chat_template_fn=format_hermes,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+BFCL_SIMPLE = DatasetSourceConfig(
+    name="gorilla-llm/Berkeley-Function-Calling-Leaderboard",
+    subset="simple",
+    split="test",
+    is_sft=True,
+    chat_template_fn=format_bfcl,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+BFCL_MULTIPLE = BFCL_SIMPLE.model_copy(update={"subset": "multiple"})
+BFCL_PARALLEL = BFCL_SIMPLE.model_copy(update={"subset": "parallel"})
+BFCL_IRRELEVANCE = BFCL_SIMPLE.model_copy(update={"subset": "irrelevance"})
+
+
+class _RowDataset:
+    """In-memory rows with the shuffle call the streaming trainer uses."""
+
+    def __init__(self, rows: list[dict]):
+        self._rows = rows
+
+    def __iter__(self):
+        return iter(self._rows)
+
+    def shuffle(self, seed: int | None = None, buffer_size: int | None = None, **_kwargs):
+        copied = list(self._rows)
+        random.Random(seed).shuffle(copied)
+        return _RowDataset(copied)
+
+
+def _cache_file(url: str, dest: Path) -> Path:
+    if dest.is_file() and dest.stat().st_size > 0:
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    temporary = dest.with_suffix(dest.suffix + ".part")
+    urllib.request.urlretrieve(url, temporary)
+    temporary.replace(dest)
+    return dest
+
+
+def _read_jsonl(path: Path) -> list[dict]:
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            rows.append(json.loads(line))
+    return rows
+
+
+_PIQA_ZIP = "https://storage.googleapis.com/ai2-mosaic/public/physicaliqa/physicaliqa-train-dev.zip"
+_BFCL_BASE = "https://huggingface.co/datasets/gorilla-llm/Berkeley-Function-Calling-Leaderboard/resolve/main"
+_BFCL_FILES = {
+    "simple": "BFCL_v3_simple.json",
+    "multiple": "BFCL_v3_multiple.json",
+    "parallel": "BFCL_v3_parallel.json",
+    "irrelevance": "BFCL_v3_irrelevance.json",
+}
+
+
+def _open_piqa(split: str) -> _RowDataset:
+    files = {
+        "train": ("train.jsonl", "train-labels.lst"),
+        "validation": ("dev.jsonl", "dev-labels.lst"),
+    }
+    if split not in files:
+        raise ValueError(f"PIQA split must be train or validation, got {split}")
+    data_name, label_name = files[split]
+    root = Path.home() / ".cache" / "teapot_trainer" / "piqa"
+    archive_path = _cache_file(_PIQA_ZIP, root / "physicaliqa-train-dev.zip")
+    with zipfile.ZipFile(archive_path) as archive:
+        names = archive.namelist()
+        data_member = next(name for name in names if name.endswith("/" + data_name) or name == data_name)
+        label_member = next(name for name in names if name.endswith("/" + label_name) or name == label_name)
+        raw_rows = archive.read(data_member).decode().splitlines()
+        labels = archive.read(label_member).decode().splitlines()
+    rows = []
+    for line, label in zip(raw_rows, labels):
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        row["label"] = int(str(label).strip())
+        rows.append(row)
+    return _RowDataset(rows)
+
+
+def _open_bfcl(category: str) -> _RowDataset:
+    filename = _BFCL_FILES.get(category)
+    if filename is None:
+        raise ValueError(f"Unknown BFCL category: {category}")
+    root = Path.home() / ".cache" / "teapot_trainer" / "bfcl"
+    data_path = _cache_file(f"{_BFCL_BASE}/{filename}", root / filename)
+    rows = _read_jsonl(data_path)
+    if category == "irrelevance":
+        for row in rows:
+            row["ground_truth"] = None
+        return _RowDataset(rows)
+    answer_path = _cache_file(f"{_BFCL_BASE}/possible_answer/{filename}", root / "possible_answer" / filename)
+    answers = {row.get("id"): row.get("ground_truth") for row in _read_jsonl(answer_path)}
+    for row in rows:
+        row["ground_truth"] = answers.get(row.get("id"))
+    return _RowDataset(rows)
+
 
 def open_dataset(src: DatasetSourceConfig, streaming: bool):
+    # The AlpacaEval loader is a dataset script. Current `datasets` will not run it.
+    if src.name == "ybisk/piqa":
+        return _open_piqa(src.split)
+    if src.name == "gorilla-llm/Berkeley-Function-Calling-Leaderboard":
+        return _open_bfcl(src.subset or "simple")
+    if src.name == "tatsu-lab/alpaca_eval":
+        return load_dataset(
+            "json",
+            data_files="https://huggingface.co/datasets/tatsu-lab/alpaca_eval/resolve/main/alpaca_eval.json",
+            split="train",
+            streaming=streaming,
+        )
     kwargs = {"split": src.split, "streaming": streaming}
+    # These benchmarks publish one train split. The preset split stays test so
+    # eval sees the benchmark instead of a 5% train holdout.
+    if src.split == "test" and src.name in {
+        "google/IFEval",
+        "HuggingFaceH4/mt_bench_prompts",
+        "lmarena-ai/arena-hard-auto-v0.1",
+    }:
+        kwargs["split"] = "train"
     try:
         if src.subset:
             return load_dataset(src.name, src.subset, **kwargs)
@@ -363,6 +591,8 @@ def holdout_membership(key: str, ratio: float, seed: int) -> bool:
 
 def encode_pair(tokenizer, prompt: str, answer: str, seq_len: int) -> dict | None:
     """Mask the prompt. Left-truncate so the supervised answer still fits."""
+    if answer == NO_REFERENCE:
+        return None
     answer = (answer or "").strip()
     prompt = prompt or ""
     if not answer or not prompt.strip():

@@ -431,6 +431,94 @@ def constraint_checks(instruction: str, response: str) -> list[tuple[str, bool]]
     return checks
 
 
+def _bfcl_specs(ground_truth: Any) -> list[dict]:
+    if not isinstance(ground_truth, list):
+        return []
+    specs = []
+    for entry in ground_truth:
+        if not isinstance(entry, dict) or len(entry) != 1:
+            continue
+        name, params = next(iter(entry.items()))
+        if not isinstance(name, str) or not isinstance(params, dict):
+            continue
+        specs.append({"name": name, "arguments": params})
+    return specs
+
+
+def _bfcl_optional(options: Any) -> bool:
+    return isinstance(options, list) and ("" in options or None in options)
+
+
+def _bfcl_value_ok(predicted: Any, options: Any) -> bool:
+    accepted = options if isinstance(options, list) else [options]
+    pred = _canonicalize(predicted)
+    if pred in ("", None) and _bfcl_optional(accepted):
+        return True
+    for option in accepted:
+        if option in ("", None):
+            continue
+        if _canonicalize(option) == pred:
+            return True
+    return False
+
+
+def _bfcl_args_ok(predicted: dict, options: dict) -> bool:
+    predicted = predicted or {}
+    for key, accepted in options.items():
+        if key not in predicted or predicted[key] in ("", None):
+            if _bfcl_optional(accepted):
+                continue
+            return False
+        if not _bfcl_value_ok(predicted[key], accepted):
+            return False
+    return all(key in options for key in predicted)
+
+
+def _bfcl_matched(pred_calls: list[dict], specs: list[dict], check_args: bool) -> bool:
+    if len(pred_calls) != len(specs):
+        return False
+    unused = list(pred_calls)
+    for spec in specs:
+        found = None
+        for call in unused:
+            if call["name"] != spec["name"]:
+                continue
+            if check_args and not _bfcl_args_ok(call["arguments"], spec["arguments"]):
+                continue
+            found = call
+            break
+        if found is None:
+            return False
+        unused.remove(found)
+    return True
+
+
+def score_bfcl(prediction: str, ground_truth: Any) -> dict[str, float]:
+    """Name and argument match against BFCL's list of acceptable values.
+
+    ``""`` in an argument's list means that argument may be left out. Parallel
+    calls may appear in any order. This is stricter than the official checker
+    about types and languages, and it does not execute the call.
+    """
+    pred_calls = extract_tool_calls(prediction)
+    specs = _bfcl_specs(ground_truth)
+    if not specs:
+        return {
+            "parse": 0.0,
+            "name": 0.0,
+            "args": 0.0,
+            "restraint": 1.0 if not pred_calls else 0.0,
+            "gold_is_call": 0.0,
+        }
+    return {
+        "parse": 1.0 if pred_calls else 0.0,
+        "name": 1.0 if _bfcl_matched(pred_calls, specs, check_args=False) else 0.0,
+        "args": 1.0 if _bfcl_matched(pred_calls, specs, check_args=True) else 0.0,
+        "restraint": 0.0,
+        "gold_is_call": 1.0,
+    }
+
+
 def score_constraints(instruction: str, response: str) -> dict[str, float] | None:
     checks = constraint_checks(instruction, response)
     if not checks:
@@ -457,4 +545,6 @@ HIGHER_IS_BETTER = (
     "numeric_em",
     "example_pass",
     "check_pass",
+    "choice_accuracy",
+    "contains",
 )
