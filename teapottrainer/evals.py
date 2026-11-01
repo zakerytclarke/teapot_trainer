@@ -13,7 +13,7 @@ from collections import defaultdict
 import torch
 
 from .datasets import DatasetSourceConfig, encode_pair, holdout_membership, open_dataset, row_pairs
-from .formatting import ABSTAIN_TEXT, NO_REFERENCE
+from .formatting import ABSTAIN_TEXT, NO_REFERENCE, multiple_choice_view
 from .ifeval import score_ifeval
 from .metrics import (
     best_span_scores,
@@ -21,6 +21,7 @@ from .metrics import (
     constraint_checks,
     extract_tool_calls,
     is_abstention,
+    score_bfcl,
     score_constraints,
     score_gsm,
     score_tool_prediction,
@@ -31,6 +32,16 @@ from .metrics import (
 def task_kind(src: DatasetSourceConfig) -> str:
     name = (src.name or "").lower()
     subset = (src.subset or "").lower()
+    if "berkeley-function-calling" in name or "berkeley_function_calling" in name:
+        return "bfcl"
+    if "hermes-function-calling" in name or "hermes_function_calling" in name:
+        return "tools"
+    if "ai2_arc" in name or "hellaswag" in name or "piqa" in name or "winogrande" in name:
+        return "choice"
+    if "coqa" in name:
+        return "coqa"
+    if name == "drop" or name.endswith("/drop"):
+        return "drop"
     if "ifeval" in name:
         return "ifeval"
     if "mt_bench" in name:
@@ -215,6 +226,28 @@ def _generate(model, tokenizer, prompts: list[str], max_new: int, seq_len: int, 
     return texts
 
 
+def _answer_loss(model, tokenizer, prompt: str, answer: str, seq_len: int, device) -> float | None:
+    """Mean loss of one continuation. Used to rank multiple-choice options."""
+    item = encode_pair(tokenizer, prompt, answer, seq_len)
+    if item is None:
+        return None
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        input_ids = torch.tensor([item["input_ids"]], dtype=torch.long, device=device)
+        labels = torch.tensor([item["labels"]], dtype=torch.long, device=device)
+        if device.type == "cuda":
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                output = model(input_ids=input_ids, labels=labels)
+        else:
+            output = model(input_ids=input_ids, labels=labels)
+    if was_training:
+        model.train()
+    if output.loss is None or torch.isnan(output.loss):
+        return None
+    return float(output.loss.item())
+
+
 def _mean_loss(model, tokenizer, pairs: list[tuple[str, str]], seq_len: int, device) -> float | None:
     encoded = []
     for prompt, answer in pairs[:16]:
@@ -273,8 +306,11 @@ def evaluate_source(
         pairs = row_pairs(src, row)
         if not pairs:
             continue
-        prompt, answer = pairs[-1]
-        prepared.append((row, prompt, answer))
+        # CoQA and multi-turn tool traces score every assistant turn. A single
+        # pair, including APIGen, stays one example.
+        selected = pairs if kind == "coqa" or (kind == "tools" and len(pairs) > 1) else [pairs[-1]]
+        for prompt, answer in selected:
+            prepared.append((row, prompt, answer))
     if not prepared:
         return {"key": key, "kind": kind, "metrics": metrics, "samples": samples}
 
@@ -296,7 +332,11 @@ def evaluate_source(
         "mtbench": 384,
         "alpaca": 384,
         "arena": 384,
+        "coqa": 48,
+        "drop": 48,
+        "bfcl": 160,
         "sft_loss": 0,
+        "choice": 0,
     }.get(kind, 0)
     predictions = [""] * len(prepared)
     if max_new > 0:
@@ -520,6 +560,103 @@ def evaluate_source(
             metrics["reference_f1"] = sum(scores) / len(scores)
             metrics["support"] = float(len(scores))
 
+    elif kind == "choice":
+        hits = []
+        for (row, prompt, answer), _prediction in zip(prepared, predictions):
+            viewed = multiple_choice_view(src.name, row)
+            if viewed is None:
+                continue
+            _prompt, _gold, options, index = viewed
+            losses = [
+                _answer_loss(model, tokenizer, prompt, option, seq_len, device)
+                for option in options
+            ]
+            if index >= len(losses) or losses[index] is None:
+                continue
+            best = None
+            best_loss = None
+            for option_index, loss in enumerate(losses):
+                if loss is None:
+                    continue
+                if best_loss is None or loss < best_loss:
+                    best = option_index
+                    best_loss = loss
+            hits.append(1.0 if best == index else 0.0)
+            if len(samples) < 3:
+                chosen = options[best] if best is not None and best < len(options) else ""
+                samples.append({
+                    "task": "choice",
+                    "user": prompt[:240],
+                    "gold": answer[:200],
+                    "prediction": chosen[:200],
+                })
+        if hits:
+            metrics["choice_accuracy"] = sum(hits) / len(hits)
+            metrics["support"] = float(len(hits))
+
+    elif kind == "coqa":
+        f1s, contains = [], []
+        for (row, prompt, answer), prediction in zip(prepared, predictions):
+            _em, f1, contained = best_span_scores(prediction, [answer])
+            f1s.append(f1)
+            contains.append(contained)
+            if len(samples) < 3:
+                samples.append({
+                    "task": "coqa",
+                    "user": prompt[:240],
+                    "gold": answer[:200],
+                    "prediction": prediction[:200],
+                })
+        if f1s:
+            metrics["f1"] = sum(f1s) / len(f1s)
+            metrics["contains"] = sum(contains) / len(contains)
+            metrics["support"] = float(len(f1s))
+
+    elif kind == "drop":
+        ems, f1s, contains = [], [], []
+        for (row, prompt, answer), prediction in zip(prepared, predictions):
+            spans = [_text for _text in ((row.get("answers_spans") or {}).get("spans") or []) if str(_text).strip()]
+            if not spans:
+                spans = [answer]
+            em, f1, contained = best_span_scores(prediction, [str(span) for span in spans])
+            ems.append(em)
+            f1s.append(f1)
+            contains.append(contained)
+            if len(samples) < 3:
+                samples.append({
+                    "task": "drop",
+                    "user": str(row.get("question") or "")[:240],
+                    "gold": answer[:200],
+                    "prediction": prediction[:200],
+                })
+        if f1s:
+            metrics["em"] = sum(ems) / len(ems)
+            metrics["f1"] = sum(f1s) / len(f1s)
+            metrics["contains"] = sum(contains) / len(contains)
+            metrics["support"] = float(len(f1s))
+
+    elif kind == "bfcl":
+        buckets = {"parse": [], "name": [], "args": [], "restraint": []}
+        for (row, prompt, answer), prediction in zip(prepared, predictions):
+            scored = score_bfcl(prediction, row.get("ground_truth"))
+            if scored["gold_is_call"]:
+                buckets["parse"].append(scored["parse"])
+                buckets["name"].append(scored["name"])
+                buckets["args"].append(scored["args"])
+            else:
+                buckets["restraint"].append(scored["restraint"])
+            if len(samples) < 3:
+                samples.append({
+                    "task": "bfcl",
+                    "user": prompt[:240],
+                    "gold": answer[:300],
+                    "prediction": prediction[:300],
+                })
+        for name, values in buckets.items():
+            if values:
+                metrics[name] = sum(values) / len(values)
+                metrics[f"support_{name}"] = float(len(values))
+
     elif kind == "arena":
         for (row, prompt, answer), prediction in zip(prepared, predictions):
             if len(samples) < 3:
@@ -578,6 +715,7 @@ def selection_score(flat_metrics: dict[str, float]) -> float | None:
         "chat_f1",
         "answerable_abstain",
         "prompt_strict",
+        "choice_accuracy",
     )
     values = []
     for key, value in flat_metrics.items():

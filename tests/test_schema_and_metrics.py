@@ -1166,3 +1166,147 @@ def test_chat_benchmarks_stay_out_of_the_running_mix():
     )
     assert capitals["prompt_strict"] == 0.0
 
+
+def test_added_presets_stay_out_of_the_running_mix():
+    from train import build_config
+    from teapottrainer import (
+        ARC_EASY,
+        ARC_EASY_VAL,
+        BFCL_IRRELEVANCE,
+        BFCL_MULTIPLE,
+        BFCL_PARALLEL,
+        BFCL_SIMPLE,
+        COQA,
+        COQA_VAL,
+        DROP,
+        DROP_VAL,
+        HELLASWAG,
+        HELLASWAG_VAL,
+        HERMES_FUNCTION_CALLING,
+        PIQA,
+        PIQA_VAL,
+        WINOGRANDE,
+        WINOGRANDE_VAL,
+    )
+    from teapottrainer.evals import task_kind
+    from teapottrainer.formatting import (
+        TOOLS_PRESENT_REFUSAL,
+        format_bfcl,
+        format_coqa,
+        format_drop,
+        format_hermes,
+        multiple_choice_view,
+    )
+    from teapottrainer.metrics import extract_tool_calls, score_bfcl
+
+    config = build_config()
+    used = {spec.source.name for spec in config.pretrain_datasets + config.sft_datasets + config.eval_datasets}
+    presets = (
+        ARC_EASY,
+        ARC_EASY_VAL,
+        HELLASWAG,
+        HELLASWAG_VAL,
+        PIQA,
+        PIQA_VAL,
+        WINOGRANDE,
+        WINOGRANDE_VAL,
+        COQA,
+        COQA_VAL,
+        DROP,
+        DROP_VAL,
+        HERMES_FUNCTION_CALLING,
+        BFCL_SIMPLE,
+        BFCL_MULTIPLE,
+        BFCL_PARALLEL,
+        BFCL_IRRELEVANCE,
+    )
+    assert {src.name for src in presets}.isdisjoint(used)
+    assert [task_kind(src) for src in presets] == [
+        "choice", "choice", "choice", "choice", "choice", "choice", "choice", "choice",
+        "coqa", "coqa", "drop", "drop",
+        "tools",
+        "bfcl", "bfcl", "bfcl", "bfcl",
+    ]
+    assert ARC_EASY_VAL.split == "validation"
+    assert BFCL_PARALLEL.subset == "parallel"
+    assert HERMES_FUNCTION_CALLING.subset == "func_calling"
+
+    viewed = multiple_choice_view("allenai/ai2_arc", {
+        "question": "Which is newest?",
+        "choices": {"text": ["phone", "television"], "label": ["A", "B"]},
+        "answerKey": "A",
+    })
+    assert viewed is not None
+    prompt, gold, options, index = viewed
+    assert "phone" in prompt and "television" in prompt
+    assert gold == "phone" and options == ["phone", "television"] and index == 0
+    assert multiple_choice_view("ybisk/piqa", {"goal": "Boil eggs.", "sol1": "Use water.", "sol2": "Use sand.", "label": -1}) is None
+    assert multiple_choice_view("allenai/winogrande", {
+        "sentence": "Sarah was better than Maria so _ got the easy cases.",
+        "option1": "Sarah",
+        "option2": "Maria",
+        "answer": "2",
+    })[1] == "Maria"
+
+    turns = format_coqa({
+        "story": "Cotton was a white kitten.",
+        "questions": ["What color was Cotton?", "Where did she live?"],
+        "answers": {"input_text": ["white", "in a barn"]},
+    })
+    assert turns[0][1] == "white"
+    assert "white" in turns[1][0]
+    assert turns[1][1] == "in a barn"
+
+    drop_prompt, drop_answer = format_drop({
+        "passage": "Chaz Schilens scored, then Vonta Leach scored.",
+        "question": "Who scored the first touchdown?",
+        "answers_spans": {"spans": ["Chaz Schilens", "JaMarcus Russell"], "types": ["span", "span"]},
+    })
+    assert "Who scored" in drop_prompt
+    assert drop_answer == "Chaz Schilens"
+
+    hermes = format_hermes({
+        "tools": "[{\"name\": \"get_feed\"}]",
+        "conversations": [
+            {"from": "system", "value": "Old system prompt."},
+            {"from": "human", "value": "Check the front door."},
+            {"from": "gpt", "value": "<tool_call>\n{\"name\": \"get_feed\", \"arguments\": {\"camera_id\": \"front_door\"}}\n</tool_call>\n<tool_call>\n{\"name\": \"record_feed\", \"arguments\": {\"camera_id\": \"front_door\"}}\n</tool_call>"},
+            {"from": "tool", "value": "{\"live_feed_url\": \"https://example.com/live\"}"},
+            {"from": "gpt", "value": "The feed is ready."},
+        ],
+    })
+    assert len(hermes) == 2
+    assert "Old system prompt." not in hermes[0][0]
+    assert "get_feed" in hermes[0][0]
+    calls = extract_tool_calls(hermes[0][1])
+    assert [call["name"] for call in calls] == ["get_feed", "record_feed"]
+    assert "Tool result:" in hermes[1][0]
+    assert hermes[1][1] == "The feed is ready."
+
+    ground = [{"calculate_triangle_area": {"base": [10], "height": [5], "unit": ["units", ""]}}]
+    prompt, answer = format_bfcl({
+        "question": [[{"role": "user", "content": "Find the area."}]],
+        "function": [{"name": "calculate_triangle_area"}],
+        "ground_truth": ground,
+    })
+    assert "Find the area." in prompt
+    assert extract_tool_calls(answer)[0]["arguments"]["unit"] == "units"
+    alternate = '<tool_call>[{"name": "calculate_triangle_area", "arguments": {"base": 10, "height": 5}}]</tool_call>'
+    assert score_bfcl(alternate, ground)["args"] == 1.0
+    swapped = (
+        '<tool_call>[{"name": "spotify.play", "arguments": {"artist": "Maroon 5", "duration": 15}},'
+        '{"name": "spotify.play", "arguments": {"artist": "Taylor Swift", "duration": 20}}]</tool_call>'
+    )
+    parallel = [
+        {"spotify.play": {"artist": ["Taylor Swift"], "duration": [20]}},
+        {"spotify.play": {"artist": ["Maroon 5"], "duration": [15]}},
+    ]
+    assert score_bfcl(swapped, parallel)["args"] == 1.0
+    assert score_bfcl("I cannot do that.", None)["restraint"] == 1.0
+    refused_prompt, refused = format_bfcl({
+        "question": [[{"role": "user", "content": "Solve the quadratic."}]],
+        "function": [{"name": "math.sum"}],
+    })
+    assert "Solve the quadratic." in refused_prompt
+    assert refused == TOOLS_PRESENT_REFUSAL
+
