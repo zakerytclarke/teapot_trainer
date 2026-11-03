@@ -196,6 +196,9 @@ class TeapotTrainer:
         tokenizer_short = self.config.tokenizer.split("/")[-1]
         try:
             safe_dict = self.config.model_dump(exclude_defaults=True, mode="json")
+            # This flag only decides whether copies are fine-tuned at checkpoints.
+            # It must not fork the run directory, or a resume would miss its weights.
+            safe_dict.pop("sft_at_checkpoints", None)
             run_hash = hashlib.md5(json.dumps(safe_dict, default=str).encode()).hexdigest()[:6]
         except Exception:
             run_hash = hashlib.md5(repr(self.config).encode()).hexdigest()[:6]
@@ -422,7 +425,7 @@ class TeapotTrainer:
             return None
         return sum(losses) / len(losses)
 
-    def run_evaluation_suite(self, model, tokenizer, phase_name: str, global_step: int):
+    def run_evaluation_suite(self, model, tokenizer, phase_name: str, global_step: int, update_best: bool = True):
         """Score every eval set. Text holdouts report loss. Task sets report loss and behavior."""
         unwrapped = _unwrap(model)
         flat: dict[str, float] = {}
@@ -495,7 +498,7 @@ class TeapotTrainer:
             with open(os.path.join(snapshot_dir, "metrics.json"), "w", encoding="utf-8") as handle:
                 json.dump({"phase": phase_name, "step": global_step, "metrics": flat}, handle, indent=2)
             print(f" saved eval checkpoint to {snapshot_dir}")
-        if improved and flat:
+        if update_best and improved and flat:
             best_dir = os.path.join(self.output_dir, "checkpoints", "best")
             self._save_weights(model, tokenizer, best_dir)
             with open(os.path.join(best_dir, "metrics.json"), "w", encoding="utf-8") as handle:
@@ -631,7 +634,99 @@ class TeapotTrainer:
             raise SystemExit(f"Resume fast-forward for {phase_name} did not land on the checkpoint random state.")
         print(f"Fast-forward complete at {sum(produced):,} tokens.")
 
-    def _train_phase(self, phase_name: str, dataset_specs, model, tokenizer, starting_step: int, peak_lr: float, task_eval: bool, resume: dict | None = None):
+    def _sft_from_base_checkpoint(self, model, tokenizer, phase_name: str, global_step: int) -> None:
+        """Fine-tune a copy of a saved base checkpoint on the full SFT mix.
+
+        The live pretrain weights, optimizer, mixture cursor, and resume file
+        stay where they are. The copy is written to ``checkpoints/<phase>_sft``
+        with the held-out metrics from the finished supervised run.
+        """
+        if not self.config.sft_at_checkpoints or not self.config.sft_datasets:
+            return
+        if not phase_name.startswith("pretrain"):
+            return
+        label = f"{phase_name}_sft"
+        directory = os.path.join(self.output_dir, "checkpoints", label)
+        if os.path.isfile(os.path.join(directory, "metrics.json")):
+            print(f"SFT checkpoint already saved at {directory}")
+            return
+        base_dir = os.path.join(self.output_dir, "checkpoints", phase_name)
+        if not os.path.isfile(os.path.join(base_dir, "config.json")):
+            print(f"No base checkpoint at {base_dir}. Skipping side SFT.")
+            return
+
+        print(f"\nSide SFT from {phase_name}. The pretrain model is left unchanged.")
+        python_random = _python_random_state()
+        torch_rng = _capture_torch_rng()
+        saved_best_loss = self.best_loss
+        saved_best_behavior = self.best_behavior
+        saved_restarts = getattr(self, "_restarts", None)
+        saved_phases = list(self._completed_phases)
+        side = None
+        try:
+            side = AutoModelForCausalLM.from_pretrained(base_dir, dtype=torch.float32, trust_remote_code=True)
+            align_tokenizer_ids(side, tokenizer)
+            side.to(self.device)
+            if self._checkpointing and hasattr(side, "gradient_checkpointing_enable"):
+                try:
+                    side.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+                except TypeError:
+                    side.gradient_checkpointing_enable()
+                side.config.use_cache = False
+            sft_lr = self.config.lr * 0.2 if self.config.pretrain_datasets else self.config.lr
+            print(f"SFT copy peak lr is 0.2x config.lr ({sft_lr:.3e}).")
+            self._train_phase(
+                label,
+                list(self.config.sft_datasets),
+                side,
+                tokenizer,
+                global_step,
+                peak_lr=sft_lr,
+                task_eval=False,
+                resume=None,
+                persist_resume=False,
+                record_completion=False,
+                update_best=False,
+                eval_during=False,
+                final_phase_name=label,
+            )
+            stats = self.phase_stats.get(label)
+            if stats:
+                os.makedirs(directory, exist_ok=True)
+                with open(os.path.join(directory, "train_stats.json"), "w", encoding="utf-8") as handle:
+                    json.dump(stats, handle, indent=2)
+            print(f"Saved SFT checkpoint to {directory}")
+        finally:
+            _set_python_random_state(python_random)
+            _restore_torch_rng(torch_rng)
+            self.best_loss = saved_best_loss
+            self.best_behavior = saved_best_behavior
+            self._restarts = saved_restarts
+            self._completed_phases = saved_phases
+            del side
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            live = _unwrap(model)
+            live.train()
+            if self._checkpointing:
+                live.config.use_cache = False
+
+    def _train_phase(
+        self,
+        phase_name: str,
+        dataset_specs,
+        model,
+        tokenizer,
+        starting_step: int,
+        peak_lr: float,
+        task_eval: bool,
+        resume: dict | None = None,
+        persist_resume: bool = True,
+        record_completion: bool = True,
+        update_best: bool = True,
+        eval_during: bool = True,
+        final_phase_name: str | None = None,
+    ):
         if not dataset_specs:
             return starting_step
         sources = self._materialize_sources(dataset_specs)
@@ -695,7 +790,9 @@ class TeapotTrainer:
             _unwrap(model).config.use_cache = False
 
         if task_eval and not resume:
-            self.run_evaluation_suite(model, tokenizer, f"{phase_name}_start", global_step)
+            self.run_evaluation_suite(
+                model, tokenizer, f"{phase_name}_start", global_step, update_best=update_best
+            )
 
         started = time.time()
         resume_every = max(1, int(getattr(self, "resume_every_tokens", RESUME_EVERY_TOKENS)))
@@ -736,15 +833,18 @@ class TeapotTrainer:
                     self.writer.add_scalar(f"train_{phase_name}/tokens_per_sec", speed, global_step)
                     progress.set_postfix(loss=f"{loss:.4f}", lr=f"{lr:.2e}", speed=f"{int(speed)}tok/s")
                     pct = 100.0 * tokens / total_tokens
-                    if pct >= next_eval and pct < 100.0:
+                    if eval_during and pct >= next_eval and pct < 100.0:
                         progress.write(f"\n[eval at {pct:.1f}%]")
+                        checkpoint_name = f"{phase_name}_{int(pct)}pct"
                         self.run_evaluation_suite(
-                            model, tokenizer, f"{phase_name}_{int(pct)}pct", global_step
+                            model, tokenizer, checkpoint_name, global_step, update_best=update_best
                         )
+                        if phase_name == "pretrain":
+                            self._sft_from_base_checkpoint(model, tokenizer, checkpoint_name, global_step)
                         next_eval += self.config.eval_every_percent
                         model.train()
                     # After eval, so the saved generator and eval cursor include it.
-                    if tokens >= next_resume_tokens:
+                    if persist_resume and tokens >= next_resume_tokens:
                         self._write_resume(
                             model,
                             tokenizer,
@@ -791,28 +891,35 @@ class TeapotTrainer:
             f" finished {phase_name}: {tokens:,} tokens, "
             f"loss {first_loss} -> {last_loss}, {trained_tokens / elapsed:,.0f} tok/s"
         )
-        self.run_evaluation_suite(model, tokenizer, f"{phase_name}_end", global_step)
-        if phase_name not in self._completed_phases:
-            self._completed_phases.append(phase_name)
-        self._write_resume(
+        self.run_evaluation_suite(
             model,
             tokenizer,
-            None,
-            {
-                "phase": phase_name,
-                "phase_done": True,
-                "completed_phases": list(self._completed_phases),
-                "tokens": tokens,
-                "samples_taken": samples_taken,
-                "produced": list(produced),
-                "restarts": list(restarts),
-                "global_step": global_step,
-                "micro_steps": micro_steps,
-                "next_eval": next_eval,
-                "first_loss": first_loss,
-                "peak_lr": peak_lr,
-            },
+            final_phase_name or f"{phase_name}_end",
+            global_step,
+            update_best=update_best,
         )
+        if record_completion and phase_name not in self._completed_phases:
+            self._completed_phases.append(phase_name)
+        if persist_resume:
+            self._write_resume(
+                model,
+                tokenizer,
+                None,
+                {
+                    "phase": phase_name,
+                    "phase_done": True,
+                    "completed_phases": list(self._completed_phases),
+                    "tokens": tokens,
+                    "samples_taken": samples_taken,
+                    "produced": list(produced),
+                    "restarts": list(restarts),
+                    "global_step": global_step,
+                    "micro_steps": micro_steps,
+                    "next_eval": next_eval,
+                    "first_loss": first_loss,
+                    "peak_lr": peak_lr,
+                },
+            )
         return global_step
 
     def train(self, fresh: bool = True, init_from: str | None = None):

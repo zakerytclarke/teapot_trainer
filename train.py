@@ -116,6 +116,9 @@ def build_config() -> TrainingConfig:
         lr=3e-3,
         weight_decay=0.1,
         eval_every_percent=10.0,
+        # Each pretrain eval also fine-tunes a copy to completion and saves it
+        # next to the base checkpoint. Pretrain itself keeps the base weights.
+        sft_at_checkpoints=True,
         compile=True,
     )
 

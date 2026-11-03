@@ -45,6 +45,9 @@ class TrainingConfig(BaseModel):
     logging_dir: Optional[str] = None
     
     eval_every_percent: float = 5.0
+    # At each pretrain eval checkpoint, train a copy on the full SFT mix and
+    # save it beside the base weights. The pretrain model keeps training.
+    sft_at_checkpoints: bool = False
     holdout_ratio: float = 0.05
     seed: int = 42
 

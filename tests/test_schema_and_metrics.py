@@ -39,6 +39,7 @@ LOCKED_TRAINING_FIELDS = {
     "compile",
     "logging_dir",
     "eval_every_percent",
+    "sft_at_checkpoints",
     "holdout_ratio",
     "seed",
 }
@@ -638,6 +639,96 @@ def test_resume_directory_falls_back_when_the_live_dir_is_incomplete():
         assert fallback["tokens"] == 12
         shutil.rmtree(live)
         assert trainer._read_resume()["tokens"] == 12
+
+
+def test_sft_at_checkpoints_trains_a_copy_and_restores_pretrain_state():
+    import os
+    import random
+    import tempfile
+
+    import teapottrainer.trainer as trainer_mod
+    from teapottrainer.trainer import TeapotTrainer
+
+    class _Copy:
+        def to(self, device):
+            return self
+
+        def train(self):
+            return self
+
+    with tempfile.TemporaryDirectory() as tmp:
+        base = os.path.join(tmp, "checkpoints", "pretrain_20pct")
+        os.makedirs(base)
+        with open(os.path.join(base, "config.json"), "w", encoding="utf-8") as handle:
+            handle.write("{}")
+        trainer = object.__new__(TeapotTrainer)
+        trainer.config = TrainingConfig(
+            tokenizer="local-test",
+            lr=1e-3,
+            sft_at_checkpoints=True,
+            sft_datasets=[DatasetSpec(source="toy", target_tokens=8)],
+            pretrain_datasets=[DatasetSpec(source="toy", target_tokens=8)],
+        )
+        trainer.output_dir = tmp
+        trainer.device = "cpu"
+        trainer.best_loss = 1.5
+        trainer.best_behavior = 0.25
+        trainer._restarts = [4]
+        trainer._completed_phases = []
+        trainer._checkpointing = False
+        trainer.phase_stats = {}
+        calls = []
+
+        def train_phase(*args, **kwargs):
+            random.seed(123)
+            trainer.best_loss = 9.0
+            trainer.best_behavior = 0.9
+            trainer._completed_phases.append("pretrain_20pct_sft")
+            trainer.phase_stats[kwargs.get("final_phase_name") or args[0]] = {"last_loss": 0.4}
+            calls.append(kwargs)
+            directory = os.path.join(tmp, "checkpoints", "pretrain_20pct_sft")
+            os.makedirs(directory, exist_ok=True)
+            with open(os.path.join(directory, "metrics.json"), "w", encoding="utf-8") as handle:
+                handle.write('{"loss": 1}')
+
+        trainer._train_phase = train_phase
+        original = trainer_mod.AutoModelForCausalLM.from_pretrained
+        trainer_mod.AutoModelForCausalLM.from_pretrained = lambda *args, **kwargs: _Copy()
+        random.seed(7)
+        expected_random = random.getstate()
+        try:
+            trainer._sft_from_base_checkpoint(_Copy(), None, "pretrain_20pct", 10)
+        finally:
+            trainer_mod.AutoModelForCausalLM.from_pretrained = original
+        assert len(calls) == 1
+        assert calls[0]["persist_resume"] is False
+        assert calls[0]["record_completion"] is False
+        assert calls[0]["update_best"] is False
+        assert calls[0]["eval_during"] is False
+        assert calls[0]["final_phase_name"] == "pretrain_20pct_sft"
+        assert calls[0]["peak_lr"] == 2e-4
+        assert trainer.best_loss == 1.5
+        assert trainer.best_behavior == 0.25
+        assert trainer._restarts == [4]
+        assert trainer._completed_phases == []
+        assert random.getstate() == expected_random
+        assert os.path.isfile(os.path.join(tmp, "checkpoints", "pretrain_20pct_sft", "train_stats.json"))
+        trainer._sft_from_base_checkpoint(object(), None, "pretrain_20pct", 10)
+        assert len(calls) == 1
+
+
+def test_sft_at_checkpoints_does_not_change_the_run_directory():
+    from teapottrainer.trainer import TeapotTrainer
+
+    plain = TeapotTrainer(TrainingConfig(tokenizer="hash-probe-sft-flag", compile=False))
+    flagged = TeapotTrainer(
+        TrainingConfig(tokenizer="hash-probe-sft-flag", compile=False, sft_at_checkpoints=True)
+    )
+    try:
+        assert plain.output_dir == flagged.output_dir
+    finally:
+        plain.writer.close()
+        flagged.writer.close()
 
 
 def test_eval_suite_records_task_scores_with_holdout_loss():
