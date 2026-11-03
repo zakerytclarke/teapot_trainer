@@ -678,13 +678,23 @@ def test_sft_at_checkpoints_trains_a_copy_and_restores_pretrain_state():
         trainer._checkpointing = False
         trainer.phase_stats = {}
         calls = []
+        logged = []
+
+        class _Chart:
+            def add_scalar(self, tag, value, step, *args, **kwargs):
+                logged.append((tag, value, step))
+
+        trainer.writer = _Chart()
 
         def train_phase(*args, **kwargs):
             random.seed(123)
             trainer.best_loss = 9.0
             trainer.best_behavior = 0.9
             trainer._completed_phases.append("pretrain_20pct_sft")
-            trainer.phase_stats[kwargs.get("final_phase_name") or args[0]] = {"last_loss": 0.4}
+            trainer.phase_stats[kwargs.get("final_phase_name") or args[0]] = {
+                "last_loss": 0.4,
+                "best_train_loss": 0.2,
+            }
             calls.append(kwargs)
             directory = os.path.join(tmp, "checkpoints", "pretrain_20pct_sft")
             os.makedirs(directory, exist_ok=True)
@@ -706,7 +716,10 @@ def test_sft_at_checkpoints_trains_a_copy_and_restores_pretrain_state():
         assert calls[0]["update_best"] is False
         assert calls[0]["eval_during"] is False
         assert calls[0]["final_phase_name"] == "pretrain_20pct_sft"
+        assert calls[0]["metric_group"] == "sft_checkpoint"
+        assert calls[0]["metric_step"] == 10
         assert calls[0]["peak_lr"] == 2e-4
+        assert ("sft_checkpoint/best_train_loss", 0.2, 10) in logged
         assert trainer.best_loss == 1.5
         assert trainer.best_behavior == 0.25
         assert trainer._restarts == [4]
@@ -715,6 +728,18 @@ def test_sft_at_checkpoints_trains_a_copy_and_restores_pretrain_state():
         assert os.path.isfile(os.path.join(tmp, "checkpoints", "pretrain_20pct_sft", "train_stats.json"))
         trainer._sft_from_base_checkpoint(object(), None, "pretrain_20pct", 10)
         assert len(calls) == 1
+        os.remove(os.path.join(tmp, "checkpoints", "pretrain_20pct_sft", "metrics.json"))
+        trainer.config.sft_at_checkpoints = False
+        trainer._sft_from_base_checkpoint(_Copy(), None, "pretrain_20pct", 10)
+        assert len(calls) == 1
+        trainer_mod.AutoModelForCausalLM.from_pretrained = lambda *args, **kwargs: _Copy()
+        try:
+            trainer._sft_from_base_checkpoint(_Copy(), None, "pretrain_20pct", 10, required=True)
+        finally:
+            trainer_mod.AutoModelForCausalLM.from_pretrained = original
+        assert len(calls) == 2
+        assert calls[1]["metric_group"] == "sft_checkpoint"
+        assert calls[1]["metric_step"] == 10
 
 
 def test_sft_at_checkpoints_does_not_change_the_run_directory():
@@ -817,6 +842,9 @@ def test_eval_suite_records_task_scores_with_holdout_loss():
             best = json.load(handle)
         with open(os.path.join(created, "checkpoints", "pretrain_10pct", "metrics.json"), encoding="utf-8") as handle:
             snapshot = json.load(handle)
+        trainer.run_evaluation_suite(
+            _Model(), None, "pretrain_sft", 10, update_best=False, metric_group="sft_checkpoint"
+        )
     finally:
         trainer_mod.evaluate_source = original
         trainer.writer.close()
@@ -828,6 +856,14 @@ def test_eval_suite_records_task_scores_with_holdout_loss():
     assert flat["squad_v2/validation/loss"] == 1.5
     assert flat["loss"] == 2.0
     assert ("eval/loss", 2.0, 3) in scalars
+    assert ("val/loss", 2.0, 3) in scalars
+    assert ("val/fineweb-edu/train/loss", 2.5, 3) in scalars
+    assert ("val/squad_v2/validation/loss", 1.5, 3) in scalars
+    assert ("sft_checkpoint/loss", 2.0, 10) in scalars
+    assert ("sft_checkpoint/fineweb-edu/train/loss", 2.5, 10) in scalars
+    assert ("sft_checkpoint/squad_v2/validation/loss", 1.5, 10) in scalars
+    assert ("eval/fineweb-edu/train/loss", 2.5, 3) in scalars
+    assert all(step != 10 or not tag.startswith("eval/") for tag, _value, step in scalars)
     assert saved["metrics"]["loss"] == 2.0
     assert saved["metrics"]["fineweb-edu/train/loss"] == 2.5
     assert saved["metrics"]["squad_v2/validation/answerable_f1"] == 0.25

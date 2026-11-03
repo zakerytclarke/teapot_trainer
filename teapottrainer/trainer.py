@@ -382,16 +382,25 @@ class TeapotTrainer:
         unwrapped.save_pretrained(directory)
         tokenizer.save_pretrained(directory)
 
-    def _log_metrics(self, phase: str, step: int, payload: dict):
+    def _log_metrics(self, phase: str, step: int, payload: dict, group: str = "eval"):
         path = os.path.join(self.output_dir, "metrics.jsonl")
         record = {"phase": phase, "step": step, "metrics": payload}
         with open(path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(record) + "\n")
+        # Base checkpoints use val/. A finished SFT copy uses sft_checkpoint/,
+        # plotted at the pretrain step so the copies line up on one chart.
+        chart = "sft_checkpoint" if group == "sft_checkpoint" else "val"
         for key, value in payload.items():
-            if isinstance(value, (int, float)) and not key.endswith(tuple(f"/support_{suffix}" for suffix in ("x",))):
-                if "support" in key.split("/")[-1]:
-                    continue
+            if not isinstance(value, (int, float)):
+                continue
+            if "support" in key.split("/")[-1]:
+                continue
+            if group == "eval":
                 self.writer.add_scalar(f"eval/{key}", value, step)
+            if key == "loss":
+                self.writer.add_scalar(f"{chart}/loss", value, step)
+            elif key.endswith("/loss"):
+                self.writer.add_scalar(f"{chart}/{key}", value, step)
 
     def _lm_loss(self, model, tokenizer, src: DatasetSourceConfig) -> float | None:
         unwrapped = _unwrap(model)
@@ -425,7 +434,15 @@ class TeapotTrainer:
             return None
         return sum(losses) / len(losses)
 
-    def run_evaluation_suite(self, model, tokenizer, phase_name: str, global_step: int, update_best: bool = True):
+    def run_evaluation_suite(
+        self,
+        model,
+        tokenizer,
+        phase_name: str,
+        global_step: int,
+        update_best: bool = True,
+        metric_group: str = "eval",
+    ):
         """Score every eval set. Text holdouts report loss. Task sets report loss and behavior."""
         unwrapped = _unwrap(model)
         flat: dict[str, float] = {}
@@ -482,7 +499,7 @@ class TeapotTrainer:
         if mean_loss is not None:
             print(f" mean_eval_loss: {mean_loss:.4f}")
         print("=" * 78 + "\n")
-        self._log_metrics(phase_name, global_step, flat)
+        self._log_metrics(phase_name, global_step, flat, group=metric_group)
 
         improved = False
         if behavior is not None and (self.best_behavior is None or behavior >= self.best_behavior):
@@ -634,14 +651,20 @@ class TeapotTrainer:
             raise SystemExit(f"Resume fast-forward for {phase_name} did not land on the checkpoint random state.")
         print(f"Fast-forward complete at {sum(produced):,} tokens.")
 
-    def _sft_from_base_checkpoint(self, model, tokenizer, phase_name: str, global_step: int) -> None:
+    def _sft_from_base_checkpoint(
+        self, model, tokenizer, phase_name: str, global_step: int, required: bool = False
+    ) -> None:
         """Fine-tune a copy of a saved base checkpoint on the full SFT mix.
 
         The live pretrain weights, optimizer, mixture cursor, and resume file
         stay where they are. The copy is written to ``checkpoints/<phase>_sft``
         with the held-out metrics from the finished supervised run.
+        ``required`` runs the copy even when ``sft_at_checkpoints`` is off, which
+        is how the end-of-run SFT stays the same pass as these checkpoints.
         """
-        if not self.config.sft_at_checkpoints or not self.config.sft_datasets:
+        if not self.config.sft_datasets:
+            return
+        if not required and not self.config.sft_at_checkpoints:
             return
         if not phase_name.startswith("pretrain"):
             return
@@ -655,7 +678,10 @@ class TeapotTrainer:
             print(f"No base checkpoint at {base_dir}. Skipping side SFT.")
             return
 
-        print(f"\nSide SFT from {phase_name}. The pretrain model is left unchanged.")
+        if required:
+            print(f"\nSFT from {phase_name}. Same full pass as the checkpoint copies.")
+        else:
+            print(f"\nSide SFT from {phase_name}. The pretrain model is left unchanged.")
         python_random = _python_random_state()
         torch_rng = _capture_torch_rng()
         saved_best_loss = self.best_loss
@@ -689,8 +715,13 @@ class TeapotTrainer:
                 update_best=False,
                 eval_during=False,
                 final_phase_name=label,
+                metric_group="sft_checkpoint",
+                metric_step=global_step,
             )
             stats = self.phase_stats.get(label)
+            best_train = None if not stats else stats.get("best_train_loss")
+            if best_train is not None and getattr(self, "writer", None) is not None:
+                self.writer.add_scalar("sft_checkpoint/best_train_loss", best_train, global_step)
             if stats:
                 os.makedirs(directory, exist_ok=True)
                 with open(os.path.join(directory, "train_stats.json"), "w", encoding="utf-8") as handle:
@@ -726,6 +757,8 @@ class TeapotTrainer:
         update_best: bool = True,
         eval_during: bool = True,
         final_phase_name: str | None = None,
+        metric_group: str = "eval",
+        metric_step: int | None = None,
     ):
         if not dataset_specs:
             return starting_step
@@ -757,6 +790,7 @@ class TeapotTrainer:
         global_step = starting_step
         first_loss = None
         last_loss = None
+        best_train_loss = None
         next_eval = self.config.eval_every_percent
         if resume:
             tokens = int(resume["tokens"])
@@ -778,6 +812,7 @@ class TeapotTrainer:
             micro_steps = int(resume["micro_steps"])
             next_eval = float(resume["next_eval"])
             first_loss = resume.get("first_loss")
+            best_train_loss = resume.get("best_train_loss")
             samples_taken = samples_target
         optimizer = self._optimizer(_unwrap(model), peak_lr)
         optimizer_path = os.path.join(resume["dir"], "optimizer.pt") if resume else ""
@@ -828,9 +863,15 @@ class TeapotTrainer:
                     elapsed = max(time.time() - started, 1e-6)
                     trained_tokens = tokens - (int(resume["tokens"]) if resume else 0)
                     speed = trained_tokens / elapsed
+                    if best_train_loss is None or loss < best_train_loss:
+                        best_train_loss = loss
                     self.writer.add_scalar(f"train_{phase_name}/loss", loss, global_step)
                     self.writer.add_scalar(f"train_{phase_name}/lr", lr, global_step)
                     self.writer.add_scalar(f"train_{phase_name}/tokens_per_sec", speed, global_step)
+                    # One pretrain curve. Side SFT copies keep their own step axis
+                    # and must not draw on top of this series.
+                    if phase_name == "pretrain":
+                        self.writer.add_scalar("train/loss", loss, global_step)
                     progress.set_postfix(loss=f"{loss:.4f}", lr=f"{lr:.2e}", speed=f"{int(speed)}tok/s")
                     pct = 100.0 * tokens / total_tokens
                     if eval_during and pct >= next_eval and pct < 100.0:
@@ -861,6 +902,7 @@ class TeapotTrainer:
                                 "micro_steps": micro_steps,
                                 "next_eval": next_eval,
                                 "first_loss": first_loss,
+                                "best_train_loss": best_train_loss,
                                 "peak_lr": peak_lr,
                             },
                         )
@@ -872,6 +914,8 @@ class TeapotTrainer:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
+                if last_loss is not None and (best_train_loss is None or last_loss < best_train_loss):
+                    best_train_loss = last_loss
         finally:
             progress.close()
 
@@ -881,6 +925,7 @@ class TeapotTrainer:
         self.phase_stats[phase_name] = {
             "first_loss": first_loss,
             "last_loss": last_loss,
+            "best_train_loss": best_train_loss,
             "tokens": tokens,
             "tokens_per_source": {
                 source_key(src): count for src, count in zip(sources, produced)
@@ -895,8 +940,9 @@ class TeapotTrainer:
             model,
             tokenizer,
             final_phase_name or f"{phase_name}_end",
-            global_step,
+            global_step if metric_step is None else metric_step,
             update_best=update_best,
+            metric_group=metric_group,
         )
         if record_completion and phase_name not in self._completed_phases:
             self._completed_phases.append(phase_name)
@@ -917,6 +963,7 @@ class TeapotTrainer:
                     "micro_steps": micro_steps,
                     "next_eval": next_eval,
                     "first_loss": first_loss,
+                    "best_train_loss": best_train_loss,
                     "peak_lr": peak_lr,
                 },
             )
@@ -1021,11 +1068,48 @@ class TeapotTrainer:
                     "SFT stays eager. Variable-length chats crash torch.compile "
                     "after it specializes on the first padded width."
                 )
-            sft_lr = self.config.lr * 0.2 if pretrain else self.config.lr
-            if pretrain:
-                print(f"SFT peak lr is 0.2x config.lr ({sft_lr:.3e}) because this run already pretrained.")
             if "sft" in self._completed_phases:
                 print("Supervised training is already complete in the resume checkpoint.")
+            elif pretrain:
+                # The 100% pass is the same copy as pretrain_10pct_sft: load the
+                # saved base, train a fresh model on the full SFT mix, score it once.
+                pretrain_dir = os.path.join(self.output_dir, "checkpoints", "pretrain")
+                if not os.path.isfile(os.path.join(pretrain_dir, "config.json")):
+                    self._save_weights(model, tokenizer, pretrain_dir)
+                    print(f"Saved pretrain weights to {pretrain_dir}")
+                if resume and not resume.get("phase_done") and resume.get("phase") == "sft":
+                    print("In-progress SFT resume is unused. The final pass reruns the full checkpoint copy.")
+                self._sft_from_base_checkpoint(model, tokenizer, "pretrain", global_step, required=True)
+                sft_dir = os.path.join(self.output_dir, "checkpoints", "pretrain_sft")
+                if not os.path.isfile(os.path.join(sft_dir, "config.json")):
+                    raise SystemExit(f"Final SFT did not write {sft_dir}.")
+                model = AutoModelForCausalLM.from_pretrained(sft_dir, dtype=torch.float32, trust_remote_code=True)
+                align_tokenizer_ids(model, tokenizer)
+                model.to(self.device)
+                if "pretrain_sft" in self.phase_stats:
+                    self.phase_stats["sft"] = self.phase_stats["pretrain_sft"]
+                if "sft" not in self._completed_phases:
+                    self._completed_phases.append("sft")
+                self._write_resume(
+                    model,
+                    tokenizer,
+                    None,
+                    {
+                        "phase": "sft",
+                        "phase_done": True,
+                        "completed_phases": list(self._completed_phases),
+                        "tokens": 0,
+                        "samples_taken": 0,
+                        "produced": [],
+                        "restarts": [],
+                        "global_step": global_step,
+                        "micro_steps": 0,
+                        "next_eval": float(self.config.eval_every_percent),
+                        "first_loss": None,
+                        "best_train_loss": (self.phase_stats.get("pretrain_sft") or {}).get("best_train_loss"),
+                        "peak_lr": self.config.lr * 0.2,
+                    },
+                )
             else:
                 sft_resume = resume if resume and not resume.get("phase_done") and resume.get("phase") == "sft" else None
                 if sft_resume is None:
@@ -1036,7 +1120,7 @@ class TeapotTrainer:
                     model,
                     tokenizer,
                     global_step,
-                    peak_lr=sft_lr,
+                    peak_lr=self.config.lr,
                     task_eval=True,
                     resume=sft_resume,
                 )
