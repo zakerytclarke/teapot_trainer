@@ -219,5 +219,12 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Model Runs
+# Model runs and checkpoint weights. runs/ is everything the trainer writes.
+# The extensions catch a checkpoint saved outside that directory.
 runs/
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.bin
+events.out.tfevents*
