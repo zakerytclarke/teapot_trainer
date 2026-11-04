@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "teapottrainer"
+dynamic = ["version"]
+authors = [
+    { name = "Zakery Clarke", email = "zakerytclarke@gmail.com" },
+]
+description = "A modular, config-driven library for training LLMs."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+keywords = ["llm", "training", "transformers", "pytorch"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.1",
+    "transformers>=4.40",
+    "datasets>=2.14",
+    "pydantic>=2",
+    "tensorboard>=2.14",
+    "tqdm>=4.66",
+    "huggingface_hub>=0.20",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "build", "twine"]
+
+[project.urls]
+Homepage = "https://github.com/zakerytclarke/teapot_trainer"
+Repository = "https://github.com/zakerytclarke/teapot_trainer"
+Issues = "https://github.com/zakerytclarke/teapot_trainer/issues"
+
+[tool.setuptools]
+packages = ["teapottrainer"]
+
+[tool.setuptools.dynamic]
+version = { attr = "teapottrainer.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
