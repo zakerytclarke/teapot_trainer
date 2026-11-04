@@ -401,6 +401,10 @@ class TeapotTrainer:
                 self.writer.add_scalar(f"{chart}/loss", value, step)
             elif key.endswith("/loss"):
                 self.writer.add_scalar(f"{chart}/{key}", value, step)
+            elif key == "perplexity":
+                self.writer.add_scalar(f"{chart}/perplexity", value, step)
+            elif key.endswith("/perplexity"):
+                self.writer.add_scalar(f"{chart}/{key}", value, step)
 
     def _lm_loss(self, model, tokenizer, src: DatasetSourceConfig) -> float | None:
         unwrapped = _unwrap(model)
@@ -491,13 +495,17 @@ class TeapotTrainer:
         behavior = selection_score(flat)
         losses = [value for name, value in flat.items() if name.endswith("/loss")]
         mean_loss = sum(losses) / len(losses) if losses else None
+        for key, value in list(flat.items()):
+            if key.endswith("/loss"):
+                flat[f"{key[: -len('loss')]}perplexity"] = math.exp(min(value, 20))
         if mean_loss is not None:
             # One series for every eval set. Each set counts once, whatever its size.
             flat["loss"] = mean_loss
+            flat["perplexity"] = math.exp(min(mean_loss, 20))
         if behavior is not None:
             print(f" behavior_score: {behavior:.3f}")
         if mean_loss is not None:
-            print(f" mean_eval_loss: {mean_loss:.4f}")
+            print(f" mean_eval_loss: {mean_loss:.4f}  ppl {flat['perplexity']:.2f}")
         print("=" * 78 + "\n")
         self._log_metrics(phase_name, global_step, flat, group=metric_group)
 
