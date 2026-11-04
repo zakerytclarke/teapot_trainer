@@ -35,6 +35,8 @@ class TrainingConfig(BaseModel):
     eval_datasets: List[DatasetSpec] = Field(default_factory=list)
     
     tokenizer: str = "Qwen/Qwen2.5-0.5B"
+    # Hugging Face id or local directory. None builds a new model from the config.
+    init_from: Optional[str] = None
     batch_size: int = 4
     grad_accum: int = 32
     lr: float = 5e-4
@@ -43,6 +45,9 @@ class TrainingConfig(BaseModel):
     logging_dir: Optional[str] = None
     
     eval_every_percent: float = 5.0
+    # At each pretrain eval checkpoint, train a copy on the full SFT mix and
+    # save it beside the base weights. The pretrain model keeps training.
+    sft_at_checkpoints: bool = False
     holdout_ratio: float = 0.05
     seed: int = 42
 

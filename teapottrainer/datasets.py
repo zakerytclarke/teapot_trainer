@@ -1,10 +1,65 @@
+"""Dataset presets and the streaming encoder.
+
+New presets are additional constants. ``chat_template_fn`` may return one
+``(prompt, answer)`` pair or a list of pairs (one per assistant turn).
+``token_loss_weight_fn`` is optional and, when set, returns one loss weight
+per label. The trainer applies those weights; it does not decide them.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
 import random
-from typing import List, Dict, Callable, Optional, Union, Any
+import urllib.request
+import zipfile
+from pathlib import Path
+from typing import Any, Callable, Iterator, Optional
+
 from pydantic import BaseModel, ConfigDict, Field
-from datasets import load_dataset, Dataset as HFDataset, IterableDataset as HFIterableDataset
+from datasets import load_dataset
+
+from .formatting import (
+    NO_REFERENCE,
+    as_pairs,
+    format_alpaca_eval,
+    format_arc,
+    format_bfcl,
+    format_coqa,
+    format_drop,
+    format_hellaswag,
+    format_hermes,
+    format_piqa,
+    format_apigen_aliased,
+    format_apigen_decision,
+    format_apigen_missing_argument,
+    format_apigen_unrelated_tool,
+    format_gsm8k,
+    format_arena_hard,
+    format_hotpot,
+    format_hotpot_contrastive,
+    format_ifeval,
+    format_mt_bench,
+    format_squad,
+    format_squad_answerable,
+    format_squad_contrastive,
+    format_squad_unanswerable,
+    format_synthqa,
+    format_synthqa_answerable,
+    format_synthqa_contrastive,
+    format_synthqa_unanswerable,
+    format_teapot_chat,
+    format_when2call,
+    format_when2call_ask,
+    format_when2call_refuse,
+    format_winogrande,
+    messages_format,
+)
+
 
 class DatasetSourceConfig(BaseModel):
     """Configuration for an individual dataset source in a mix."""
+
     name: str
     subset: Optional[str] = None
     split: str = "train"
@@ -12,134 +67,668 @@ class DatasetSourceConfig(BaseModel):
     weight: float = 1.0
     text_column: str = "text"
     is_sft: bool = False
-    
-    # Exclude functions from serialization to prevent any Pydantic serialization errors
-    preprocess_fn: Optional[Callable[[Dict], Dict]] = Field(default=None, exclude=True)
-    chat_template_fn: Optional[Callable[[Dict], tuple[str, str]]] = Field(default=None, exclude=True)
+
+    preprocess_fn: Optional[Callable[[dict], dict]] = Field(default=None, exclude=True)
+    chat_template_fn: Optional[Callable[[dict], tuple[str, str]]] = Field(default=None, exclude=True)
+    # Maps an encoded example to one weight per label. None means every token counts as 1.
+    token_loss_weight_fn: Optional[Callable[[dict, Any], list[float]]] = Field(default=None, exclude=True)
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
 
-# ─────────────────────────────────────────────────────────────
-# Exported Dataset Preset Constants
-# ─────────────────────────────────────────────────────────────
+# End-of-answer token, relative to a normal supervised token.
+STOP_TOKEN_LOSS_WEIGHT = 8.0
+
+
+def eos_loss_weight(weight: float = STOP_TOKEN_LOSS_WEIGHT) -> Callable[[dict, Any], list[float]]:
+    """Upweight the tokenizer end token. Every other label stays at 1."""
+
+    def apply(example: dict, tokenizer) -> list[float]:
+        eos_id = getattr(tokenizer, "eos_token_id", None)
+        return [
+            float(weight) if eos_id is not None and label == eos_id else 1.0
+            for label in example["labels"]
+        ]
+
+    return apply
+
+
+_STOP_WEIGHT = eos_loss_weight(STOP_TOKEN_LOSS_WEIGHT)
+
+# Supervised answer tokens, relative to a masked prompt token. The end token stays higher.
+SPAN_TOKEN_LOSS_WEIGHT = 4.0
+
+
+def span_loss_weight(
+    answer_weight: float = SPAN_TOKEN_LOSS_WEIGHT,
+    eos_weight: float = STOP_TOKEN_LOSS_WEIGHT,
+) -> Callable[[dict, Any], list[float]]:
+    """Upweight the answer span, and upweight the end token further."""
+
+    def apply(example: dict, tokenizer) -> list[float]:
+        eos_id = getattr(tokenizer, "eos_token_id", None)
+        weights = []
+        for label in example["labels"]:
+            if eos_id is not None and label == eos_id:
+                weights.append(float(eos_weight))
+            elif label != -100:
+                weights.append(float(answer_weight))
+            else:
+                weights.append(1.0)
+        return weights
+
+    return apply
+
+
+_SPAN_WEIGHT = span_loss_weight()
+
 
 FINEWEB_EDU = DatasetSourceConfig(
     name="HuggingFaceFW/fineweb-edu",
     split="train",
     is_sft=False,
-    text_column="text"
+    text_column="text",
 )
 
-def _smoltalk_formatter(row):
-    messages = row.get("messages", [])
-    prompt, answer = "", ""
-    for i in range(len(messages) - 1):
-        if messages[i]["role"] == "user" and messages[i+1]["role"] == "assistant":
-            prompt = messages[i]["content"]
-            answer = messages[i+1]["content"]
-            break
-    if not prompt and messages:
-        prompt = messages[0].get("content", "")
-        answer = messages[-1].get("content", "")
-    return prompt, answer
+
+def _keep_strong_dclm(row: dict) -> dict:
+    """SmolLM2-135M improved when DCLM-Edu pages scored below 3 were left out."""
+    score = row.get("edu_int_score")
+    if isinstance(score, (int, float)) and int(score) < 3:
+        return {**row, "text": ""}
+    return row
+
+
+DCLM_EDU = DatasetSourceConfig(
+    name="HuggingFaceTB/dclm-edu",
+    split="train",
+    is_sft=False,
+    text_column="text",
+    preprocess_fn=_keep_strong_dclm,
+)
+# Official Stack-Edu rows are Software Heritage ids. This copy includes the file text.
+STACK_EDU = DatasetSourceConfig(
+    name="utter-project/stack-edu-HF",
+    split="train",
+    is_sft=False,
+    text_column="text",
+)
+FINEMATH = DatasetSourceConfig(
+    name="HuggingFaceTB/finemath",
+    subset="finemath-4plus",
+    split="train",
+    is_sft=False,
+    text_column="text",
+)
+INFIWEBMATH = DatasetSourceConfig(
+    name="HuggingFaceTB/finemath",
+    subset="infiwebmath-4plus",
+    split="train",
+    is_sft=False,
+    text_column="text",
+)
+COSMOPEDIA_V2 = DatasetSourceConfig(
+    name="HuggingFaceTB/smollm-corpus",
+    subset="cosmopedia-v2",
+    split="train",
+    is_sft=False,
+    text_column="text",
+)
 
 SMOLTALK = DatasetSourceConfig(
     name="HuggingFaceTB/smoltalk",
     subset="all",
     split="train",
     is_sft=True,
-    chat_template_fn=_smoltalk_formatter
+    chat_template_fn=messages_format,
+    token_loss_weight_fn=_STOP_WEIGHT,
 )
 
-def _gsm8k_formatter(row):
-    question = row.get("question", "")
-    answer = row.get("answer", "")
-    return f"Question: {question}\nAnswer:", f" {answer}"
+SMOLTALK_MAGPIE = DatasetSourceConfig(
+    name="HuggingFaceTB/smoltalk",
+    subset="smol-magpie-ultra",
+    split="train",
+    is_sft=True,
+    chat_template_fn=messages_format,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+SMOLTALK_EVERYDAY = DatasetSourceConfig(
+    name="HuggingFaceTB/smoltalk",
+    subset="everyday-conversations",
+    split="train",
+    is_sft=True,
+    chat_template_fn=messages_format,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+SMOLTALK_OPENHERMES = DatasetSourceConfig(
+    name="HuggingFaceTB/smoltalk",
+    subset="openhermes-100k",
+    split="train",
+    is_sft=True,
+    chat_template_fn=messages_format,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+SMOLTALK_CONSTRAINTS = DatasetSourceConfig(
+    name="HuggingFaceTB/smoltalk",
+    subset="smol-constraints",
+    split="train",
+    is_sft=True,
+    chat_template_fn=messages_format,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+SMOLTALK_SYSTEMCHATS = DatasetSourceConfig(
+    name="HuggingFaceTB/smoltalk",
+    subset="systemchats-30k",
+    split="train",
+    is_sft=True,
+    chat_template_fn=messages_format,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+SMOLTALK_SUMMARIZE = DatasetSourceConfig(
+    name="HuggingFaceTB/smoltalk",
+    subset="smol-summarize",
+    split="train",
+    is_sft=True,
+    chat_template_fn=messages_format,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+SMOLTALK_REWRITE = DatasetSourceConfig(
+    name="HuggingFaceTB/smoltalk",
+    subset="smol-rewrite",
+    split="train",
+    is_sft=True,
+    chat_template_fn=messages_format,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+SMOLTALK_APIGEN = DatasetSourceConfig(
+    name="HuggingFaceTB/smoltalk",
+    subset="apigen-80k",
+    split="train",
+    is_sft=True,
+    chat_template_fn=messages_format,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+SMOLTALK_APIGEN_DECISION = DatasetSourceConfig(
+    name="HuggingFaceTB/smoltalk",
+    subset="apigen-80k",
+    split="train",
+    is_sft=True,
+    chat_template_fn=format_apigen_decision,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+SMOLTALK_APIGEN_ALIASED = DatasetSourceConfig(
+    name="HuggingFaceTB/smoltalk",
+    subset="apigen-80k",
+    split="train",
+    is_sft=True,
+    chat_template_fn=format_apigen_aliased,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+SMOLTALK_APIGEN_MISSING = SMOLTALK_APIGEN_ALIASED.model_copy(
+    update={"chat_template_fn": format_apigen_missing_argument}
+)
+SMOLTALK_APIGEN_UNRELATED = SMOLTALK_APIGEN_ALIASED.model_copy(
+    update={"chat_template_fn": format_apigen_unrelated_tool}
+)
+SMOLTALK_METAMATH = DatasetSourceConfig(
+    name="HuggingFaceTB/smoltalk",
+    subset="metamathqa-50k",
+    split="train",
+    is_sft=True,
+    chat_template_fn=messages_format,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+
+SMOLTALK_MAGPIE_TEST = SMOLTALK_MAGPIE.model_copy(update={"split": "test"})
+SMOLTALK_CONSTRAINTS_TEST = SMOLTALK_CONSTRAINTS.model_copy(update={"split": "test"})
+SMOLTALK_APIGEN_TEST = SMOLTALK_APIGEN.model_copy(update={"split": "test"})
+SMOLTALK_APIGEN_DECISION_TEST = SMOLTALK_APIGEN_DECISION.model_copy(update={"split": "test"})
+SMOLTALK_APIGEN_ALIASED_TEST = SMOLTALK_APIGEN_ALIASED.model_copy(update={"split": "test"})
 
 GSM8K = DatasetSourceConfig(
     name="gsm8k",
     subset="main",
     split="train",
     is_sft=True,
-    chat_template_fn=_gsm8k_formatter
+    chat_template_fn=format_gsm8k,
+    token_loss_weight_fn=_STOP_WEIGHT,
 )
+GSM8K_TEST = GSM8K.model_copy(update={"split": "test"})
+
+WHEN2CALL = DatasetSourceConfig(
+    name="nvidia/When2Call",
+    subset="train_sft",
+    split="train",
+    is_sft=True,
+    chat_template_fn=format_when2call,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+WHEN2CALL_TEST = DatasetSourceConfig(
+    name="nvidia/When2Call",
+    subset="test",
+    split="mcq",
+    is_sft=True,
+    chat_template_fn=format_when2call,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+WHEN2CALL_ASK = WHEN2CALL.model_copy(update={"chat_template_fn": format_when2call_ask})
+WHEN2CALL_REFUSE = WHEN2CALL.model_copy(update={"chat_template_fn": format_when2call_refuse})
+
+SQUAD_V2 = DatasetSourceConfig(
+    name="rajpurkar/squad_v2",
+    split="train",
+    is_sft=True,
+    chat_template_fn=format_squad,
+    token_loss_weight_fn=_SPAN_WEIGHT,
+)
+SQUAD_V2_VAL = SQUAD_V2.model_copy(update={"split": "validation"})
+SQUAD_V2_ANSWERABLE = SQUAD_V2.model_copy(update={"chat_template_fn": format_squad_answerable})
+SQUAD_V2_UNANSWERABLE = SQUAD_V2.model_copy(update={"chat_template_fn": format_squad_unanswerable})
+SQUAD_V2_CONTRASTIVE = SQUAD_V2.model_copy(update={"chat_template_fn": format_squad_contrastive})
+
+HOTPOT = DatasetSourceConfig(
+    name="hotpot_qa",
+    subset="distractor",
+    split="train",
+    is_sft=True,
+    chat_template_fn=format_hotpot,
+    token_loss_weight_fn=_SPAN_WEIGHT,
+)
+HOTPOT_VAL = HOTPOT.model_copy(update={"split": "validation"})
+HOTPOT_CONTRASTIVE = HOTPOT.model_copy(update={"chat_template_fn": format_hotpot_contrastive})
+
+SYNTHQA = DatasetSourceConfig(
+    name="teapotai/synthqa",
+    split="train",
+    is_sft=True,
+    chat_template_fn=format_synthqa,
+    token_loss_weight_fn=_SPAN_WEIGHT,
+)
+SYNTHQA_TEST = SYNTHQA.model_copy(update={"split": "test"})
+SYNTHQA_ANSWERABLE = SYNTHQA.model_copy(update={"chat_template_fn": format_synthqa_answerable})
+SYNTHQA_UNANSWERABLE = SYNTHQA.model_copy(update={"chat_template_fn": format_synthqa_unanswerable})
+SYNTHQA_CONTRASTIVE = SYNTHQA.model_copy(update={"chat_template_fn": format_synthqa_contrastive})
+
+TEAPOT_CHAT = DatasetSourceConfig(
+    name="teapotai/teapot-chat",
+    split="train",
+    is_sft=True,
+    chat_template_fn=format_teapot_chat,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+
+# Chat benchmarks. They are not part of the running mix. The published files
+# use a train split; these presets say test or eval so the train-split holdout
+# does not drop most of the benchmark. open_dataset reads the published file.
+IFEVAL = DatasetSourceConfig(
+    name="google/IFEval",
+    split="test",
+    is_sft=True,
+    chat_template_fn=format_ifeval,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+MT_BENCH = DatasetSourceConfig(
+    name="HuggingFaceH4/mt_bench_prompts",
+    split="test",
+    is_sft=True,
+    chat_template_fn=format_mt_bench,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+ALPACA_EVAL = DatasetSourceConfig(
+    name="tatsu-lab/alpaca_eval",
+    split="eval",
+    is_sft=True,
+    chat_template_fn=format_alpaca_eval,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+ARENA_HARD = DatasetSourceConfig(
+    name="lmarena-ai/arena-hard-auto-v0.1",
+    split="test",
+    is_sft=True,
+    chat_template_fn=format_arena_hard,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+
+# Small-model checks, conversational reading, and tool traces. Not in train.py.
+ARC_EASY = DatasetSourceConfig(
+    name="allenai/ai2_arc",
+    subset="ARC-Easy",
+    split="train",
+    is_sft=True,
+    chat_template_fn=format_arc,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+ARC_EASY_VAL = ARC_EASY.model_copy(update={"split": "validation"})
+HELLASWAG = DatasetSourceConfig(
+    name="Rowan/hellaswag",
+    split="train",
+    is_sft=True,
+    chat_template_fn=format_hellaswag,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+HELLASWAG_VAL = HELLASWAG.model_copy(update={"split": "validation"})
+PIQA = DatasetSourceConfig(
+    name="ybisk/piqa",
+    split="train",
+    is_sft=True,
+    chat_template_fn=format_piqa,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+PIQA_VAL = PIQA.model_copy(update={"split": "validation"})
+WINOGRANDE = DatasetSourceConfig(
+    name="allenai/winogrande",
+    subset="winogrande_xl",
+    split="train",
+    is_sft=True,
+    chat_template_fn=format_winogrande,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+WINOGRANDE_VAL = WINOGRANDE.model_copy(update={"split": "validation"})
+COQA = DatasetSourceConfig(
+    name="stanfordnlp/coqa",
+    split="train",
+    is_sft=True,
+    chat_template_fn=format_coqa,
+    token_loss_weight_fn=_SPAN_WEIGHT,
+)
+COQA_VAL = COQA.model_copy(update={"split": "validation"})
+DROP = DatasetSourceConfig(
+    name="ucinlp/drop",
+    split="train",
+    is_sft=True,
+    chat_template_fn=format_drop,
+    token_loss_weight_fn=_SPAN_WEIGHT,
+)
+DROP_VAL = DROP.model_copy(update={"split": "validation"})
+HERMES_FUNCTION_CALLING = DatasetSourceConfig(
+    name="NousResearch/hermes-function-calling-v1",
+    subset="func_calling",
+    split="train",
+    is_sft=True,
+    chat_template_fn=format_hermes,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+BFCL_SIMPLE = DatasetSourceConfig(
+    name="gorilla-llm/Berkeley-Function-Calling-Leaderboard",
+    subset="simple",
+    split="test",
+    is_sft=True,
+    chat_template_fn=format_bfcl,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+BFCL_MULTIPLE = BFCL_SIMPLE.model_copy(update={"subset": "multiple"})
+BFCL_PARALLEL = BFCL_SIMPLE.model_copy(update={"subset": "parallel"})
+BFCL_IRRELEVANCE = BFCL_SIMPLE.model_copy(update={"subset": "irrelevance"})
+
+
+class _RowDataset:
+    """In-memory rows with the shuffle call the streaming trainer uses."""
+
+    def __init__(self, rows: list[dict]):
+        self._rows = rows
+
+    def __iter__(self):
+        return iter(self._rows)
+
+    def shuffle(self, seed: int | None = None, buffer_size: int | None = None, **_kwargs):
+        copied = list(self._rows)
+        random.Random(seed).shuffle(copied)
+        return _RowDataset(copied)
+
+
+def _cache_file(url: str, dest: Path) -> Path:
+    if dest.is_file() and dest.stat().st_size > 0:
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    temporary = dest.with_suffix(dest.suffix + ".part")
+    urllib.request.urlretrieve(url, temporary)
+    temporary.replace(dest)
+    return dest
+
+
+def _read_jsonl(path: Path) -> list[dict]:
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            rows.append(json.loads(line))
+    return rows
+
+
+_PIQA_ZIP = "https://storage.googleapis.com/ai2-mosaic/public/physicaliqa/physicaliqa-train-dev.zip"
+_BFCL_BASE = "https://huggingface.co/datasets/gorilla-llm/Berkeley-Function-Calling-Leaderboard/resolve/main"
+_BFCL_FILES = {
+    "simple": "BFCL_v3_simple.json",
+    "multiple": "BFCL_v3_multiple.json",
+    "parallel": "BFCL_v3_parallel.json",
+    "irrelevance": "BFCL_v3_irrelevance.json",
+}
+
+
+def _open_piqa(split: str) -> _RowDataset:
+    files = {
+        "train": ("train.jsonl", "train-labels.lst"),
+        "validation": ("dev.jsonl", "dev-labels.lst"),
+    }
+    if split not in files:
+        raise ValueError(f"PIQA split must be train or validation, got {split}")
+    data_name, label_name = files[split]
+    root = Path.home() / ".cache" / "teapot_trainer" / "piqa"
+    archive_path = _cache_file(_PIQA_ZIP, root / "physicaliqa-train-dev.zip")
+    with zipfile.ZipFile(archive_path) as archive:
+        names = archive.namelist()
+        data_member = next(name for name in names if name.endswith("/" + data_name) or name == data_name)
+        label_member = next(name for name in names if name.endswith("/" + label_name) or name == label_name)
+        raw_rows = archive.read(data_member).decode().splitlines()
+        labels = archive.read(label_member).decode().splitlines()
+    rows = []
+    for line, label in zip(raw_rows, labels):
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        row["label"] = int(str(label).strip())
+        rows.append(row)
+    return _RowDataset(rows)
+
+
+def _open_bfcl(category: str) -> _RowDataset:
+    filename = _BFCL_FILES.get(category)
+    if filename is None:
+        raise ValueError(f"Unknown BFCL category: {category}")
+    root = Path.home() / ".cache" / "teapot_trainer" / "bfcl"
+    data_path = _cache_file(f"{_BFCL_BASE}/{filename}", root / filename)
+    rows = _read_jsonl(data_path)
+    if category == "irrelevance":
+        for row in rows:
+            row["ground_truth"] = None
+        return _RowDataset(rows)
+    answer_path = _cache_file(f"{_BFCL_BASE}/possible_answer/{filename}", root / "possible_answer" / filename)
+    answers = {row.get("id"): row.get("ground_truth") for row in _read_jsonl(answer_path)}
+    for row in rows:
+        row["ground_truth"] = answers.get(row.get("id"))
+    return _RowDataset(rows)
+
+
+def open_dataset(src: DatasetSourceConfig, streaming: bool):
+    # The AlpacaEval loader is a dataset script. Current `datasets` will not run it.
+    if src.name == "ybisk/piqa":
+        return _open_piqa(src.split)
+    if src.name == "gorilla-llm/Berkeley-Function-Calling-Leaderboard":
+        return _open_bfcl(src.subset or "simple")
+    if src.name == "tatsu-lab/alpaca_eval":
+        return load_dataset(
+            "json",
+            data_files="https://huggingface.co/datasets/tatsu-lab/alpaca_eval/resolve/main/alpaca_eval.json",
+            split="train",
+            streaming=streaming,
+        )
+    kwargs = {"split": src.split, "streaming": streaming}
+    # These benchmarks publish one train split. The preset split stays test so
+    # eval sees the benchmark instead of a 5% train holdout.
+    if src.split == "test" and src.name in {
+        "google/IFEval",
+        "HuggingFaceH4/mt_bench_prompts",
+        "lmarena-ai/arena-hard-auto-v0.1",
+    }:
+        kwargs["split"] = "train"
+    try:
+        if src.subset:
+            return load_dataset(src.name, src.subset, **kwargs)
+        return load_dataset(src.name, **kwargs)
+    except Exception:
+        if src.subset:
+            return load_dataset(src.name, **kwargs)
+        raise
+
+
+def holdout_membership(key: str, ratio: float, seed: int) -> bool:
+    """True when this example belongs to the train-split holdout."""
+    if ratio <= 0:
+        return False
+    digest = hashlib.md5(f"{seed}:{key[:500]}".encode()).digest()
+    bucket = int.from_bytes(digest[:4], "big") / 2**32
+    return bucket < ratio
+
+
+def encode_pair(tokenizer, prompt: str, answer: str, seq_len: int) -> dict | None:
+    """Mask the prompt. Left-truncate so the supervised answer still fits."""
+    if answer == NO_REFERENCE:
+        return None
+    answer = (answer or "").strip()
+    prompt = prompt or ""
+    if not answer or not prompt.strip():
+        return None
+    if not prompt.endswith("\n"):
+        prompt += "\n"
+    eos = tokenizer.eos_token or ""
+    full_ids = tokenizer.encode(prompt + answer + eos, add_special_tokens=False)
+    prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    if full_ids[: len(prompt_ids)] != prompt_ids:
+        answer_ids = tokenizer.encode(answer + eos, add_special_tokens=False)
+        full_ids = prompt_ids + answer_ids
+    else:
+        answer_ids = full_ids[len(prompt_ids) :]
+    if not answer_ids:
+        return None
+    overflow = len(full_ids) - seq_len
+    if overflow > 0:
+        if overflow >= len(prompt_ids):
+            full_ids = answer_ids[-seq_len:]
+            labels = list(full_ids)
+        else:
+            prompt_ids = prompt_ids[overflow:]
+            full_ids = prompt_ids + answer_ids
+            labels = [-100] * len(prompt_ids) + list(answer_ids)
+    else:
+        labels = [-100] * (len(full_ids) - len(answer_ids)) + list(answer_ids)
+    if len(labels) != len(full_ids) or all(token == -100 for token in labels):
+        return None
+    return {"input_ids": list(full_ids), "labels": list(labels)}
+
+
+def row_text(src: DatasetSourceConfig, row: dict) -> str:
+    if src.preprocess_fn:
+        row = src.preprocess_fn(row)
+    value = row.get(src.text_column, row.get("text", row.get("content", "")))
+    return value if isinstance(value, str) else ""
+
+
+def row_pairs(src: DatasetSourceConfig, row: dict) -> list[tuple[str, str]]:
+    if src.preprocess_fn:
+        row = src.preprocess_fn(row)
+    if not src.chat_template_fn:
+        return []
+    return as_pairs(src.chat_template_fn(row))
+
+
+def iterate_encoded(
+    src: DatasetSourceConfig,
+    tokenizer,
+    seq_len: int,
+    *,
+    is_eval: bool = False,
+    holdout_ratio: float = 0.05,
+    seed: int = 42,
+    rows: list[dict] | None = None,
+) -> Iterator[dict]:
+    """Yield fixed trainer examples.
+
+    Train and eval of a ``split='train'`` source share a hash holdout so the
+    eval slice is not trained on. Test and validation splits are used whole.
+    """
+
+    def source_rows():
+        if rows is not None:
+            yield from rows
+            return
+        dataset = open_dataset(src, streaming=True)
+        if not is_eval:
+            # SQuAD v2's first ~2k rows are all answerable, so the buffer has to
+            # reach past them or a short run never sees an abstention.
+            buffer = 4096 if "squad" in (src.name or "") else 512
+            dataset = dataset.shuffle(seed=seed, buffer_size=buffer)
+        for row in dataset:
+            yield row
+
+    use_holdout = src.split == "train" and holdout_ratio > 0
+
+    if not src.is_sft:
+        buffer: list[int] = []
+        eos_id = tokenizer.eos_token_id
+        for row in source_rows():
+            text = row_text(src, row)
+            if not text:
+                continue
+            if use_holdout:
+                held = holdout_membership(text, holdout_ratio, seed)
+                if held != is_eval:
+                    continue
+            ids = tokenizer.encode(text, add_special_tokens=False)
+            if eos_id is not None:
+                ids = ids + [eos_id]
+            buffer.extend(ids)
+            while len(buffer) >= seq_len:
+                chunk = buffer[:seq_len]
+                buffer = buffer[seq_len:]
+                yield {"input_ids": chunk, "labels": list(chunk)}
+        return
+
+    for row in source_rows():
+        pairs = row_pairs(src, row)
+        for prompt, answer in pairs:
+            if use_holdout:
+                held = holdout_membership(prompt + "\n" + answer, holdout_ratio, seed)
+                if held != is_eval:
+                    continue
+            encoded = encode_pair(tokenizer, prompt, answer, seq_len)
+            if encoded is None:
+                continue
+            if src.token_loss_weight_fn is not None:
+                encoded["loss_weights"] = [float(value) for value in src.token_loss_weight_fn(encoded, tokenizer)]
+            yield encoded
 
 
 class DatasetRegistry:
-    """Manages loading, splitting, tokenizing, and mixing multiple data sources with leakage prevention."""
-    
+    """Load, encode, and mix sources. One generator is bound to one source."""
+
     @staticmethod
     def prepare_dataset_splits(
-        sources: List[Union[DatasetSourceConfig, Any]], 
-        tokenizer, 
-        seq_len: int, 
+        sources: list[Any],
+        tokenizer,
+        seq_len: int,
         is_eval: bool = False,
-        holdout_ratio: float = 0.05
+        holdout_ratio: float = 0.05,
+        seed: int = 42,
     ):
-        processed_data_streams = []
-        
+        streams = []
         for src in sources:
-            actual_split = src.split
-            if src.name == "gsm8k":
-                actual_split = "test" if is_eval else "train"
-            
-            try:
-                raw_ds = load_dataset(src.name, src.subset, split=actual_split, streaming=True)
-            except Exception:
-                raw_ds = load_dataset(src.name, split=actual_split, streaming=True)
-
-            if is_eval and src.name != "gsm8k" and actual_split == "train":
-                raw_ds = raw_ds.shard(num_shards=int(1 / holdout_ratio), index=0, contiguous=True)
-            elif not is_eval and src.name != "gsm8k" and actual_split == "train":
-                try:
-                    raw_ds = raw_ds.shard(num_shards=int(1 / holdout_ratio), index=1, contiguous=True)
-                except Exception:
-                    pass
-
-            def generator():
-                for item in raw_ds:
-                    if src.preprocess_fn:
-                        item = src.preprocess_fn(item)
-
-                    if src.is_sft and src.chat_template_fn:
-                        prompt, answer = src.chat_template_fn(item)
-                        if not prompt or not answer:
-                            continue
-                        
-                        prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
-                        answer_ids = tokenizer.encode(answer + tokenizer.eos_token, add_special_tokens=False)
-                        
-                        full_ids = prompt_ids + answer_ids
-                        labels_mask = [-100] * len(prompt_ids) + answer_ids
-
-                        while len(full_ids) >= seq_len:
-                            chunk_ids = full_ids[:seq_len]
-                            chunk_labels = labels_mask[:seq_len]
-                            
-                            full_ids = full_ids[seq_len:]
-                            labels_mask = labels_mask[seq_len:]
-                            yield {
-                                "input_ids": chunk_ids, 
-                                "labels": chunk_labels,
-                                "is_sft": True
-                            }
-                    else:
-                        text = item.get(src.text_column, item.get("text", item.get("content", "")))
-                        if not text:
-                            continue
-                        ids = tokenizer.encode(text, add_special_tokens=False)
-                        
-                        buffer = ids
-                        while len(buffer) >= seq_len:
-                            chunk = buffer[:seq_len]
-                            buffer = buffer[seq_len:]
-                            yield {
-                                "input_ids": chunk,
-                                "labels": chunk,
-                                "is_sft": False
-                            }
-
-            processed_data_streams.append(generator())
-
-        return processed_data_streams
+            streams.append(
+                iterate_encoded(
+                    src,
+                    tokenizer,
+                    seq_len,
+                    is_eval=is_eval,
+                    holdout_ratio=holdout_ratio,
+                    seed=seed,
+                )
+            )
+        return streams
