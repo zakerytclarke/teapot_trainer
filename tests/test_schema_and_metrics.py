@@ -779,6 +779,7 @@ def test_sft_at_checkpoints_does_not_change_the_run_directory():
 
 def test_eval_suite_records_task_scores_with_holdout_loss():
     import json
+    import math
     import os
     import shutil
 
@@ -880,7 +881,13 @@ def test_eval_suite_records_task_scores_with_holdout_loss():
     assert ("val/loss", 2.0, 3) in scalars
     assert ("val/fineweb-edu/train/loss", 2.5, 3) in scalars
     assert ("val/squad_v2/validation/loss", 1.5, 3) in scalars
+    assert ("eval/perplexity", math.exp(2.0), 3) in scalars
+    assert ("val/perplexity", math.exp(2.0), 3) in scalars
+    assert ("val/fineweb-edu/train/perplexity", math.exp(2.5), 3) in scalars
+    assert ("val/squad_v2/validation/perplexity", math.exp(1.5), 3) in scalars
+    assert ("eval/fineweb-edu/train/perplexity", math.exp(2.5), 3) in scalars
     assert ("sft_checkpoint/loss", 2.0, 10) in scalars
+    assert ("sft_checkpoint/perplexity", math.exp(2.0), 10) in scalars
     assert ("sft_checkpoint/fineweb-edu/train/loss", 2.5, 10) in scalars
     assert ("sft_checkpoint/squad_v2/validation/loss", 1.5, 10) in scalars
     assert ("eval/fineweb-edu/train/loss", 2.5, 3) in scalars
