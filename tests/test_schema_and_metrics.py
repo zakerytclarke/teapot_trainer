@@ -929,6 +929,9 @@ def test_resume_fast_forward_matches_an_uninterrupted_run():
 
     trainer.writer = _Quiet()
 
+    class _StopAfterCheckpoint(Exception):
+        pass
+
     def open_iterators(bucket):
         def _open(sources, tokenizer):
             def gen(marker):
