@@ -12,6 +12,7 @@ from collections import defaultdict
 
 import torch
 
+from .chat_formats import extra_stop_ids
 from .datasets import DatasetSourceConfig, encode_pair, holdout_membership, open_dataset, row_pairs
 from .formatting import ABSTAIN_TEXT, NO_REFERENCE, multiple_choice_view
 from .ifeval import score_ifeval
@@ -176,14 +177,26 @@ def load_task_rows(
 
 
 def generation_stop_ids(tokenizer) -> dict:
-    """Stop on the tokenizer end token, not the architecture default."""
+    """Stop on the tokenizer end token, not the architecture default.
+
+    A supervised chat format adds its own stop id when that string is already
+    one vocabulary token. Pretrain packing does not use this.
+    """
     eos_id = getattr(tokenizer, "eos_token_id", None)
     pad_id = getattr(tokenizer, "pad_token_id", None)
     if pad_id is None:
         pad_id = eos_id if eos_id is not None else 0
     kwargs = {"pad_token_id": pad_id}
+    stop_ids = []
     if eos_id is not None:
-        kwargs["eos_token_id"] = eos_id
+        stop_ids.append(eos_id)
+    for token_id in extra_stop_ids(tokenizer):
+        if token_id not in stop_ids:
+            stop_ids.append(token_id)
+    if len(stop_ids) == 1:
+        kwargs["eos_token_id"] = stop_ids[0]
+    elif stop_ids:
+        kwargs["eos_token_id"] = stop_ids
     return kwargs
 
 

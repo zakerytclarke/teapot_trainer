@@ -40,6 +40,7 @@ disable_hub_progress()
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, GPT2Config, GPT2LMHeadModel, LlamaConfig, LlamaForCausalLM
 
+from .chat_formats import get_chat_format, pop_chat_format, push_chat_format, single_token_id
 from .config import TrainingConfig
 from .datasets import DatasetRegistry, DatasetSourceConfig, iterate_encoded
 from .evals import evaluate_source, selection_score, source_key, task_kind
@@ -376,11 +377,46 @@ class TeapotTrainer:
             raise
         return float(loss.detach().float().item()), real_tokens
 
+    def _phase_uses_chat(self, phase_name: str | None) -> bool:
+        """Supervised checkpoints carry the chat template. Pretrain checkpoints do not."""
+        if not phase_name:
+            return False
+        return phase_name == "sft" or phase_name.startswith("sft_") or phase_name.endswith("_sft")
+
+    def _apply_chat_tokenizer(self, model, tokenizer):
+        """Point a supervised save at the selected template and its stop token."""
+        fmt = get_chat_format(self.config.chat_format)
+        previous = (
+            getattr(tokenizer, "chat_template", None),
+            getattr(tokenizer, "eos_token", None),
+        )
+        tokenizer.chat_template = fmt.template
+        if fmt.stop_token and single_token_id(tokenizer, fmt.stop_token) is not None:
+            tokenizer.eos_token = fmt.stop_token
+            align_tokenizer_ids(model, tokenizer)
+        return previous
+
+    def _restore_chat_tokenizer(self, model, tokenizer, previous) -> None:
+        template, eos = previous
+        tokenizer.chat_template = template
+        if eos is not None:
+            tokenizer.eos_token = eos
+        align_tokenizer_ids(model, tokenizer)
+
     def _save_weights(self, model, tokenizer, directory: str):
+        # ``_save_chat`` is set by the caller. The signature stays three
+        # arguments so a resumed pretrain save is unchanged.
         os.makedirs(directory, exist_ok=True)
-        unwrapped = _unwrap(model)
-        unwrapped.save_pretrained(directory)
-        tokenizer.save_pretrained(directory)
+        chat = bool(getattr(self, "_save_chat", False))
+        self._save_chat = False
+        previous = self._apply_chat_tokenizer(model, tokenizer) if chat else None
+        try:
+            unwrapped = _unwrap(model)
+            unwrapped.save_pretrained(directory)
+            tokenizer.save_pretrained(directory)
+        finally:
+            if previous is not None:
+                self._restore_chat_tokenizer(model, tokenizer, previous)
 
     def _log_metrics(self, phase: str, step: int, payload: dict, group: str = "eval"):
         path = os.path.join(self.output_dir, "metrics.jsonl")
@@ -519,12 +555,14 @@ class TeapotTrainer:
         if flat:
             # Keep every eval's weights. best/ is only the single best score.
             snapshot_dir = os.path.join(self.output_dir, "checkpoints", phase_name)
+            self._save_chat = self._phase_uses_chat(phase_name)
             self._save_weights(model, tokenizer, snapshot_dir)
             with open(os.path.join(snapshot_dir, "metrics.json"), "w", encoding="utf-8") as handle:
                 json.dump({"phase": phase_name, "step": global_step, "metrics": flat}, handle, indent=2)
             print(f" saved eval checkpoint to {snapshot_dir}")
         if update_best and improved and flat:
             best_dir = os.path.join(self.output_dir, "checkpoints", "best")
+            self._save_chat = self._phase_uses_chat(phase_name)
             self._save_weights(model, tokenizer, best_dir)
             with open(os.path.join(best_dir, "metrics.json"), "w", encoding="utf-8") as handle:
                 json.dump({"phase": phase_name, "step": global_step, "metrics": flat}, handle, indent=2)
@@ -569,6 +607,7 @@ class TeapotTrainer:
         if os.path.isdir(temporary):
             shutil.rmtree(temporary)
         os.makedirs(temporary, exist_ok=True)
+        self._save_chat = self._phase_uses_chat(state.get("phase"))
         self._save_weights(model, tokenizer, temporary)
         if optimizer is not None:
             torch.save(optimizer.state_dict(), os.path.join(temporary, "optimizer.pt"))
@@ -978,6 +1017,14 @@ class TeapotTrainer:
         return global_step
 
     def train(self, fresh: bool = True, init_from: str | None = None):
+        # Supervised rendering uses this format. Pretrain packing never reads it.
+        token = push_chat_format(self.config.chat_format)
+        try:
+            return self._train_body(fresh=fresh, init_from=init_from)
+        finally:
+            pop_chat_format(token)
+
+    def _train_body(self, fresh: bool = True, init_from: str | None = None):
         random.seed(self.config.seed)
         torch.manual_seed(self.config.seed)
         if torch.cuda.is_available():
@@ -1133,6 +1180,7 @@ class TeapotTrainer:
                     resume=sft_resume,
                 )
 
+        self._save_chat = "sft" in self._completed_phases
         self._save_weights(model, tokenizer, self.output_dir)
         with open(os.path.join(self.output_dir, "phase_stats.json"), "w", encoding="utf-8") as handle:
             json.dump(self.phase_stats, handle, indent=2)
