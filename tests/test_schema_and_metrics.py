@@ -73,6 +73,27 @@ def test_training_config_fields_are_unchanged():
     }
 
 
+def test_every_preset_uses_a_namespaced_dataset_id():
+    """Current Hugging Face clients reject an id that is not namespace/name."""
+    import teapottrainer.datasets as datasets
+    from teapottrainer.evals import task_kind
+
+    presets = {
+        name: value
+        for name, value in vars(datasets).items()
+        if isinstance(value, DatasetSourceConfig)
+    }
+    assert presets
+    bare = sorted(f"{name}={value.name}" for name, value in presets.items() if value.name.count("/") != 1)
+    assert bare == []
+    assert presets["GSM8K"].name == "openai/gsm8k"
+    assert presets["GSM8K_TEST"].name == "openai/gsm8k"
+    assert presets["HOTPOT"].name == "hotpotqa/hotpot_qa"
+    assert presets["HOTPOT_VAL"].name == "hotpotqa/hotpot_qa"
+    assert task_kind(presets["GSM8K"]) == "gsm8k"
+    assert task_kind(presets["HOTPOT"]) == "hotpot"
+
+
 def test_train_script_uses_the_same_constructor():
     from train import build_config
 

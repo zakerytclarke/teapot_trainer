@@ -286,7 +286,7 @@ SMOLTALK_APIGEN_DECISION_TEST = SMOLTALK_APIGEN_DECISION.model_copy(update={"spl
 SMOLTALK_APIGEN_ALIASED_TEST = SMOLTALK_APIGEN_ALIASED.model_copy(update={"split": "test"})
 
 GSM8K = DatasetSourceConfig(
-    name="gsm8k",
+    name="openai/gsm8k",
     subset="main",
     split="train",
     is_sft=True,
@@ -327,7 +327,7 @@ SQUAD_V2_UNANSWERABLE = SQUAD_V2.model_copy(update={"chat_template_fn": format_s
 SQUAD_V2_CONTRASTIVE = SQUAD_V2.model_copy(update={"chat_template_fn": format_squad_contrastive})
 
 HOTPOT = DatasetSourceConfig(
-    name="hotpot_qa",
+    name="hotpotqa/hotpot_qa",
     subset="distractor",
     split="train",
     is_sft=True,
