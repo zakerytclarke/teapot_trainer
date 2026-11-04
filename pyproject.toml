@@ -45,3 +45,7 @@ version = { attr = "teapottrainer.__version__" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# train.py lives at the repo root and is not installed. The pytest console
+# script does not put that directory on sys.path, so the tests that import it
+# need it added explicitly.
+pythonpath = ["."]
