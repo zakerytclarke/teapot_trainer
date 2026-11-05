@@ -31,6 +31,7 @@ LOCKED_TRAINING_FIELDS = {
     "sft_datasets",
     "eval_datasets",
     "tokenizer",
+    "chat_format",
     "init_from",
     "batch_size",
     "grad_accum",
@@ -1467,4 +1468,155 @@ def test_added_presets_stay_out_of_the_running_mix():
     })
     assert "Solve the quadratic." in refused_prompt
     assert refused == TOOLS_PRESENT_REFUSAL
+
+
+def test_chat_format_names_and_aliases():
+    import pytest
+
+    from teapottrainer.chat_formats import chat_format_names, get_chat_format
+
+    assert "chatml" in chat_format_names()
+    assert "plain" in chat_format_names()
+    assert get_chat_format("qwen").name == "chatml"
+    assert get_chat_format("smollm2").name == "smollm"
+    with pytest.raises(ValueError):
+        get_chat_format("not-a-format")
+    assert TrainingConfig(chat_format="Qwen").chat_format == "chatml"
+
+
+def test_every_chat_format_matches_apply_chat_template():
+    from transformers import AutoTokenizer
+
+    from teapottrainer.chat_formats import CHAT_FORMATS
+
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    messages = [
+        {"role": "system", "content": "Be brief."},
+        {"role": "user", "content": "Who are you?"},
+    ]
+    for name, fmt in CHAT_FORMATS.items():
+        tokenizer.chat_template = fmt.template
+        assert fmt.render(messages) == tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        ), name
+
+
+def test_plain_format_matches_the_historical_prompt():
+    prompt, answer = messages_format({
+        "messages": [
+            {"role": "system", "content": "Be brief."},
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello"},
+            {"role": "user", "content": "Again"},
+            {"role": "assistant", "content": "Yes"},
+        ]
+    })[0]
+    assert prompt == "System: Be brief.\n\nUser: Hi\n\nAssistant:\n"
+    assert answer == "Hello"
+    second = messages_format({
+        "messages": [
+            {"role": "system", "content": "Be brief."},
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello"},
+            {"role": "user", "content": "Again"},
+            {"role": "assistant", "content": "Yes"},
+        ]
+    })[1][0]
+    assert second == "System: Be brief.\n\nUser: Hi\n\nAssistant: Hello\n\nUser: Again\n\nAssistant:\n"
+
+
+def test_chat_format_matches_the_tokenizer_template_and_skips_pretrain():
+    from transformers import AutoTokenizer
+
+    from teapottrainer.chat_formats import use_chat_format
+    from teapottrainer.formatting import render_prompt
+
+    base = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    instruct = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM-135M-Instruct")
+    smollm2 = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M-Instruct")
+    messages = [{"role": "user", "content": "Who are you?"}]
+    with use_chat_format("chatml"):
+        prompt = render_prompt(messages)
+        assert prompt == instruct.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        assert "<|im_start|>user" in prompt
+        assert prompt.endswith("<|im_start|>assistant\n")
+        raw = DatasetSourceConfig(name="web", split="test", is_sft=False, text_column="text")
+        document = "a plain document " * 30
+        packed = next(iterate_encoded(raw, base, seq_len=8, rows=[{"text": document}]))
+        raw_ids = base.encode(document + base.eos_token, add_special_tokens=False)
+        assert packed["input_ids"] == raw_ids[:8]
+        assert "<|im_start|>" not in base.decode(packed["input_ids"])
+        chat = DatasetSourceConfig(
+            name="chat",
+            split="test",
+            is_sft=True,
+            chat_template_fn=messages_format,
+        )
+        encoded = next(iterate_encoded(
+            chat,
+            base,
+            seq_len=64,
+            rows=[{"messages": [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello"}]}],
+        ))
+        supervised = [token for token, label in zip(encoded["input_ids"], encoded["labels"]) if label != -100]
+        assert base.decode(supervised).startswith("Hello")
+        assert supervised[-1] == base.convert_tokens_to_ids("<|im_end|>")
+    with use_chat_format("smollm"):
+        rendered = render_prompt(messages)
+        assert rendered == smollm2.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        assert "helpful AI assistant named SmolLM" in rendered
+    # The default stays plain after the context exits.
+    assert messages_format({
+        "messages": [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello"}]
+    })[0][0].endswith("Assistant:\n")
+
+
+def test_supervised_save_writes_the_chat_template():
+    import json
+    import os
+    import tempfile
+
+    from transformers import AutoTokenizer
+
+    from teapottrainer.trainer import TeapotTrainer
+
+    tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+    config = TrainingConfig(chat_format="chatml", tokenizer="HuggingFaceTB/SmolLM2-135M", compile=False)
+    trainer = TeapotTrainer(config)
+    created = trainer.output_dir
+    trainer.writer.close()
+
+    class _Model:
+        def __init__(self):
+            self.config = type("C", (), {"eos_token_id": tokenizer.eos_token_id})()
+            self.generation_config = type("G", (), {"eos_token_id": tokenizer.eos_token_id})()
+
+        def save_pretrained(self, directory):
+            os.makedirs(directory, exist_ok=True)
+            with open(os.path.join(directory, "config.json"), "w", encoding="utf-8") as handle:
+                json.dump({"eos_token_id": self.config.eos_token_id}, handle)
+
+    model = _Model()
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            trainer._save_chat = True
+            trainer._save_weights(model, tokenizer, directory)
+            saved = AutoTokenizer.from_pretrained(directory)
+            messages = [{"role": "user", "content": "Who are you?"}]
+            assert saved.apply_chat_template(messages, tokenize=False, add_generation_prompt=True).endswith(
+                "<|im_start|>assistant\n"
+            )
+            assert saved.eos_token == "<|im_end|>"
+            with open(os.path.join(directory, "config.json"), encoding="utf-8") as handle:
+                assert json.load(handle)["eos_token_id"] == tokenizer.convert_tokens_to_ids("<|im_end|>")
+        assert tokenizer.eos_token != "<|im_end|>"
+        assert not tokenizer.chat_template
+        with tempfile.TemporaryDirectory() as directory:
+            trainer._save_weights(model, tokenizer, directory)
+            saved = AutoTokenizer.from_pretrained(directory)
+            assert not saved.chat_template
+    finally:
+        trainer.writer.close()
+        import shutil
+        shutil.rmtree(created, ignore_errors=True)
 

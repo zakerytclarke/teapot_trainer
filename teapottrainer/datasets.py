@@ -19,6 +19,7 @@ from typing import Any, Callable, Iterator, Optional
 from pydantic import BaseModel, ConfigDict, Field
 from datasets import load_dataset
 
+from .chat_formats import current_chat_format, supervised_end
 from .formatting import (
     NO_REFERENCE,
     as_pairs,
@@ -590,16 +591,23 @@ def holdout_membership(key: str, ratio: float, seed: int) -> bool:
 
 
 def encode_pair(tokenizer, prompt: str, answer: str, seq_len: int) -> dict | None:
-    """Mask the prompt. Left-truncate so the supervised answer still fits."""
+    """Mask the prompt. Left-truncate so the supervised answer still fits.
+
+    The plain format still ends the prompt with a newline and the tokenizer end
+    token. Any other format keeps the template text and, when that format's
+    stop string is one vocabulary token, supervises that stop instead.
+    """
     if answer == NO_REFERENCE:
         return None
     answer = (answer or "").strip()
     prompt = prompt or ""
     if not answer or not prompt.strip():
         return None
-    if not prompt.endswith("\n"):
+    plain = current_chat_format().name == "plain"
+    if plain and not prompt.endswith("\n"):
         prompt += "\n"
-    eos = tokenizer.eos_token or ""
+    end = supervised_end(tokenizer)
+    eos = (tokenizer.eos_token or "") if end is None else end
     full_ids = tokenizer.encode(prompt + answer + eos, add_special_tokens=False)
     prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
     if full_ids[: len(prompt_ids)] != prompt_ids:
@@ -671,6 +679,7 @@ def iterate_encoded(
 
     use_holdout = src.split == "train" and holdout_ratio > 0
 
+    # Pretrain documents are raw text. chat_format does not wrap them.
     if not src.is_sft:
         buffer: list[int] = []
         eos_id = tokenizer.eos_token_id

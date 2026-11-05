@@ -1,3 +1,4 @@
+from .chat_formats import CHAT_FORMATS, chat_format_names, use_chat_format
 from .config import TrainingConfig, ModelConfig, DatasetSpec
 from .trainer import TeapotTrainer
 from .datasets import (
@@ -71,8 +72,11 @@ from .datasets import (
     BFCL_IRRELEVANCE,
 )
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 __all__ = [
+    "CHAT_FORMATS",
+    "chat_format_names",
+    "use_chat_format",
     "TeapotTrainer",
     "TrainingConfig",
     "ModelConfig",

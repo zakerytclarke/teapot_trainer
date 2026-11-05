@@ -2,6 +2,8 @@
 
 Presets still expose ``chat_template_fn(row) -> (prompt, answer)`` or a list of
 those pairs (one pair per assistant turn). The prompt is the supervised prefix.
+The active chat format decides how those roles are written. Pretrain text never
+comes through here.
 """
 
 from __future__ import annotations
@@ -11,6 +13,8 @@ import json
 import random
 import re
 from typing import Any
+
+from .chat_formats import current_chat_format
 
 ABSTAIN_TEXT = "The context does not contain the answer."
 # Benchmark prompts that have no reference reply. Loss is not trained against this.
@@ -50,16 +54,35 @@ def rewrite_missing_tools_claim(answer: str, tools: str) -> str:
     return TOOLS_PRESENT_REFUSAL
 
 
+def render_prompt(messages: list[dict]) -> str:
+    """Format role messages up through the assistant prefix for the active format."""
+    cleaned = []
+    for message in messages:
+        role = str(message.get("role") or "").lower()
+        content = message.get("content")
+        if role not in {"system", "user", "assistant"} or not isinstance(content, str):
+            continue
+        content = content.strip()
+        if content:
+            cleaned.append({"role": role, "content": content})
+    if not cleaned:
+        return ""
+    return current_chat_format().render(cleaned, add_generation_prompt=True)
+
+
 def _rag_prompt(context: str, question: str, system: str = RAG_SYSTEM) -> str:
-    return (
-        f"System: {system}\n\n"
-        f"User: Context:\n{context}\n\nQuestion: {question}\n\nAssistant:\n"
+    user = f"Context:\n{context}\n\nQuestion: {question}"
+    return render_prompt(
+        [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
     )
 
 
 def render_message_pairs(messages: list[dict] | None) -> list[tuple[str, str]]:
     """One ``(prompt, answer)`` per assistant turn, including system text."""
-    lines: list[str] = []
+    history: list[dict] = []
     pairs: list[tuple[str, str]] = []
     for message in messages or []:
         role = str(message.get("role") or "").lower()
@@ -67,14 +90,13 @@ def render_message_pairs(messages: list[dict] | None) -> list[tuple[str, str]]:
         if not isinstance(content, str):
             continue
         content = content.strip()
-        if role == "system" and content:
-            lines.append(f"System: {content}")
-        elif role == "user" and content:
-            lines.append(f"User: {content}")
+        if role in {"system", "user"} and content:
+            history.append({"role": role, "content": content})
         elif role == "assistant" and content:
-            prompt = "\n\n".join(lines + ["Assistant:"]) + "\n"
-            pairs.append((prompt, content))
-            lines.append(f"Assistant: {content}")
+            prompt = render_prompt(history)
+            if prompt:
+                pairs.append((prompt, content))
+            history.append({"role": "assistant", "content": content})
     return pairs
 
 
@@ -110,7 +132,12 @@ def format_apigen_decision(row: dict) -> tuple[str, str]:
         f"{DECISION_RULES}\n\n"
         f"You have access to the following tools:\n<tools>{tools}</tools>"
     )
-    prompt = f"System: {prompt_system}\n\nUser: {user}\n\nAssistant:\n"
+    prompt = render_prompt(
+        [
+            {"role": "system", "content": prompt_system},
+            {"role": "user", "content": user},
+        ]
+    )
     return prompt, rewrite_missing_tools_claim(answer, tools)
 
 
@@ -149,7 +176,12 @@ def format_when2call(row: dict) -> tuple[str, str]:
         f"{DECISION_RULES}\n\n"
         f"You have access to the following tools:\n<tools>{tools}</tools>"
     )
-    prompt = f"System: {system}\n\nUser: {user}\n\nAssistant:\n"
+    prompt = render_prompt(
+        [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+    )
     return prompt, rewrite_missing_tools_claim(answer, tools)
 
 
@@ -242,10 +274,15 @@ def format_gsm8k(row: dict) -> tuple[str, str]:
         exprs = ["0"]
     calls = [{"name": "calculator", "arguments": {"expression": expr}} for expr in exprs]
     answer = "<tool_call>" + json.dumps(calls, ensure_ascii=False) + "</tool_call>"
-    prompt = (
-        f"System: {DECISION_RULES}\n\n"
-        f"You have access to the following tools:\n<tools>{_CALCULATOR_TOOLS}</tools>\n\n"
-        f"User: {question}\n\nAssistant:\n"
+    system = (
+        f"{DECISION_RULES}\n\n"
+        f"You have access to the following tools:\n<tools>{_CALCULATOR_TOOLS}</tools>"
+    )
+    prompt = render_prompt(
+        [
+            {"role": "system", "content": system},
+            {"role": "user", "content": question},
+        ]
     )
     return prompt, answer
 
@@ -559,12 +596,17 @@ def format_teapot_chat(row: dict) -> tuple[str, str] | None:
         return None
     context = _as_text(row.get("context"))
     user = f"Context:\n{context}\n\nQuestion: {query}" if context else query
-    prompt = f"System: {system}\n\nUser: {user}\n\nAssistant:\n"
+    prompt = render_prompt(
+        [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+    )
     return prompt, response
 
 
 def _chat_prompt(user: str) -> str:
-    return f"User: {user.strip()}\n\nAssistant:\n"
+    return render_prompt([{"role": "user", "content": user.strip()}])
 
 
 def format_ifeval(row: dict) -> tuple[str, str] | None:
@@ -587,17 +629,17 @@ def format_mt_bench(row: dict) -> list[tuple[str, str]] | None:
         return None
     references = list(row.get("reference") or [])
     pairs = []
-    history: list[str] = []
+    history: list[dict] = []
     for index, user in enumerate(prompts):
         reference = ""
         if index < len(references) and isinstance(references[index], str):
             reference = references[index].strip()
-        history.append(f"User: {user}")
-        prompt = "\n\n".join(history + ["Assistant:"]) + "\n"
+        history.append({"role": "user", "content": user})
+        prompt = render_prompt(history)
         pairs.append((prompt, reference if reference else NO_REFERENCE))
         if not reference:
             break
-        history.append(f"Assistant: {reference}")
+        history.append({"role": "assistant", "content": reference})
     return pairs
 
 
@@ -714,7 +756,12 @@ def format_coqa(row: dict) -> list[tuple[str, str]] | None:
             break
         prior = "\n\n".join(earlier)
         user = f"Context:\n{story}\n\n{prior}\n\nQuestion: {question}" if prior else f"Context:\n{story}\n\nQuestion: {question}"
-        prompt = f"System: {RAG_SYSTEM}\n\nUser: {user}\n\nAssistant:\n"
+        prompt = render_prompt(
+            [
+                {"role": "system", "content": RAG_SYSTEM},
+                {"role": "user", "content": user},
+            ]
+        )
         pairs.append((prompt, answer))
         earlier.append(f"Question: {question}\nAnswer: {answer}")
     return pairs or None
@@ -768,7 +815,7 @@ def format_hermes(row: dict) -> list[tuple[str, str]] | None:
     """
     tools = _as_text(row.get("tools"))
     system = DECISION_RULES if not tools else f"{DECISION_RULES}\nAvailable tools:\n{tools}"
-    lines = [f"System: {system}"]
+    history = [{"role": "system", "content": system}]
     pairs = []
     for message in row.get("conversations") or []:
         who = str(message.get("from") or "").lower()
@@ -776,18 +823,19 @@ def format_hermes(row: dict) -> list[tuple[str, str]] | None:
         if not value or who == "system":
             continue
         if who == "human":
-            lines.append(f"User: {value}")
+            history.append({"role": "user", "content": value})
             continue
         if who == "tool":
-            lines.append(f"User: Tool result:\n{value}")
+            history.append({"role": "user", "content": f"Tool result:\n{value}"})
             continue
         if who != "gpt":
             continue
         calls = _calls_from_tags(value)
         answer = _tool_call_text(calls) if calls else value
-        prompt = "\n\n".join(lines + ["Assistant:"]) + "\n"
-        pairs.append((prompt, answer))
-        lines.append(f"Assistant: {answer}")
+        prompt = render_prompt(history)
+        if prompt:
+            pairs.append((prompt, answer))
+        history.append({"role": "assistant", "content": answer})
     return pairs or None
 
 
@@ -834,7 +882,12 @@ def format_bfcl(row: dict) -> tuple[str, str] | None:
     tools = json.dumps(row.get("function") or [], ensure_ascii=False)
     system = f"{DECISION_RULES}\nAvailable tools:\n{tools}"
     user = users[0] if len(users) == 1 else "\n".join(users)
-    prompt = f"System: {system}\n\nUser: {user}\n\nAssistant:\n"
+    prompt = render_prompt(
+        [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+    )
     calls = bfcl_concrete_calls(row.get("ground_truth"))
     if not calls:
         return prompt, TOOLS_PRESENT_REFUSAL
@@ -842,7 +895,11 @@ def format_bfcl(row: dict) -> tuple[str, str] | None:
 
 
 def as_pairs(formatted: Any) -> list[tuple[str, str]]:
-    """Accept the original ``(prompt, answer)`` tuple or a list of them."""
+    """Accept the original ``(prompt, answer)`` tuple or a list of them.
+
+    The plain format keeps its trailing newline. Every other format keeps the
+    template text exactly, so it matches ``apply_chat_template``.
+    """
     if formatted is None:
         return []
     if (
@@ -851,10 +908,13 @@ def as_pairs(formatted: Any) -> list[tuple[str, str]]:
         and isinstance(formatted[0], str)
         and isinstance(formatted[1], str)
     ):
-        prompt = formatted[0].strip()
+        plain = current_chat_format().name == "plain"
+        prompt = formatted[0].strip() if plain else formatted[0]
         answer = formatted[1] if formatted[1] == NO_REFERENCE else formatted[1].strip()
-        if prompt and answer:
-            return [(prompt if prompt.endswith("\n") else prompt + "\n", answer)]
+        if prompt.strip() and answer:
+            if plain and not prompt.endswith("\n"):
+                prompt += "\n"
+            return [(prompt, answer)]
         return []
     if isinstance(formatted, list):
         pairs = []

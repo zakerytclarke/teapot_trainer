@@ -1,5 +1,6 @@
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 from typing import Optional, List, Any, Union
+from .chat_formats import get_chat_format
 from .datasets import DatasetSourceConfig, FINEWEB_EDU
 
 class ModelConfig(BaseModel):
@@ -35,8 +36,16 @@ class TrainingConfig(BaseModel):
     eval_datasets: List[DatasetSpec] = Field(default_factory=list)
     
     tokenizer: str = "Qwen/Qwen2.5-0.5B"
+    # Applied to supervised examples only. Pretrain text stays raw.
+    # Names: plain, chatml, smollm, llama2, llama3, gemma, mistral, phi, zephyr, alpaca, vicuna.
+    chat_format: str = "plain"
     # Hugging Face id or local directory. None builds a new model from the config.
     init_from: Optional[str] = None
+
+    @field_validator("chat_format")
+    @classmethod
+    def _known_chat_format(cls, value: str) -> str:
+        return get_chat_format(value).name
     batch_size: int = 4
     grad_accum: int = 32
     lr: float = 5e-4

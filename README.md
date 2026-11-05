@@ -50,6 +50,22 @@ Set `sft_at_checkpoints=True` to fine-tune a copy of the base model at each pret
 
 Runs are written under `./runs/`. Loss and task scores go to TensorBoard and to `metrics.jsonl` in the run directory.
 
+## Chat format
+
+`chat_format` wraps supervised examples. Pretrain rows stay raw text, including a raw source that you also put in the supervised mix. The default is `plain`, which is the `System` / `User` / `Assistant` text. The same template is saved with a supervised checkpoint, so Transformers can build the prompt from messages.
+
+```python
+config = TrainingConfig(
+    chat_format="chatml",
+    tokenizer="HuggingFaceTB/SmolLM2-135M",
+    sft_datasets=[
+        DatasetSpec(source=GSM8K, target_tokens=4_000_000),
+    ],
+)
+```
+
+`chatml` is the SmolLM-Instruct template. SmolLM2 already contains `<|im_start|>` and `<|im_end|>`, and a supervised checkpoint uses `<|im_end|>` as the stop token. `smollm` is the SmolLM2-Instruct template, including its default system line. The other names are `llama2`, `llama3`, `gemma`, `mistral`, `phi`, `zephyr`, `alpaca`, and `vicuna`. `qwen` is another name for `chatml`.
+
 ## Model
 
 `model_type` chooses how the trainer builds a new model. `llama` and `gpt2` are built in. Any other Hugging Face architecture is `custom`: pass the config class and the model class. The trainer calls the config class with `vocab_size`, `hidden_size`, `num_hidden_layers`, `num_attention_heads`, `intermediate_size`, and `max_position_embeddings`. It does not pass `kv_heads`. A wrapper can set fields the class needs beyond those six.
@@ -114,7 +130,18 @@ TrainingConfig(
 
 ## Inference
 
-The finished weights are a normal Transformers checkpoint. After both phases, the run directory is the supervised model. `checkpoints/pretrain` is the base model from before supervised training.
+The finished weights are a normal Transformers checkpoint. After both phases, the run directory is the supervised model. `checkpoints/pretrain` is the base model from before supervised training, still without a chat template.
+
+With `chat_format="chatml"` or `chat_format="smollm"`, load that supervised directory and pass messages. The pipeline applies the template that was used for supervised training.
+
+```python
+from transformers import pipeline
+
+pipe = pipeline("text-generation", model="./runs/teapot-SmolLM2-135M-4c2004")
+pipe([{"role": "user", "content": "Who are you?"}])
+```
+
+`plain` does not add those control tokens. Format the prompt yourself:
 
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
