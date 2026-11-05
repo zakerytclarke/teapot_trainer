@@ -28,6 +28,7 @@ from teapottrainer.metrics import (
 LOCKED_TRAINING_FIELDS = {
     "model",
     "pretrain_datasets",
+    "bridge_datasets",
     "sft_datasets",
     "eval_datasets",
     "tokenizer",
@@ -36,10 +37,13 @@ LOCKED_TRAINING_FIELDS = {
     "batch_size",
     "grad_accum",
     "lr",
+    "sft_lr",
     "weight_decay",
     "compile",
     "logging_dir",
     "eval_every_percent",
+    "plateau_window_tokens",
+    "plateau_min_loss_drop",
     "sft_at_checkpoints",
     "holdout_ratio",
     "seed",
@@ -140,10 +144,16 @@ def test_train_script_uses_the_same_constructor():
     assert built.rms_norm_eps == 1e-5
     assert built.initializer_range == 0.02
     assert config.tokenizer == "HuggingFaceTB/SmolLM2-135M"
-    assert config.init_from is None
+    assert config.init_from == "runs/teapot-SmolLM2-135M-4c2004/checkpoints/pretrain"
     assert TrainingConfig().init_from is None
-    assert config.lr == 3e-3
-    assert sum(spec.target_tokens for spec in config.pretrain_datasets) == 5_700_000_000
+    assert config.lr == 3e-4
+    assert config.sft_lr == 6e-4
+    assert config.sft_at_checkpoints is False
+    assert config.plateau_window_tokens == 20_000_000_000
+    assert config.plateau_min_loss_drop == 0.02
+    assert abs(config.eval_every_percent - (10_000_000_000 / 140_000_000_000 * 100)) < 1e-9
+    assert sum(spec.target_tokens for spec in config.pretrain_datasets) == 140_000_000_000
+    assert sum(spec.target_tokens for spec in config.bridge_datasets) == 2_000_000_000
     pretrain_names = [(spec.source.name, spec.source.subset) for spec in config.pretrain_datasets]
     assert ("HuggingFaceTB/dclm-edu", None) in pretrain_names
     assert ("HuggingFaceFW/fineweb-edu", None) in pretrain_names
@@ -163,14 +173,17 @@ def test_train_script_uses_the_same_constructor():
     answerable = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn and spec.source.chat_template_fn.__name__ == "format_squad_answerable")
     unanswerable = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn and spec.source.chat_template_fn.__name__ == "format_squad_unanswerable")
     contrastive = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn and spec.source.chat_template_fn.__name__ == "format_squad_contrastive")
-    assert answerable == 1_700_000
-    assert unanswerable == 570_000
-    assert contrastive == 1_140_000
+    assert answerable == 11_900_000
+    assert unanswerable == 3_990_000
+    assert contrastive == 7_980_000
     synth_answerable = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn and spec.source.chat_template_fn.__name__ == "format_synthqa_answerable")
     synth_unanswerable = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn and spec.source.chat_template_fn.__name__ == "format_synthqa_unanswerable")
-    assert synth_answerable == 1_140_000
-    assert synth_unanswerable == 570_000
-    assert sum(spec.target_tokens for spec in config.sft_datasets) == 21_110_000
+    assert synth_answerable == 7_980_000
+    assert synth_unanswerable == 3_990_000
+    replay = next(spec.target_tokens for spec in config.sft_datasets if spec.source.name == "HuggingFaceFW/fineweb-edu")
+    task_tokens = sum(spec.target_tokens for spec in config.sft_datasets) - replay
+    assert replay == task_tokens
+    assert sum(spec.target_tokens for spec in config.sft_datasets) == 271_740_000
     eval_names = [(spec.source.name, spec.source.split) for spec in config.eval_datasets]
     assert ("teapotai/synthqa", "test") in eval_names
     assert ("teapotai/teapot-chat", "train") in eval_names

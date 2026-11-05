@@ -2,6 +2,7 @@
 
 import json
 import os
+import tempfile
 
 import torch
 from transformers import AutoModelForCausalLM, BertConfig, LlamaConfig, LlamaForCausalLM
@@ -347,6 +348,9 @@ def test_pretrain_effort_is_one_and_sft_prefers_one():
 
     assert draw("pretrain") == 1
     assert draw("eval") == 1
+    bridge = [draw("bridge") for _ in range(400)]
+    assert set(bridge) <= {1, 2, 3, 4}
+    assert min(bridge) == 1 and max(bridge) == 4
     draws = [draw("sft") for _ in range(6000)]
     copies = [draw("pretrain_sft") for _ in range(200)]
     assert set(draws) <= set(range(1, 11))
@@ -448,3 +452,88 @@ def test_extra_reasoning_effort_trains_the_same_weights():
     assert grad is not None
     assert torch.count_nonzero(grad) > 0
     assert model.config.reasoning_effort == 1
+
+
+def test_plateau_stops_only_after_a_flat_window():
+    previous = os.getcwd()
+    workspace = tempfile.mkdtemp()
+    try:
+        os.chdir(workspace)
+        trainer = TeapotTrainer(
+            TrainingConfig(
+                tokenizer="plateau-probe",
+                compile=False,
+                pretrain_datasets=[],
+                plateau_window_tokens=20,
+                plateau_min_loss_drop=0.02,
+            )
+        )
+        assert trainer._plateau_reached(10, {"fineweb-edu/train/loss": 3.0}) is False
+        assert trainer._plateau_reached(30, {"fineweb-edu/train/loss": 2.90}) is False
+        assert trainer._plateau_reached(50, {"fineweb-edu/train/loss": 2.89}) is True
+        trainer.writer.close()
+    finally:
+        os.chdir(previous)
+
+
+def test_llama_checkpoint_seeds_the_teapot_weights():
+    previous = os.getcwd()
+    workspace = tempfile.mkdtemp()
+    try:
+        os.chdir(workspace)
+
+        def make_config(**kwargs):
+            return _tiny_config(
+                vocab_size=kwargs["vocab_size"],
+                hidden_size=kwargs["hidden_size"],
+                num_hidden_layers=kwargs["num_hidden_layers"],
+                num_attention_heads=kwargs["num_attention_heads"],
+                num_key_value_heads=kwargs["num_key_value_heads"],
+                intermediate_size=kwargs["intermediate_size"],
+                max_position_embeddings=kwargs["max_position_embeddings"],
+            )
+
+        llama = LlamaForCausalLM(
+            LlamaConfig(
+                vocab_size=64,
+                hidden_size=32,
+                num_hidden_layers=1,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                intermediate_size=64,
+                max_position_embeddings=64,
+            )
+        )
+        with torch.no_grad():
+            llama.model.embed_tokens.weight.fill_(0.25)
+        llama.save_pretrained(os.path.join(workspace, "llama"))
+        trainer = TeapotTrainer(
+            TrainingConfig(
+                tokenizer="seed-probe",
+                compile=False,
+                pretrain_datasets=[],
+                model=ModelConfig(
+                    model_type="custom",
+                    hidden_size=32,
+                    layers=1,
+                    heads=4,
+                    kv_heads=2,
+                    intermediate=64,
+                    seq_len=64,
+                    custom_config_cls=make_config,
+                    custom_model_cls=TeapotForCausalLM,
+                ),
+            )
+        )
+
+        class Tok:
+            def __len__(self):
+                return 64
+
+        model = trainer._load_model_weights(os.path.join(workspace, "llama"), Tok())
+        assert isinstance(model, TeapotForCausalLM)
+        assert torch.allclose(model.model.embed_tokens.weight, torch.full_like(model.model.embed_tokens.weight, 0.25))
+        assert any(name.startswith("embedder.") for name, _ in model.named_parameters())
+        trainer.writer.close()
+    finally:
+        os.chdir(previous)

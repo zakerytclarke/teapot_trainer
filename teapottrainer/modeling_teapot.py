@@ -472,10 +472,9 @@ class TeapotForCausalLM(LlamaForCausalLM):
                     hidden_states, causal_mask, position_embeddings, position_ids
                 )
         hidden_states = self.model.norm(hidden_states)
-        from transformers.modeling_utils import slice_logits_to_keep
-
-        hidden_states = slice_logits_to_keep(hidden_states, logits_to_keep)
-        logits = self.lm_head(hidden_states)
+        # logits_to_keep=0 means the whole sequence. slice(-0, None) is that slice.
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
         loss = None
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)

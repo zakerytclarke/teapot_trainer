@@ -207,6 +207,8 @@ class TeapotTrainer:
         self.best_loss: float | None = None
         self._completed_phases: list[str] = []
         self._checkpointing = False
+        self.lm_eval_batches = 16
+        self._plateau_history: list[list[float]] = []
 
         tokenizer_short = self.config.tokenizer.split("/")[-1]
         safe_dict = self.config.model_dump(exclude_defaults=True)
@@ -272,6 +274,88 @@ class TeapotTrainer:
             )
             return GPT2LMHeadModel(cfg)
         raise ValueError(f"Unsupported model_type: '{kind}'")
+
+    def _supervised_lr(self) -> float:
+        """Peak for a supervised copy. An explicit sft_lr wins."""
+        if self.config.sft_lr is not None:
+            return float(self.config.sft_lr)
+        if self.config.pretrain_datasets:
+            return self.config.lr * 0.2
+        return self.config.lr
+
+    def _load_model_weights(self, source: str, tokenizer):
+        """Load a checkpoint. A plain Llama checkpoint seeds the custom class.
+
+        The language-model tensors are copied. The embedder built with the
+        custom class stays as it was loaded, which is teapotai/teapotembedding
+        for the teapot model.
+        """
+        import teapottrainer.modeling_teapot  # noqa: F401  registers the auto classes
+
+        loaded = AutoModelForCausalLM.from_pretrained(source, dtype=torch.float32, trust_remote_code=True)
+        mismatches = architecture_mismatches(loaded.config, self.m_cfg)
+        if mismatches:
+            detail = "\n  ".join(mismatches)
+            raise SystemExit(f"checkpoint does not match the model config:\n  {detail}")
+        custom_cls = self.m_cfg.custom_model_cls
+        if self.m_cfg.model_type.lower() == "custom" and custom_cls is not None and not isinstance(loaded, custom_cls):
+            print(f"Copying {type(loaded).__name__} weights into {custom_cls.__name__}.")
+            rows = loaded.get_input_embeddings().weight.shape[0]
+            model = self._build_model(vocab_size=max(len(tokenizer), int(rows)))
+            missing, unexpected = model.load_state_dict(loaded.state_dict(), strict=False)
+            tied = {"lm_head.weight"} if getattr(model.config, "tie_word_embeddings", False) else set()
+            bad_missing = [key for key in missing if key not in tied and not key.startswith("embedder.")]
+            if bad_missing or unexpected:
+                raise SystemExit(
+                    "Checkpoint tensors do not match the custom model.\n"
+                    f"  missing: {bad_missing}\n  unexpected: {list(unexpected)}"
+                )
+            kept = [key for key in missing if key.startswith("embedder.")]
+            print(f"Embedder stays as loaded ({len(kept)} tensors were not in the checkpoint).")
+            del loaded
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        else:
+            model = loaded
+        embedding = model.get_input_embeddings()
+        rows = None if embedding is None else embedding.weight.shape[0]
+        if rows is not None and rows < len(tokenizer):
+            print(f"Tokenizer is longer than the checkpoint embeddings ({len(tokenizer)} > {rows}). Resizing.")
+            model.resize_token_embeddings(len(tokenizer))
+        elif rows is not None and rows != len(tokenizer):
+            print(f"Checkpoint embeddings have {rows} rows and the tokenizer has {len(tokenizer)}. Leaving the matrix as stored.")
+        return model
+
+    def _plateau_reached(self, tokens: int, metrics: dict) -> bool:
+        """True when the FineWeb holdout has stopped moving across the window."""
+        window = int(self.config.plateau_window_tokens or 0)
+        if window <= 0:
+            return False
+        loss = None
+        for key, value in metrics.items():
+            if key.endswith("/loss") and "fineweb" in key:
+                loss = float(value)
+                break
+        if loss is None:
+            return False
+        history = self._plateau_history
+        history.append([float(tokens), loss])
+        baseline = None
+        for seen_tokens, seen_loss in history:
+            if tokens - seen_tokens >= window:
+                baseline = (seen_tokens, seen_loss)
+            else:
+                break
+        if baseline is None:
+            return False
+        drop = baseline[1] - loss
+        if drop >= float(self.config.plateau_min_loss_drop):
+            return False
+        print(
+            f"Pretrain holdout moved {drop:.4f} nats over {tokens - baseline[0]:,.0f} tokens "
+            f"(from {baseline[1]:.4f} to {loss:.4f}), under {self.config.plateau_min_loss_drop}. Stopping pretrain."
+        )
+        return True
 
     def _optimizer(self, model, lr: float) -> AdamW:
         decay, frozen = [], []
@@ -509,7 +593,7 @@ class TeapotTrainer:
         )
         with torch.no_grad():
             for index, sample in enumerate(stream):
-                if index >= 16:
+                if index >= self.lm_eval_batches:
                     break
                 input_ids = torch.tensor([sample["input_ids"]], dtype=torch.long, device=self.device)
                 labels = torch.tensor([sample["labels"]], dtype=torch.long, device=self.device)
@@ -669,6 +753,7 @@ class TeapotTrainer:
         payload["torch_rng"] = torch_rng
         payload["best_loss"] = self.best_loss
         payload["best_behavior"] = self.best_behavior
+        payload["plateau_history"] = list(getattr(self, "_plateau_history", []))
         with open(os.path.join(temporary, "trainer_state.json"), "w", encoding="utf-8") as handle:
             json.dump(payload, handle)
         previous = directory + ".old"
@@ -765,7 +850,7 @@ class TeapotTrainer:
             return
         if not required and not self.config.sft_at_checkpoints:
             return
-        if not phase_name.startswith("pretrain"):
+        if not phase_name.startswith("pretrain") and phase_name != "bridge":
             return
         label = f"{phase_name}_sft"
         directory = os.path.join(self.output_dir, "checkpoints", label)
@@ -798,8 +883,8 @@ class TeapotTrainer:
                 except TypeError:
                     side.gradient_checkpointing_enable()
                 side.config.use_cache = False
-            sft_lr = self.config.lr * 0.2 if self.config.pretrain_datasets else self.config.lr
-            print(f"SFT copy peak lr is 0.2x config.lr ({sft_lr:.3e}).")
+            sft_lr = self._supervised_lr()
+            print(f"SFT copy peak lr is {sft_lr:.3e}.")
             self._train_phase(
                 label,
                 list(self.config.sft_datasets),
@@ -978,13 +1063,17 @@ class TeapotTrainer:
                     if eval_during and pct >= next_eval and pct < 100.0:
                         progress.write(f"\n[eval at {pct:.1f}%]")
                         checkpoint_name = f"{phase_name}_{int(pct)}pct"
-                        self.run_evaluation_suite(
+                        flat = self.run_evaluation_suite(
                             model, tokenizer, checkpoint_name, global_step, update_best=update_best
                         )
-                        if phase_name == "pretrain":
+                        plateau = phase_name == "pretrain" and self._plateau_reached(tokens, flat)
+                        if phase_name == "pretrain" and not plateau:
                             self._sft_from_base_checkpoint(model, tokenizer, checkpoint_name, global_step)
                         next_eval += self.config.eval_every_percent
                         model.train()
+                        if plateau:
+                            progress.write("\n[pretrain plateau, stopping this phase]")
+                            break
                     # After eval, so the saved generator and eval cursor include it.
                     if persist_resume and tokens >= next_resume_tokens:
                         self._write_resume(
@@ -1103,28 +1192,14 @@ class TeapotTrainer:
                 f"Resuming from {resume['dir']} "
                 f"({resume.get('phase')}{finished}, {int(resume.get('tokens') or 0):,} tokens)."
             )
-            model = AutoModelForCausalLM.from_pretrained(resume["dir"], dtype=torch.float32, trust_remote_code=True)
-            mismatches = architecture_mismatches(model.config, self.m_cfg)
-            if mismatches:
-                detail = "\n  ".join(mismatches)
-                raise SystemExit(f"resume checkpoint does not match the model config:\n  {detail}")
+            self._plateau_history = [list(item) for item in resume.get("plateau_history") or []]
+            model = self._load_model_weights(resume["dir"], tokenizer)
         # A train() argument overrides the config field. Either one is used
         # before pretrain or supervised training starts.
         elif (source := init_from if init_from is not None else self.config.init_from):
             source = _resolve_init_from(source)
             print(f"Loading initial weights from {source} before training.")
-            model = AutoModelForCausalLM.from_pretrained(source, dtype=torch.float32, trust_remote_code=True)
-            mismatches = architecture_mismatches(model.config, self.m_cfg)
-            if mismatches:
-                detail = "\n  ".join(mismatches)
-                raise SystemExit(f"init_from does not match the model config:\n  {detail}")
-            embedding = model.get_input_embeddings()
-            rows = None if embedding is None else embedding.weight.shape[0]
-            if rows is not None and rows < len(tokenizer):
-                print(f"Tokenizer is longer than the checkpoint embeddings ({len(tokenizer)} > {rows}). Resizing.")
-                model.resize_token_embeddings(len(tokenizer))
-            elif rows is not None and rows != len(tokenizer):
-                print(f"Checkpoint embeddings have {rows} rows and the tokenizer has {len(tokenizer)}. Leaving the matrix as stored.")
+            model = self._load_model_weights(source, tokenizer)
         else:
             print("Building a new model from the config.")
             model = self._build_model(vocab_size=len(tokenizer))
@@ -1171,6 +1246,31 @@ class TeapotTrainer:
         elif resume and "pretrain" in self._completed_phases:
             print("Pretrain is already complete in the resume checkpoint.")
             model = _unwrap(model)
+        bridge = list(self.config.bridge_datasets or [])
+        if bridge and "bridge" not in self._completed_phases:
+            # Fixed length, but the loop count changes every batch, so one
+            # compiled graph would not stay valid.
+            print("Bridge stays eager so the loop count can change on every batch.")
+            model = _unwrap(model)
+            bridge_resume = resume if resume and not resume.get("phase_done") and resume.get("phase") == "bridge" else None
+            bridge_lr = self.config.lr * 0.1
+            print(f"Bridge peak lr is 0.1x config.lr ({bridge_lr:.3e}).")
+            global_step = self._train_phase(
+                "bridge",
+                bridge,
+                model,
+                tokenizer,
+                global_step,
+                peak_lr=bridge_lr,
+                task_eval=False,
+                resume=bridge_resume,
+            )
+            bridge_dir = os.path.join(self.output_dir, "checkpoints", "bridge")
+            self._save_weights(model, tokenizer, bridge_dir)
+            print(f"Saved bridge weights to {bridge_dir}")
+        elif resume and "bridge" in self._completed_phases:
+            print("Bridge is already complete in the resume checkpoint.")
+            model = _unwrap(model)
         if sft:
             if self.config.compile:
                 print(
@@ -1188,15 +1288,18 @@ class TeapotTrainer:
                     print(f"Saved pretrain weights to {pretrain_dir}")
                 if resume and not resume.get("phase_done") and resume.get("phase") == "sft":
                     print("In-progress SFT resume is unused. The final pass reruns the full checkpoint copy.")
-                self._sft_from_base_checkpoint(model, tokenizer, "pretrain", global_step, required=True)
-                sft_dir = os.path.join(self.output_dir, "checkpoints", "pretrain_sft")
+                bridge_dir = os.path.join(self.output_dir, "checkpoints", "bridge")
+                base_phase = "bridge" if os.path.isfile(os.path.join(bridge_dir, "config.json")) else "pretrain"
+                self._sft_from_base_checkpoint(model, tokenizer, base_phase, global_step, required=True)
+                sft_dir = os.path.join(self.output_dir, "checkpoints", f"{base_phase}_sft")
                 if not os.path.isfile(os.path.join(sft_dir, "config.json")):
                     raise SystemExit(f"Final SFT did not write {sft_dir}.")
                 model = AutoModelForCausalLM.from_pretrained(sft_dir, dtype=torch.float32, trust_remote_code=True)
                 align_tokenizer_ids(model, tokenizer)
                 model.to(self.device)
-                if "pretrain_sft" in self.phase_stats:
-                    self.phase_stats["sft"] = self.phase_stats["pretrain_sft"]
+                finished_key = f"{base_phase}_sft"
+                if finished_key in self.phase_stats:
+                    self.phase_stats["sft"] = self.phase_stats[finished_key]
                 if "sft" not in self._completed_phases:
                     self._completed_phases.append("sft")
                 self._write_resume(
@@ -1215,8 +1318,8 @@ class TeapotTrainer:
                         "micro_steps": 0,
                         "next_eval": float(self.config.eval_every_percent),
                         "first_loss": None,
-                        "best_train_loss": (self.phase_stats.get("pretrain_sft") or {}).get("best_train_loss"),
-                        "peak_lr": self.config.lr * 0.2,
+                        "best_train_loss": (self.phase_stats.get("sft") or {}).get("best_train_loss"),
+                        "peak_lr": self._supervised_lr(),
                     },
                 )
             else:
@@ -1229,7 +1332,7 @@ class TeapotTrainer:
                     model,
                     tokenizer,
                     global_step,
-                    peak_lr=self.config.lr,
+                    peak_lr=self._supervised_lr(),
                     task_eval=True,
                     resume=sft_resume,
                 )
