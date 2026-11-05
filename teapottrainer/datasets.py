@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from datasets import load_dataset
 
 from .chat_formats import current_chat_format, supervised_end
+from .modeling_teapot import split_conversation
 from .formatting import (
     NO_REFERENCE,
     as_pairs,
@@ -31,6 +32,7 @@ from .formatting import (
     format_drop,
     format_hellaswag,
     format_hermes,
+    hermes_turns,
     format_piqa,
     format_apigen_aliased,
     format_apigen_decision,
@@ -55,6 +57,7 @@ from .formatting import (
     format_when2call_ask,
     format_when2call_refuse,
     format_winogrande,
+    assistant_histories,
     messages_format,
 )
 
@@ -665,6 +668,33 @@ def row_pairs(src: DatasetSourceConfig, row: dict) -> list[tuple[str, str]]:
     return as_pairs(src.chat_template_fn(row))
 
 
+def _chat_overflows(tokenizer, prompt: str, answer: str, seq_len: int) -> bool:
+    """True when the rendered turn is longer than the position window."""
+    end = supervised_end(tokenizer)
+    eos = (tokenizer.eos_token or "") if end is None else end
+    return len(tokenizer.encode(prompt + answer + eos, add_special_tokens=False)) > seq_len
+
+
+def _retrieval_turns(src: DatasetSourceConfig, row: dict, pairs: list[tuple[str, str]]):
+    """Histories the retriever can pack, aligned with the rendered pairs.
+
+    A single user turn has nothing earlier to retrieve, so it stays on the
+    ordinary left-truncated prompt.
+    """
+    fn = src.chat_template_fn
+    if fn is messages_format and isinstance(row.get("messages"), list):
+        turns = assistant_histories(row.get("messages"))
+    elif fn is format_hermes:
+        turns = hermes_turns(row)
+    else:
+        return None
+    if len(turns) != len(pairs):
+        return None
+    if any(gold != answer for (_, gold), (_, answer) in zip(turns, pairs)):
+        return None
+    return turns
+
+
 def iterate_encoded(
     src: DatasetSourceConfig,
     tokenizer,
@@ -719,8 +749,10 @@ def iterate_encoded(
         return
 
     for row in source_rows():
-        pairs = row_pairs(src, row)
-        for prompt, answer in pairs:
+        worked = src.preprocess_fn(row) if src.preprocess_fn else row
+        pairs = as_pairs(src.chat_template_fn(worked)) if src.chat_template_fn else []
+        turns = _retrieval_turns(src, worked, pairs)
+        for index, (prompt, answer) in enumerate(pairs):
             if use_holdout:
                 held = holdout_membership(prompt + "\n" + answer, holdout_ratio, seed)
                 if held != is_eval:
@@ -730,6 +762,10 @@ def iterate_encoded(
                 continue
             if src.token_loss_weight_fn is not None:
                 encoded["loss_weights"] = [float(value) for value in src.token_loss_weight_fn(encoded, tokenizer)]
+            history = turns[index][0] if turns is not None else None
+            if history and _chat_overflows(tokenizer, prompt, answer, seq_len) and split_conversation(history)[2]:
+                encoded["messages"] = history
+                encoded["answer"] = answer
             yield encoded
 
 

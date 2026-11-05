@@ -33,7 +33,12 @@ in the first hour. The rest is passage questions, DROP and CoQA, GSM8K and
 MetaMath, the tool split, Hermes multi-turn calls, constraints, system chats,
 and a thin OpenHermes slice. The loop schedule is unchanged: half the steps
 are one pass, and the rest are spread across 2 through 10. The supervised
-peak is 6e-4.
+peak is 6e-4. Prompts use the SmolLM2-135M-Instruct chat format, the same
+template as the tokenizer. When a multi-turn chat does not fit in 2,048
+tokens, the supervised step packs it with the retriever: low-scoring earlier
+turns are dropped, the turns that remain stay in conversation order, and the
+encoder is trained on that choice. A single question with one passage has
+nothing earlier to retrieve and stays on the ordinary prompt.
 
 A crash continues from checkpoints/resume. The base optimizer and the sample
 cursor are there. A supervised copy that already wrote metrics.json is not
@@ -189,6 +194,7 @@ def build_config() -> TrainingConfig:
             DatasetSpec(source=TEAPOT_CHAT, target_tokens=200_000),
         ],
         tokenizer="HuggingFaceTB/SmolLM2-135M",
+        chat_format="smollm",
         init_from=None,
         batch_size=8,
         grad_accum=16,

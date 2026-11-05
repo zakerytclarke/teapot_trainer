@@ -104,6 +104,28 @@ def messages_format(row: dict) -> list[tuple[str, str]]:
     return render_message_pairs(row.get("messages") or [])
 
 
+def assistant_histories(messages: list[dict] | None) -> list[tuple[list[dict], str]]:
+    """History before each assistant turn, and that turn's answer.
+
+    The history is what the retriever packs when the rendered chat is longer
+    than the position window. The answer itself is not part of the pack.
+    """
+    history: list[dict] = []
+    turns: list[tuple[list[dict], str]] = []
+    for message in messages or []:
+        role = str(message.get("role") or "").lower()
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        content = content.strip()
+        if role in {"system", "user"} and content:
+            history.append({"role": role, "content": content})
+        elif role == "assistant" and content:
+            turns.append(([dict(item) for item in history], content))
+            history.append({"role": "assistant", "content": content})
+    return turns
+
+
 def format_apigen_decision(row: dict) -> tuple[str, str]:
     """Same decision prompt as When2Call, with APIGen's tools and gold call.
 
@@ -822,16 +844,16 @@ def _tool_call_text(calls: list[dict]) -> str:
     return "<tool_call>" + json.dumps(rendered, ensure_ascii=False) + "</tool_call>"
 
 
-def format_hermes(row: dict) -> list[tuple[str, str]] | None:
-    """Hermes traces rewritten into the library tool-call format.
+def hermes_turns(row: dict) -> list[tuple[list[dict], str]]:
+    """History before each Hermes reply, using the rewritten tool-call answer.
 
-    Tool results stay in the next prompt, so the following answer is conditioned
-    on them. The dataset's own system text is replaced by the shared tool rules.
+    The dataset system text is replaced by the shared tool rules. Tool results
+    stay in the next prompt as user turns.
     """
     tools = _as_text(row.get("tools"))
     system = DECISION_RULES if not tools else f"{DECISION_RULES}\nAvailable tools:\n{tools}"
     history = [{"role": "system", "content": system}]
-    pairs = []
+    turns: list[tuple[list[dict], str]] = []
     for message in row.get("conversations") or []:
         who = str(message.get("from") or "").lower()
         value = _as_text(message.get("value"))
@@ -847,10 +869,22 @@ def format_hermes(row: dict) -> list[tuple[str, str]] | None:
             continue
         calls = _calls_from_tags(value)
         answer = _tool_call_text(calls) if calls else value
-        prompt = render_prompt(history)
-        if prompt:
-            pairs.append((prompt, answer))
+        turns.append(([dict(item) for item in history], answer))
         history.append({"role": "assistant", "content": answer})
+    return turns
+
+
+def format_hermes(row: dict) -> list[tuple[str, str]] | None:
+    """Hermes traces rewritten into the library tool-call format.
+
+    Tool results stay in the next prompt, so the following answer is conditioned
+    on them. The dataset's own system text is replaced by the shared tool rules.
+    """
+    pairs = [
+        (render_prompt(history), answer)
+        for history, answer in hermes_turns(row)
+        if render_prompt(history)
+    ]
     return pairs or None
 
 

@@ -145,6 +145,8 @@ def test_train_script_uses_the_same_constructor():
     assert built.rms_norm_eps == 1e-5
     assert built.initializer_range == 0.02
     assert config.tokenizer == "HuggingFaceTB/SmolLM2-135M"
+    assert config.chat_format == "smollm"
+    assert TrainingConfig().chat_format == "plain"
     assert config.init_from is None
     assert TrainingConfig().init_from is None
     assert config.lr == 3e-3

@@ -158,6 +158,24 @@ def test_each_message_is_one_truncated_embedding():
     assert max(len(text) for text in seen["texts"]) > 8
 
 
+def test_pack_uses_the_active_smollm_format_and_keeps_time_order():
+    from teapottrainer.chat_formats import use_chat_format
+
+    tokenizer = CharTokenizer()
+    messages = [
+        {"role": "system", "content": "Rules."},
+        {"role": "user", "content": "First fact."},
+        {"role": "assistant", "content": "Noted first."},
+        {"role": "user", "content": "Question?"},
+    ]
+    with use_chat_format("smollm"):
+        prompt = pack_conversation(messages, tokenizer, [0.1, 0.9], context_length=400)
+    assert prompt.index("<|im_start|>system\nRules.") < prompt.index("<|im_start|>user\nFirst fact.")
+    assert prompt.index("First fact.") < prompt.index("Noted first.")
+    assert prompt.index("Noted first.") < prompt.index("<|im_start|>user\nQuestion?")
+    assert prompt.endswith("<|im_start|>assistant\n")
+
+
 def test_pack_keeps_system_and_latest_user_and_orders_by_time():
     tokenizer = CharTokenizer()
     messages = [
@@ -534,6 +552,122 @@ def test_llama_checkpoint_seeds_the_teapot_weights():
         assert isinstance(model, TeapotForCausalLM)
         assert torch.allclose(model.model.embed_tokens.weight, torch.full_like(model.model.embed_tokens.weight, 0.25))
         assert any(name.startswith("embedder.") for name, _ in model.named_parameters())
+        trainer.writer.close()
+    finally:
+        os.chdir(previous)
+
+
+class LengthTokenizer:
+    """One token per character, so a long chat is longer than seq_len."""
+
+    eos_token = ""
+    eos_token_id = 1
+
+    def encode(self, text, add_special_tokens=False):
+        return [2] * len(text)
+
+
+def test_long_multiturn_rows_carry_a_retrieval_history():
+    from teapottrainer.datasets import HERMES_FUNCTION_CALLING, ULTRACHAT, iterate_encoded
+
+    long = "x" * 80
+    chat = {
+        "messages": [
+            {"role": "user", "content": "earlier " + long},
+            {"role": "assistant", "content": "noted " + long},
+            {"role": "user", "content": "question " + long},
+            {"role": "assistant", "content": "answer"},
+        ]
+    }
+    packed = list(iterate_encoded(ULTRACHAT, LengthTokenizer(), 40, rows=[chat], holdout_ratio=0))
+    assert len(packed) == 2
+    assert "messages" not in packed[0]
+    assert packed[1]["answer"] == "answer"
+    assert packed[1]["messages"][0]["content"].startswith("earlier")
+    assert packed[1]["messages"][-1]["role"] == "user"
+
+    short = {
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "yo"},
+            {"role": "user", "content": "again"},
+            {"role": "assistant", "content": "yes"},
+        ]
+    }
+    plain = list(iterate_encoded(ULTRACHAT, LengthTokenizer(), 500, rows=[short], holdout_ratio=0))
+    assert all("messages" not in sample for sample in plain)
+
+    single = {
+        "messages": [
+            {"role": "user", "content": "q" * 200},
+            {"role": "assistant", "content": "a"},
+        ]
+    }
+    alone = list(iterate_encoded(ULTRACHAT, LengthTokenizer(), 40, rows=[single], holdout_ratio=0))
+    assert all("messages" not in sample for sample in alone)
+
+    hermes = {
+        "tools": "",
+        "conversations": [
+            {"from": "human", "value": "h" * 80},
+            {"from": "gpt", "value": "g" * 80},
+            {"from": "human", "value": "h2" * 80},
+            {"from": "gpt", "value": "done"},
+        ],
+    }
+    calls = list(iterate_encoded(HERMES_FUNCTION_CALLING, LengthTokenizer(), 40, rows=[hermes], holdout_ratio=0))
+    assert "messages" not in calls[0]
+    assert calls[1]["answer"] == "done"
+    assert any(item["role"] == "assistant" for item in calls[1]["messages"])
+
+
+def test_supervised_step_packs_long_chats_and_trains_the_embedder():
+    model = TeapotForCausalLM(_tiny_config(max_position_embeddings=64, pack_context_length=48))
+    model._embedder_tokenizer_obj = BatchTokenizer()
+    previous = os.getcwd()
+    workspace = tempfile.mkdtemp()
+    try:
+        os.chdir(workspace)
+        trainer = TeapotTrainer(TrainingConfig(tokenizer="pack-probe", compile=False, model=ModelConfig(seq_len=32)))
+        model.to(trainer.device)
+        messages = [
+            {"role": "user", "content": "first fact " + ("a" * 20)},
+            {"role": "assistant", "content": "noted " + ("b" * 20)},
+            {"role": "user", "content": "what was the fact?"},
+        ]
+        sample = {
+            "input_ids": [1, 2, 3],
+            "labels": [-100, 2, 3],
+            "messages": messages,
+            "answer": "the fact",
+            "loss_weights": [1.0, 1.0, 8.0],
+        }
+        packed, retrievals = trainer._pack_supervised_batch(model, [sample], LmTokenizer())
+        assert packed[0]["input_ids"] != [1, 2, 3]
+        assert len(packed[0]["loss_weights"]) == len(packed[0]["labels"])
+        assert retrievals and retrievals[0].requires_grad
+
+        seen = {"count": 0}
+        original = model.pack_messages
+
+        def counting(messages, tokenizer, max_new_tokens=0):
+            seen["count"] += 1
+            return original(messages, tokenizer, max_new_tokens)
+
+        model.pack_messages = counting
+        model.zero_grad(set_to_none=True)
+        trainer._forward_backward(model, [dict(sample)], LmTokenizer(), "pretrain")
+        assert seen["count"] == 0
+        assert all(param.grad is None for name, param in model.named_parameters() if name.startswith("embedder."))
+
+        model.zero_grad(set_to_none=True)
+        trainer._forward_backward(model, [dict(sample)], LmTokenizer(), "pretrain_3000000000tok_sft")
+        assert seen["count"] == 1
+        assert any(
+            param.grad is not None and float(param.grad.abs().sum()) > 0
+            for name, param in model.named_parameters()
+            if name.startswith("embedder.")
+        )
         trainer.writer.close()
     finally:
         os.chdir(previous)

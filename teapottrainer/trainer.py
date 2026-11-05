@@ -43,7 +43,16 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, GPT2Config, GPT2LM
 
 from .chat_formats import get_chat_format, pop_chat_format, push_chat_format, single_token_id
 from .config import TrainingConfig
-from .datasets import DatasetRegistry, DatasetSourceConfig, iterate_encoded
+from .datasets import (
+    SPAN_TOKEN_LOSS_WEIGHT,
+    STOP_TOKEN_LOSS_WEIGHT,
+    DatasetRegistry,
+    DatasetSourceConfig,
+    encode_pair,
+    eos_loss_weight,
+    iterate_encoded,
+    span_loss_weight,
+)
 from .evals import evaluate_source, selection_score, source_key, task_kind
 
 
@@ -467,7 +476,47 @@ class TeapotTrainer:
                 del config.__dict__[key]
         config.__dict__.update(saved)
 
-    def _forward_backward(self, model, batch, tokenizer, phase_name: str):
+    def _reweight_packed(self, sample: dict, encoded: dict, tokenizer) -> None:
+        """Keep the source's stop or span weights after the prompt is repacked."""
+        old = sample.get("loss_weights")
+        if not old:
+            return
+        if any(abs(float(value) - SPAN_TOKEN_LOSS_WEIGHT) < 1e-6 for value in old):
+            encoded["loss_weights"] = span_loss_weight()(encoded, tokenizer)
+        elif any(abs(float(value) - STOP_TOKEN_LOSS_WEIGHT) < 1e-6 for value in old):
+            encoded["loss_weights"] = eos_loss_weight()(encoded, tokenizer)
+
+    def _pack_supervised_batch(self, model, batch, tokenizer):
+        """Replace an over-long chat with the same pack inference will show.
+
+        ``retrieval_loss`` trains the encoder on which earlier turn to keep.
+        The language-model step then trains on that packed prompt, so a chat
+        that does not fit the 2,048 window is seen with the dropped turns gone
+        and the surviving turns still in conversation order.
+        """
+        live = _unwrap(model)
+        if not hasattr(live, "pack_messages"):
+            return batch, []
+        packed = []
+        retrievals = []
+        for sample in batch:
+            messages = sample.get("messages")
+            answer = sample.get("answer")
+            if not messages or not isinstance(answer, str) or not answer.strip():
+                packed.append(sample)
+                continue
+            prompt = live.pack_messages(messages, tokenizer)
+            encoded = encode_pair(tokenizer, prompt, answer, self.m_cfg.seq_len)
+            if encoded is None:
+                packed.append(sample)
+                continue
+            self._reweight_packed(sample, encoded, tokenizer)
+            packed.append(encoded)
+            if hasattr(live, "retrieval_loss"):
+                retrievals.append(live.retrieval_loss(messages, answer, tokenizer))
+        return packed, retrievals
+
+    def _collate_batch(self, batch, tokenizer):
         pad_id = tokenizer.pad_token_id
         if pad_id is None:
             pad_id = tokenizer.eos_token_id or 0
@@ -493,37 +542,48 @@ class TeapotTrainer:
         input_ids = torch.tensor(ids, dtype=torch.long, device=self.device)
         label_tensor = torch.tensor(labels, dtype=torch.long, device=self.device)
         kwargs = {"input_ids": input_ids}
+        weight_tensor = None
         if use_weights:
             weight_tensor = torch.tensor(weights, dtype=torch.float32, device=self.device)
         else:
             kwargs["labels"] = label_tensor
         if any(row.count(0) for row in mask):
             kwargs["attention_mask"] = torch.tensor(mask, dtype=torch.long, device=self.device)
+        return kwargs, label_tensor, weight_tensor, real_tokens
+
+    def _language_loss(self, model, kwargs, label_tensor, weight_tensor, retrievals):
+        output = model(**kwargs)
+        loss = (
+            weighted_cross_entropy(output.logits, label_tensor, weight_tensor)
+            if weight_tensor is not None
+            else output.loss
+        )
+        if retrievals:
+            extra = torch.stack([item.reshape(()) for item in retrievals]).mean()
+            loss = loss + extra.to(dtype=loss.dtype)
+        return loss
+
+    def _forward_backward(self, model, batch, tokenizer, phase_name: str):
         live = _unwrap(model)
         config = getattr(live, "config", None)
         # Deep copy so a hook can replace a field or edit a nested dict, and
         # both are undone after the batch. Assigning is the normal case.
         saved = copy.deepcopy(dict(config.__dict__)) if config is not None else None
         self._batch_config_metrics = {}
+        real_tokens = 0
         try:
             for hook in self._before_batch_hooks():
                 hook(live, phase_name)
             self._batch_config_metrics = _numeric_config_changes(saved, config)
+            retrievals = []
+            if self._phase_uses_chat(phase_name):
+                batch, retrievals = self._pack_supervised_batch(model, batch, tokenizer)
+            kwargs, label_tensor, weight_tensor, real_tokens = self._collate_batch(batch, tokenizer)
             if self.device.type == "cuda":
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    output = model(**kwargs)
-                    loss = (
-                        weighted_cross_entropy(output.logits, label_tensor, weight_tensor)
-                        if use_weights
-                        else output.loss
-                    )
+                    loss = self._language_loss(model, kwargs, label_tensor, weight_tensor, retrievals)
             else:
-                output = model(**kwargs)
-                loss = (
-                    weighted_cross_entropy(output.logits, label_tensor, weight_tensor)
-                    if use_weights
-                    else output.loss
-                )
+                loss = self._language_loss(model, kwargs, label_tensor, weight_tensor, retrievals)
             (loss / self.config.grad_accum).backward()
         except RuntimeError as exc:
             if "out of memory" in str(exc).lower():
