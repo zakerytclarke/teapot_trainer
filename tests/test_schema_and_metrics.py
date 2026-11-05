@@ -43,6 +43,7 @@ LOCKED_TRAINING_FIELDS = {
     "sft_at_checkpoints",
     "holdout_ratio",
     "seed",
+    "sample_reasoning_effort",
 }
 
 
@@ -101,6 +102,9 @@ def test_train_script_uses_the_same_constructor():
     config = build_config()
     dumped = set(config.model_dump().keys())
     assert dumped == LOCKED_TRAINING_FIELDS
+    assert config.model_dump()["sample_reasoning_effort"] is None
+    assert config.sample_reasoning_effort is not None
+    assert config.sample_reasoning_effort("pretrain") == 1
     assert config.model.model_type == "custom"
     assert config.model.layers == 16
     assert config.model.hidden_size == 768

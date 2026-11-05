@@ -166,6 +166,8 @@ A chat is packed into 2,048 tokens. The system prompt and the latest user messag
 
 `retrieval_loss(messages, answer, tokenizer)` trains that ranking with REINFORCE. It samples an earlier message from the softmax over those cosine scores, packs it, and uses the language-model loss of `answer` as the reward, compared with the message the scores already rank first. The ordinary supervised step does not call this loss.
 
+`reasoning_effort` is how many times the language-model block runs. Pretraining leaves it at 1. Supervised training draws 1 through 10, with 1 twice as likely as each other value. `generate(..., reasoning_effort=8)` asks for eight passes at inference. The extra passes are recomputed during training, so the memory stays near one pass.
+
 ```python
 from transformers import AutoTokenizer, AutoModelForCausalLM
 

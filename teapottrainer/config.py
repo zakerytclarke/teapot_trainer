@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, ConfigDict, field_validator
+from pydantic import BaseModel, Field, ConfigDict, field_serializer, field_validator
 from typing import Optional, List, Any, Union
 from .chat_formats import get_chat_format
 from .datasets import DatasetSourceConfig, FINEWEB_EDU
@@ -46,6 +46,7 @@ class TrainingConfig(BaseModel):
     @classmethod
     def _known_chat_format(cls, value: str) -> str:
         return get_chat_format(value).name
+
     batch_size: int = 4
     grad_accum: int = 32
     lr: float = 5e-4
@@ -59,5 +60,13 @@ class TrainingConfig(BaseModel):
     sft_at_checkpoints: bool = False
     holdout_ratio: float = 0.05
     seed: int = 42
+    # Called with the phase name before each training step. None leaves the
+    # model's own reasoning_effort alone. Return an int of at least 1.
+    sample_reasoning_effort: Optional[Any] = None
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, arbitrary_types_allowed=True)
+
+    @field_serializer("sample_reasoning_effort")
+    def _dump_reasoning_hook(self, _value):
+        # The callable stays on the object. The run hash only needs a stable dump.
+        return None

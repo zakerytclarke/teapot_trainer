@@ -21,6 +21,12 @@ training. Each message is embedded whole, up to the encoder's context length.
 ``retrieval_loss`` trains the ranking with REINFORCE from the language-model
 loss. The ordinary supervised step does not call it.
 
+Pretraining runs the language-model block once. Supervised training, including
+the checkpoint copies, draws ``reasoning_effort`` from 1 through 10. Effort 1
+is twice as likely as each later value, so the average pass count is about
+5.1. Each extra pass is recomputed on the backward, so the memory stays near
+one pass. At inference, ``generate(..., reasoning_effort=N)`` sets the count.
+
 The supervised mix pairs each passage with an unanswerable question about an
 entity in it, and draws a new tool name on every example. config.lr is the
 pretrain peak. After a pretrain phase the trainer uses 0.2x that value for
@@ -65,6 +71,7 @@ from teapottrainer import (
     TeapotForCausalLM,
     TeapotTrainer,
     build_rag_config,
+    sample_reasoning_effort,
     TrainingConfig,
     WHEN2CALL_ASK,
     WHEN2CALL_REFUSE,
@@ -140,6 +147,7 @@ def build_config() -> TrainingConfig:
         # next to the base checkpoint. Pretrain itself keeps the base weights.
         sft_at_checkpoints=True,
         compile=True,
+        sample_reasoning_effort=sample_reasoning_effort,
     )
 
 
