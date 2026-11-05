@@ -10,9 +10,12 @@ trained at 70,463 tokens/s, so another 140B tokens is about 23 days.
 Pretrain keeps the same six sources and the same proportions, one decoder
 pass. The peak learning rate is 3e-4, which is where the 40B cosine ended.
 A fresh cosine at the old 3e-3 peak would rewind a converged model. Every
-3B tokens the trainer saves a checkpoint and scores a 64-sequence FineWeb
-holdout. At 70,463 tokens/s that slice is about 12 hours. If the holdout
-improves by less than 0.02 nats across a 20B window, pretrain stops.
+1B tokens the trainer saves a checkpoint, scores a 64-sequence FineWeb
+holdout, and trains a full supervised copy. Pretrain at 70,463 tokens/s
+covers that 1B in about 4 hours. The one-hour smoke measured the looped
+supervised copy at 4,309 tokens/s, which makes the 272M-token mix about 18
+hours, so the checkpoint and its copy still finish inside a day. If the
+holdout improves by less than 0.02 nats across a 20B window, pretrain stops.
 
 The bridge is 2B tokens of the same text with the loop drawn from 1 to 4
 passes. It runs after pretrain, eager, at 0.1x the pretrain peak, so the
@@ -24,10 +27,9 @@ task tokens together, half the mix, after the last run's 8% replay took
 FineWeb perplexity from 17.4 to 74. The loop schedule is unchanged: half the
 steps are one pass, and the rest are spread across 2 through 10. The
 supervised peak stays 6e-4. The same full mix is trained at every pretrain
-checkpoint, and once more from the bridge weights at the end. One copy is
-about 11 hours at the loop's average 3.5 passes, so a checkpoint and its
-supervised copy land about once a day. Forty-six copies during pretrain plus
-the final copy add about 22 days on top of the 23 days of pretrain.
+checkpoint, and once more from the bridge weights at the end. About 139
+copies during pretrain, plus the final copy, is the cost of doing that
+every day across 140B tokens.
 
 The tokenizer is HuggingFaceTB/SmolLM2-135M and is used unchanged. Its
 vocabulary is 49,152. ``<|endoftext|>`` is id 0 and is the beginning, end,
@@ -195,9 +197,9 @@ def build_config() -> TrainingConfig:
         # The previous supervised peak. 0.2x the new pretrain peak would be 6e-5.
         sft_lr=6e-4,
         weight_decay=0.1,
-        # 3B tokens out of the 140B budget: about 12 hours of pretrain, so the
-        # supervised copy that follows still finishes inside a day.
-        eval_every_percent=3_000_000_000 / 140_000_000_000 * 100,
+        # 1B tokens out of the 140B budget. About 4 hours of pretrain, leaving
+        # the supervised copy room to finish inside the same day.
+        eval_every_percent=1_000_000_000 / 140_000_000_000 * 100,
         plateau_window_tokens=20_000_000_000,
         plateau_min_loss_drop=0.02,
         sft_at_checkpoints=True,
