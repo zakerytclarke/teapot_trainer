@@ -1,10 +1,10 @@
-"""SmolLM2-135M language model with a MiniLM retriever in the same checkpoint.
+"""Llama language model with a MiniLM retriever in the same checkpoint.
 
-The language model is a Llama built to the SmolLM2-135M recipe: 30 layers,
-hidden size 576, 9 query heads, 3 key/value heads, SwiGLU width 1536, tied
-embeddings, and RoPE theta 100,000. With the SmolLM vocabulary of 49,152 that
-backbone is 134,515,008 parameters. ``sentence-transformers/all-MiniLM-L6-v2``
-is a separate encoder loaded before training and saved beside those weights.
+``build_rag_config`` is the shape ``train.py`` trains: 16 layers, hidden size
+768, 12 query heads, 4 key/value heads, SwiGLU width 2048. The position table
+is the retrieval pack window, 2,048 tokens. ``build_smollm_config`` is the
+separate SmolLM2-135M recipe. ``sentence-transformers/all-MiniLM-L6-v2`` is
+loaded before training and saved beside the language-model weights.
 
 Each message is embedded once, truncated to the encoder's own context length.
 Packing stays a hard choice of the messages MiniLM ranks as closest to the
@@ -26,7 +26,7 @@ SMOLLM_PARAMETER_COUNT = 134_515_008
 
 
 class TeapotConfig(LlamaConfig):
-    """Llama config for the 135M recipe, plus the MiniLM encoder settings."""
+    """Llama config plus the MiniLM encoder settings."""
 
     model_type = "teapot"
 
@@ -436,6 +436,31 @@ class TeapotForCausalLM(LlamaForCausalLM):
         tokenizer = kwargs.pop("tokenizer")
         max_new_tokens = kwargs.pop("max_new_tokens", 256)
         return self.generate_from_messages(messages, tokenizer, max_new_tokens=max_new_tokens, **kwargs)
+
+
+def build_rag_config(**kwargs) -> TeapotConfig:
+    """Use the previous 16-layer Llama shape, with the pack window as the whole context.
+
+    Retrieval never shows the language model more than ``pack_context_length``
+    tokens, so the position table is that same length. RoPE theta stays
+    500,000, which is what the trainer's Llama builder already used.
+    """
+    window = int(kwargs.get("max_position_embeddings") or 2048)
+    kwargs["pack_context_length"] = window
+    kwargs["max_position_embeddings"] = window
+    kwargs.setdefault("hidden_size", 768)
+    kwargs.setdefault("num_hidden_layers", 16)
+    kwargs.setdefault("num_attention_heads", 12)
+    kwargs.setdefault("num_key_value_heads", 4)
+    kwargs.setdefault("intermediate_size", 2048)
+    kwargs.setdefault("vocab_size", SMOLLM_VOCAB_SIZE)
+    kwargs.setdefault("rope_theta", 500_000.0)
+    kwargs.setdefault("rms_norm_eps", 1e-5)
+    kwargs.setdefault("tie_word_embeddings", True)
+    kwargs.setdefault("bos_token_id", 0)
+    kwargs.setdefault("eos_token_id", 0)
+    kwargs.setdefault("pad_token_id", 0)
+    return TeapotConfig(**kwargs)
 
 
 def build_smollm_config(**kwargs) -> TeapotConfig:

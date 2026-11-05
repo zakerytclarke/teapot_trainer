@@ -160,7 +160,7 @@ print(tokenizer.decode(output[0], skip_special_tokens=True))
 
 ## Retrieval
 
-`TeapotForCausalLM` is the SmolLM2-135M Llama shape plus the `sentence-transformers/all-MiniLM-L6-v2` encoder. The language model is trained from scratch. MiniLM is loaded before training and saved in the same checkpoint.
+`TeapotForCausalLM` is the previous 16-layer Llama shape plus the `sentence-transformers/all-MiniLM-L6-v2` encoder: hidden size 768, 12 query heads, 4 key/value heads, SwiGLU width 2048. The language model is trained from scratch. Its position table is the 2,048-token pack window. MiniLM is loaded before training and saved in the same checkpoint.
 
 A chat is packed into 2,048 tokens. The system prompt and the latest user message are always kept. Earlier user and assistant messages are scored by cosine similarity to that latest user message, in one encoder batch. Each message is embedded whole and truncated at MiniLM's position table (512 tokens), not split into pieces. The closest messages are placed in chronological order after the system prompt and before the latest user message. One message may fill whatever room is left.
 

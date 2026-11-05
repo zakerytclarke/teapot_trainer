@@ -1,14 +1,13 @@
-"""One-day check of the SmolLM2-135M teapot model.
+"""One-day check of the 16-layer teapot model.
 
-The 40B-token mix was about a week on this machine. This run keeps the same
-shape, tokenizer, and data sources, and uses about one seventh of those
-budgets: 5.7B pretrain tokens and 21.11M supervised tokens.
-
-Thirty layers, hidden size 576, 9 query heads, 3 key/value heads, SwiGLU width
-1536. Tied embeddings and the SmolLM vocabulary of 49,152 put the language
-model at 134,515,008 parameters. RoPE theta is 100,000 and the position table
-is 8,192, matching the released SmolLM2-135M config. Training sequences and
-the retrieval pack window stay 2,048.
+The shape is the previous Llama run: 16 layers, hidden size 768, 12 query
+heads, 4 key/value heads, SwiGLU width 2048. RoPE theta stays 500,000. The
+position table is 2,048, the same window retrieval packs into, so every
+trained position is a position the packer can fill. The 40B-token mix was
+about a week on this machine. This run keeps the tokenizer and data sources
+and uses about one seventh of those budgets: 5.7B pretrain tokens and 21.11M
+supervised tokens. Tied embeddings and the SmolLM vocabulary of 49,152 put
+the language model at 138,437,376 parameters.
 
 The tokenizer is HuggingFaceTB/SmolLM2-135M and is used unchanged. Its
 vocabulary is 49,152. ``<|endoftext|>`` is id 0 and is the beginning, end,
@@ -65,7 +64,7 @@ from teapottrainer import (
     TEAPOT_CHAT,
     TeapotForCausalLM,
     TeapotTrainer,
-    build_smollm_config,
+    build_rag_config,
     TrainingConfig,
     WHEN2CALL_ASK,
     WHEN2CALL_REFUSE,
@@ -74,17 +73,17 @@ from teapottrainer import (
 
 
 def build_config() -> TrainingConfig:
-    # Same SmolLM2-135M teapot model as the week run. Token budgets are ~1/7.
+    # Previous 16-layer Llama shape. The pack window is the whole position table.
     return TrainingConfig(
         model=ModelConfig(
             model_type="custom",
-            hidden_size=576,
-            num_hidden_layers=30,
-            num_attention_heads=9,
-            num_key_value_heads=3,
-            intermediate_size=1536,
+            hidden_size=768,
+            num_hidden_layers=16,
+            num_attention_heads=12,
+            num_key_value_heads=4,
+            intermediate_size=2048,
             max_position_embeddings=2048,
-            custom_config_cls=build_smollm_config,
+            custom_config_cls=build_rag_config,
             custom_model_cls=TeapotForCausalLM,
         ),
         pretrain_datasets=[

@@ -102,11 +102,11 @@ def test_train_script_uses_the_same_constructor():
     dumped = set(config.model_dump().keys())
     assert dumped == LOCKED_TRAINING_FIELDS
     assert config.model.model_type == "custom"
-    assert config.model.layers == 30
-    assert config.model.hidden_size == 576
-    assert config.model.heads == 9
-    assert config.model.kv_heads == 3
-    assert config.model.intermediate == 1536
+    assert config.model.layers == 16
+    assert config.model.hidden_size == 768
+    assert config.model.heads == 12
+    assert config.model.kv_heads == 4
+    assert config.model.intermediate == 2048
     assert config.model.seq_len == 2048
     assert config.model.hidden_size % config.model.heads == 0
     assert config.model.custom_model_cls.__name__ == "TeapotForCausalLM"
@@ -119,15 +119,15 @@ def test_train_script_uses_the_same_constructor():
         intermediate_size=config.model.intermediate,
         max_position_embeddings=config.model.seq_len,
     )
-    assert built.rope_parameters["rope_theta"] == 100_000
-    assert built.max_position_embeddings == 8192
+    assert built.rope_parameters["rope_theta"] == 500_000
+    assert built.max_position_embeddings == 2048
     assert built.pack_context_length == 2048
     assert built.bos_token_id == 0
     assert built.eos_token_id == 0
     assert built.pad_token_id == 0
     assert built.tie_word_embeddings is True
     assert built.rms_norm_eps == 1e-5
-    assert abs(built.initializer_range - (576 ** -0.5)) < 1e-12
+    assert built.initializer_range == 0.02
     assert config.tokenizer == "HuggingFaceTB/SmolLM2-135M"
     assert config.init_from is None
     assert TrainingConfig().init_from is None
