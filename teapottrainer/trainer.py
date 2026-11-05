@@ -69,6 +69,32 @@ def _numeric_config_changes(saved, config) -> dict[str, float]:
 RESUME_EVERY_TOKENS = 100_000_000
 
 
+def checkpoint_due(
+    tokens: int,
+    total_tokens: int,
+    next_mark: float,
+    every_tokens: int,
+    every_percent: float,
+) -> tuple[bool, str]:
+    """Whether this step should save a mid-phase checkpoint, and its folder suffix.
+
+    Token intervals name the folder by the token count, so each save is its own
+    directory. Percent mode keeps the integer-percent suffix.
+    """
+    if total_tokens <= 0 or tokens <= 0 or tokens >= total_tokens:
+        return False, ""
+    if every_tokens > 0:
+        if tokens < next_mark:
+            return False, ""
+        return True, f"{int(tokens)}tok"
+    if every_percent <= 0:
+        return False, ""
+    pct = 100.0 * tokens / total_tokens
+    if pct < next_mark or pct >= 100.0:
+        return False, ""
+    return True, f"{int(pct)}pct"
+
+
 def take_mixture_sample(weights, budgets, produced, retired, take):
     """Draw the next training sample.
 
@@ -850,7 +876,7 @@ class TeapotTrainer:
             return
         if not required and not self.config.sft_at_checkpoints:
             return
-        if not phase_name.startswith("pretrain") and phase_name != "bridge":
+        if phase_name != "bridge" and not phase_name.startswith("pretrain") and not phase_name.startswith("bridge_"):
             return
         label = f"{phase_name}_sft"
         directory = os.path.join(self.output_dir, "checkpoints", label)
@@ -975,7 +1001,8 @@ class TeapotTrainer:
         first_loss = None
         last_loss = None
         best_train_loss = None
-        next_eval = self.config.eval_every_percent
+        every_tokens = int(self.config.eval_every_tokens or 0)
+        next_eval = float(every_tokens if every_tokens > 0 else self.config.eval_every_percent)
         if resume:
             tokens = int(resume["tokens"])
             samples_target = int(resume["samples_taken"])
@@ -1059,17 +1086,26 @@ class TeapotTrainer:
                     if phase_name == "pretrain":
                         self.writer.add_scalar("train/loss", loss, global_step)
                     progress.set_postfix(loss=f"{loss:.4f}", lr=f"{lr:.2e}", speed=f"{int(speed)}tok/s")
-                    pct = 100.0 * tokens / total_tokens
-                    if eval_during and pct >= next_eval and pct < 100.0:
-                        progress.write(f"\n[eval at {pct:.1f}%]")
-                        checkpoint_name = f"{phase_name}_{int(pct)}pct"
+                    due, suffix = checkpoint_due(
+                        tokens,
+                        total_tokens,
+                        next_eval,
+                        every_tokens,
+                        float(self.config.eval_every_percent),
+                    )
+                    if eval_during and due:
+                        progress.write(f"\n[eval at {tokens:,} tokens]")
+                        checkpoint_name = f"{phase_name}_{suffix}"
                         flat = self.run_evaluation_suite(
                             model, tokenizer, checkpoint_name, global_step, update_best=update_best
                         )
                         plateau = phase_name == "pretrain" and self._plateau_reached(tokens, flat)
-                        if phase_name == "pretrain" and not plateau:
+                        if phase_name in ("pretrain", "bridge"):
                             self._sft_from_base_checkpoint(model, tokenizer, checkpoint_name, global_step)
-                        next_eval += self.config.eval_every_percent
+                        if every_tokens > 0:
+                            next_eval += every_tokens
+                        else:
+                            next_eval += self.config.eval_every_percent
                         model.train()
                         if plateau:
                             progress.write("\n[pretrain plateau, stopping this phase]")
@@ -1246,6 +1282,14 @@ class TeapotTrainer:
         elif resume and "pretrain" in self._completed_phases:
             print("Pretrain is already complete in the resume checkpoint.")
             model = _unwrap(model)
+        if pretrain and "pretrain" in self._completed_phases and self.config.sft_at_checkpoints:
+            # The daily copies cover the interior. This one is the finished base,
+            # before the bridge moves those weights.
+            pretrain_dir = os.path.join(self.output_dir, "checkpoints", "pretrain")
+            if not os.path.isfile(os.path.join(pretrain_dir, "config.json")):
+                self._save_weights(model, tokenizer, pretrain_dir)
+                print(f"Saved pretrain weights to {pretrain_dir}")
+            self._sft_from_base_checkpoint(model, tokenizer, "pretrain", global_step)
         bridge = list(self.config.bridge_datasets or [])
         if bridge and "bridge" not in self._completed_phases:
             # Fixed length, but the loop count changes every batch, so one

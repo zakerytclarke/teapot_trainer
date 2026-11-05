@@ -60,12 +60,16 @@ class TrainingConfig(BaseModel):
     logging_dir: Optional[str] = None
     
     eval_every_percent: float = 5.0
+    # When positive, checkpoint every this many tokens instead of by percent.
+    # Percent mode names folders by the integer percent, so a step under 1%
+    # makes two checkpoints share a folder and the second supervised copy is skipped.
+    eval_every_tokens: int = 0
     # Stop pretrain when the FineWeb holdout improves by less than this many
     # nats across plateau_window_tokens. Zero window disables the check.
     plateau_window_tokens: int = 0
     plateau_min_loss_drop: float = 0.02
-    # At each pretrain eval checkpoint, train a copy on the full SFT mix and
-    # save it beside the base weights. The pretrain model keeps training.
+    # At each pretrain or bridge eval checkpoint, train a copy on the full SFT
+    # mix and save it beside the base weights. The base model keeps training.
     sft_at_checkpoints: bool = False
     holdout_ratio: float = 0.05
     seed: int = 42

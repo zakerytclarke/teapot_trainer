@@ -42,6 +42,7 @@ LOCKED_TRAINING_FIELDS = {
     "compile",
     "logging_dir",
     "eval_every_percent",
+    "eval_every_tokens",
     "plateau_window_tokens",
     "plateau_min_loss_drop",
     "sft_at_checkpoints",
@@ -144,16 +145,18 @@ def test_train_script_uses_the_same_constructor():
     assert built.rms_norm_eps == 1e-5
     assert built.initializer_range == 0.02
     assert config.tokenizer == "HuggingFaceTB/SmolLM2-135M"
-    assert config.init_from == "runs/teapot-SmolLM2-135M-4c2004/checkpoints/pretrain"
+    assert config.init_from is None
     assert TrainingConfig().init_from is None
-    assert config.lr == 3e-4
+    assert config.lr == 3e-3
     assert config.sft_lr == 6e-4
     assert config.sft_at_checkpoints is True
     assert config.plateau_window_tokens == 20_000_000_000
     assert config.plateau_min_loss_drop == 0.02
-    assert abs(config.eval_every_percent - (1_000_000_000 / 140_000_000_000 * 100)) < 1e-9
-    assert sum(spec.target_tokens for spec in config.pretrain_datasets) == 140_000_000_000
-    assert sum(spec.target_tokens for spec in config.bridge_datasets) == 2_000_000_000
+    assert config.eval_every_percent == 100.0
+    assert config.eval_every_tokens == 3_000_000_000
+    assert TrainingConfig().eval_every_tokens == 0
+    assert sum(spec.target_tokens for spec in config.pretrain_datasets) == 66_000_000_000
+    assert sum(spec.target_tokens for spec in config.bridge_datasets) == 4_000_000_000
     pretrain_names = [(spec.source.name, spec.source.subset) for spec in config.pretrain_datasets]
     assert ("HuggingFaceTB/dclm-edu", None) in pretrain_names
     assert ("HuggingFaceFW/fineweb-edu", None) in pretrain_names
@@ -165,28 +168,37 @@ def test_train_script_uses_the_same_constructor():
     for spec in config.sft_datasets:
         names.append((spec.source.name, spec.source.subset))
     assert ("HuggingFaceTB/smoltalk", "all") not in names
+    assert ("HuggingFaceTB/smoltalk", "everyday-conversations") not in names
     assert ("HuggingFaceFW/fineweb-edu", None) in names
-    assert ("HuggingFaceTB/smoltalk", "everyday-conversations") in names
+    assert ("HuggingFaceH4/ultrachat_200k", None) in names
     assert ("nvidia/When2Call", "train_sft") in names
     assert ("teapotai/synthqa", None) in names
     assert ("teapotai/teapot-chat", None) in names
+    assert ("NousResearch/hermes-function-calling-v1", "func_calling") in names
+    assert ("tatsu-lab/alpaca", None) not in names
     answerable = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn and spec.source.chat_template_fn.__name__ == "format_squad_answerable")
     unanswerable = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn and spec.source.chat_template_fn.__name__ == "format_squad_unanswerable")
     contrastive = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn and spec.source.chat_template_fn.__name__ == "format_squad_contrastive")
-    assert answerable == 11_900_000
-    assert unanswerable == 3_990_000
-    assert contrastive == 7_980_000
-    synth_answerable = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn and spec.source.chat_template_fn.__name__ == "format_synthqa_answerable")
-    synth_unanswerable = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn and spec.source.chat_template_fn.__name__ == "format_synthqa_unanswerable")
-    assert synth_answerable == 7_980_000
-    assert synth_unanswerable == 3_990_000
+    assert answerable == 5_000_000
+    assert unanswerable == 2_500_000
+    assert contrastive == 3_000_000
+    synth_answerable = next(spec for spec in config.sft_datasets if spec.source.chat_template_fn and spec.source.chat_template_fn.__name__ == "format_synthqa_answerable")
+    synth_unanswerable = next(spec for spec in config.sft_datasets if spec.source.chat_template_fn and spec.source.chat_template_fn.__name__ == "format_synthqa_unanswerable")
+    teapot = next(spec for spec in config.sft_datasets if spec.source.name == "teapotai/teapot-chat")
+    assert synth_answerable.target_tokens == 10_000_000
+    assert synth_answerable.weight == 4.0
+    assert synth_unanswerable.target_tokens == 6_000_000
+    assert synth_unanswerable.weight == 4.0
+    assert teapot.target_tokens == 14_000_000
+    assert teapot.weight == 4.0
     replay = next(spec.target_tokens for spec in config.sft_datasets if spec.source.name == "HuggingFaceFW/fineweb-edu")
-    task_tokens = sum(spec.target_tokens for spec in config.sft_datasets) - replay
-    assert replay == task_tokens
-    assert sum(spec.target_tokens for spec in config.sft_datasets) == 271_740_000
+    assert replay == 24_000_000
+    assert sum(spec.target_tokens for spec in config.sft_datasets) == 121_500_000
     eval_names = [(spec.source.name, spec.source.split) for spec in config.eval_datasets]
     assert ("teapotai/synthqa", "test") in eval_names
     assert ("teapotai/teapot-chat", "train") in eval_names
+    assert ("ucinlp/drop", "validation") in eval_names
+    assert ("stanfordnlp/coqa", "validation") in eval_names
     assert GSM8K_TEST.split == "test"
     assert SMOLTALK_APIGEN_TEST.chat_template_fn is not None
 
@@ -1406,10 +1418,6 @@ def test_added_presets_stay_out_of_the_running_mix():
         BFCL_MULTIPLE,
         BFCL_PARALLEL,
         BFCL_SIMPLE,
-        COQA,
-        COQA_VAL,
-        DROP,
-        DROP_VAL,
         HELLASWAG,
         HELLASWAG_VAL,
         HERMES_FUNCTION_CALLING,
@@ -1440,11 +1448,6 @@ def test_added_presets_stay_out_of_the_running_mix():
         PIQA_VAL,
         WINOGRANDE,
         WINOGRANDE_VAL,
-        COQA,
-        COQA_VAL,
-        DROP,
-        DROP_VAL,
-        HERMES_FUNCTION_CALLING,
         BFCL_SIMPLE,
         BFCL_MULTIPLE,
         BFCL_PARALLEL,
@@ -1453,8 +1456,6 @@ def test_added_presets_stay_out_of_the_running_mix():
     assert {src.name for src in presets}.isdisjoint(used)
     assert [task_kind(src) for src in presets] == [
         "choice", "choice", "choice", "choice", "choice", "choice", "choice", "choice",
-        "coqa", "coqa", "drop", "drop",
-        "tools",
         "bfcl", "bfcl", "bfcl", "bfcl",
     ]
     assert ARC_EASY_VAL.split == "validation"
@@ -1541,6 +1542,77 @@ def test_added_presets_stay_out_of_the_running_mix():
     assert refused == TOOLS_PRESENT_REFUSAL
 
 
+def test_token_checkpoints_do_not_share_a_folder():
+    from teapottrainer.trainer import checkpoint_due
+
+    due, suffix = checkpoint_due(3_000_000_000, 66_000_000_000, 3_000_000_000, 3_000_000_000, 100)
+    assert due and suffix == "3000000000tok"
+    later, later_suffix = checkpoint_due(3_200_000_000, 66_000_000_000, 6_000_000_000, 3_000_000_000, 100)
+    assert later is False and later_suffix == ""
+    second, second_suffix = checkpoint_due(6_100_000_000, 66_000_000_000, 6_000_000_000, 3_000_000_000, 100)
+    assert second and second_suffix == "6100000000tok"
+    assert second_suffix != suffix
+    assert checkpoint_due(66_000_000_000, 66_000_000_000, 66_000_000_000, 3_000_000_000, 100) == (False, "")
+    percent_due, percent_suffix = checkpoint_due(2_000, 10_000, 10.0, 0, 10)
+    assert percent_due and percent_suffix == "20pct"
+    assert checkpoint_due(10_000, 10_000, 90.0, 0, 10) == (False, "")
+
+
+def test_bridge_checkpoint_gets_a_supervised_copy():
+    import os
+    import tempfile
+
+    import teapottrainer.trainer as trainer_mod
+    from teapottrainer.trainer import TeapotTrainer
+
+    class _Copy:
+        def to(self, device):
+            return self
+
+        def train(self):
+            return self
+
+    with tempfile.TemporaryDirectory() as tmp:
+        base = os.path.join(tmp, "checkpoints", "bridge_3000000000tok")
+        os.makedirs(base)
+        with open(os.path.join(base, "config.json"), "w", encoding="utf-8") as handle:
+            handle.write("{}")
+        trainer = object.__new__(TeapotTrainer)
+        trainer.config = TrainingConfig(
+            tokenizer="local-test",
+            lr=1e-3,
+            sft_at_checkpoints=True,
+            sft_datasets=[DatasetSpec(source="toy", target_tokens=8)],
+        )
+        trainer.output_dir = tmp
+        trainer.device = "cpu"
+        trainer.best_loss = 1.0
+        trainer.best_behavior = None
+        trainer._restarts = []
+        trainer._completed_phases = ["pretrain"]
+        trainer._checkpointing = False
+        trainer.phase_stats = {}
+        trainer.writer = None
+        calls = []
+
+        def train_phase(*args, **kwargs):
+            calls.append(kwargs.get("final_phase_name"))
+            directory = os.path.join(tmp, "checkpoints", "bridge_3000000000tok_sft")
+            os.makedirs(directory, exist_ok=True)
+            with open(os.path.join(directory, "metrics.json"), "w", encoding="utf-8") as handle:
+                handle.write("{}")
+
+        trainer._train_phase = train_phase
+        original = trainer_mod.AutoModelForCausalLM.from_pretrained
+        trainer_mod.AutoModelForCausalLM.from_pretrained = lambda *args, **kwargs: _Copy()
+        try:
+            trainer._sft_from_base_checkpoint(_Copy(), None, "bridge_3000000000tok", 4)
+        finally:
+            trainer_mod.AutoModelForCausalLM.from_pretrained = original
+        assert calls == ["bridge_3000000000tok_sft"]
+        assert trainer._completed_phases == ["pretrain"]
+
+
 def test_ultrachat_and_alpaca_are_presets_and_not_in_the_mix():
     from train import build_config
     from teapottrainer import ALPACA, ULTRACHAT, ULTRACHAT_TEST
@@ -1552,7 +1624,7 @@ def test_ultrachat_and_alpaca_are_presets_and_not_in_the_mix():
         spec.source.name
         for spec in config.pretrain_datasets + config.bridge_datasets + config.sft_datasets + config.eval_datasets
     }
-    assert ULTRACHAT.name not in used
+    assert ULTRACHAT.name in {spec.source.name for spec in config.sft_datasets}
     assert ALPACA.name not in used
     assert ULTRACHAT.split == "train_sft"
     assert ULTRACHAT_TEST.split == "test_sft"
