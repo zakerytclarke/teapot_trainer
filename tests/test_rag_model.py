@@ -1,4 +1,4 @@
-"""Packing, MiniLM scores, and the SmolLM2-135M parameter count."""
+"""Packing, embedding scores, and the SmolLM2-135M parameter count."""
 
 import json
 import os
@@ -217,7 +217,7 @@ def test_score_length_must_match_candidates():
         raise AssertionError("expected a score-length error")
 
 
-def test_retrieval_loss_trains_minilm_only():
+def test_retrieval_loss_trains_the_embedder_only():
     messages = [
         {"role": "system", "content": "Be brief."},
         {"role": "user", "content": "alpha fact"},

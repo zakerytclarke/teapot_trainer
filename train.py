@@ -16,7 +16,7 @@ matrix stays the size the recipe trained. ``<|im_start|>`` and ``<|im_end|>``
 are already in that vocabulary and are left unused: the supervised mix and
 the evals speak System / User / Assistant.
 
-The checkpoint also holds all-MiniLM-L6-v2. That encoder is loaded before
+The checkpoint also holds teapotai/teapotembedding. That encoder is loaded before
 training. Each message is embedded whole, up to the encoder's context length.
 ``retrieval_loss`` trains the ranking with REINFORCE from the language-model
 loss. The ordinary supervised step does not call it.

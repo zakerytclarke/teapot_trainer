@@ -1,13 +1,13 @@
-"""Llama language model with a MiniLM retriever in the same checkpoint.
+"""Llama language model with a Teapot embedding retriever in the same checkpoint.
 
 ``build_rag_config`` is the shape ``train.py`` trains: 16 layers, hidden size
 768, 12 query heads, 4 key/value heads, SwiGLU width 2048. The position table
 is the retrieval pack window, 2,048 tokens. ``build_smollm_config`` is the
-separate SmolLM2-135M recipe. ``sentence-transformers/all-MiniLM-L6-v2`` is
-loaded before training and saved beside the language-model weights.
+separate SmolLM2-135M recipe. ``teapotai/teapotembedding`` is loaded before
+training and saved beside the language-model weights.
 
 Each message is embedded once, truncated to the encoder's own context length.
-Packing stays a hard choice of the messages MiniLM ranks as closest to the
+Packing stays a hard choice of the messages the encoder ranks as closest to the
 latest user message. ``retrieval_loss`` trains that ranking with REINFORCE:
 the reward is the language-model loss of the gold reply under the sampled
 message, measured against the message the current scores already rank first.
@@ -17,22 +17,22 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, BertConfig, BertModel, LlamaConfig
+from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
 
-EMBEDDER_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+EMBEDDER_NAME = "teapotai/teapotembedding"
 SMOLLM_VOCAB_SIZE = 49152
 SMOLLM_PARAMETER_COUNT = 134_515_008
 
 
 class TeapotConfig(LlamaConfig):
-    """Llama config plus the MiniLM encoder settings."""
+    """Llama config plus the Teapot embedding encoder settings."""
 
     model_type = "teapot"
 
     embedder_name: str = EMBEDDER_NAME
     embedder_config: dict | None = None
-    # None uses the encoder position table. MiniLM's table is 512.
+    # None uses the encoder position table. Teapot embedding's table is 512.
     embedder_max_length: int | None = None
     pack_context_length: int = 2048
     retrieval_temperature: float = 1.0
@@ -274,7 +274,7 @@ def _mean_pool(hidden: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 
 
 class TeapotForCausalLM(LlamaForCausalLM):
-    """Causal LM whose checkpoint also owns the MiniLM retriever."""
+    """Causal LM whose checkpoint also owns the Teapot embedding retriever."""
 
     config_class = TeapotConfig
 
@@ -283,12 +283,14 @@ class TeapotForCausalLM(LlamaForCausalLM):
         self.embedder = self._build_embedder(config)
         self._embedder_tokenizer_obj = None
 
-    def _build_embedder(self, config: TeapotConfig) -> BertModel:
+    def _build_embedder(self, config: TeapotConfig):
         if config.embedder_config is None:
             pretrained = AutoModel.from_pretrained(config.embedder_name)
             config.embedder_config = pretrained.config.to_dict()
             return pretrained
-        return BertModel(BertConfig.from_dict(config.embedder_config))
+        data = dict(config.embedder_config)
+        model_type = data.pop("model_type")
+        return AutoModel.from_config(AutoConfig.for_model(model_type, **data))
 
     def _embedder_tokenizer(self):
         if self._embedder_tokenizer_obj is None:
@@ -389,7 +391,7 @@ class TeapotForCausalLM(LlamaForCausalLM):
     def retrieval_loss(self, messages: list[dict], answer: str, tokenizer) -> torch.Tensor:
         """REINFORCE over which earlier message is packed.
 
-        The policy is a softmax over MiniLM cosine scores, so the pretrained
+        The policy is a softmax over the encoder's cosine scores, so the pretrained
         encoder is the prior. A sampled message is packed with the system
         prompt and the latest user message. The reward is how much that pack
         lowers the language-model loss of ``answer`` relative to the message
