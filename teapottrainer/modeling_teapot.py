@@ -15,9 +15,14 @@ message, measured against the message the current scores already rank first.
 
 from __future__ import annotations
 
+import random
+
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, LlamaConfig
+from transformers.masking_utils import create_causal_mask
+from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
 
 EMBEDDER_NAME = "teapotai/teapotembedding"
@@ -36,6 +41,8 @@ class TeapotConfig(LlamaConfig):
     embedder_max_length: int | None = None
     pack_context_length: int = 2048
     retrieval_temperature: float = 1.0
+    # How many times the language-model block runs. One is a normal pass.
+    reasoning_effort: int = 1
 
     def __post_init__(self, **kwargs):
         if self.num_key_value_heads is None:
@@ -415,6 +422,108 @@ class TeapotForCausalLM(LlamaForCausalLM):
             advantage = self._answer_nll(baseline, answer, tokenizer) - self._answer_nll(sampled, answer, tokenizer)
         return -log_probs[action] * advantage + anchor
 
+    def _decoder_pass(self, hidden_states, causal_mask, position_embeddings, position_ids):
+        for layer in self.model.layers:
+            hidden_states = layer(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_embeddings=position_embeddings,
+                position_ids=position_ids,
+                past_key_values=None,
+                use_cache=False,
+            )
+        return hidden_states
+
+    def _forward_with_effort(
+        self,
+        input_ids,
+        attention_mask,
+        position_ids,
+        inputs_embeds,
+        labels,
+        logits_to_keep,
+        effort: int,
+        **kwargs,
+    ):
+        """Run the decoder block ``effort`` times. Training recomputes each pass."""
+        if inputs_embeds is None:
+            inputs_embeds = self.model.embed_tokens(input_ids)
+        if position_ids is None:
+            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device).unsqueeze(0)
+        causal_mask = create_causal_mask(
+            config=self.config,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            past_key_values=None,
+            position_ids=position_ids,
+        )
+        hidden_states = inputs_embeds
+        position_embeddings = self.model.rotary_emb(hidden_states, position_ids=position_ids)
+        for _ in range(effort):
+            if self.training and hidden_states.requires_grad:
+                hidden_states = checkpoint(
+                    self._decoder_pass,
+                    hidden_states,
+                    causal_mask,
+                    position_embeddings,
+                    position_ids,
+                    use_reentrant=False,
+                )
+            else:
+                hidden_states = self._decoder_pass(
+                    hidden_states, causal_mask, position_embeddings, position_ids
+                )
+        hidden_states = self.model.norm(hidden_states)
+        from transformers.modeling_utils import slice_logits_to_keep
+
+        hidden_states = slice_logits_to_keep(hidden_states, logits_to_keep)
+        logits = self.lm_head(hidden_states)
+        loss = None
+        if labels is not None:
+            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+        return CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=None)
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        labels=None,
+        use_cache=None,
+        logits_to_keep=0,
+        **kwargs,
+    ):
+        effort = kwargs.pop("reasoning_effort", None)
+        if effort is None:
+            effort = getattr(self.config, "reasoning_effort", 1)
+        effort = int(effort)
+        if effort < 1:
+            raise ValueError("reasoning_effort must be at least 1.")
+        if effort == 1:
+            return super().forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                labels=labels,
+                use_cache=use_cache,
+                logits_to_keep=logits_to_keep,
+                **kwargs,
+            )
+        return self._forward_with_effort(
+            input_ids,
+            attention_mask,
+            position_ids,
+            inputs_embeds,
+            labels,
+            logits_to_keep,
+            effort,
+            **kwargs,
+        )
+
     def generate_from_messages(self, messages: list[dict], tokenizer, max_new_tokens: int = 256, **kwargs):
         """Pack the chat to the 2048-token window, then generate the reply."""
         prompt = self.pack_messages(messages, tokenizer, max_new_tokens=max_new_tokens)
@@ -433,11 +542,34 @@ class TeapotForCausalLM(LlamaForCausalLM):
 
     def generate(self, *args, **kwargs):
         messages = kwargs.pop("messages", None)
-        if messages is None:
-            return super().generate(*args, **kwargs)
-        tokenizer = kwargs.pop("tokenizer")
-        max_new_tokens = kwargs.pop("max_new_tokens", 256)
-        return self.generate_from_messages(messages, tokenizer, max_new_tokens=max_new_tokens, **kwargs)
+        effort = kwargs.pop("reasoning_effort", None)
+        previous = int(getattr(self.config, "reasoning_effort", 1))
+        if effort is not None:
+            self.config.reasoning_effort = max(1, int(effort))
+        try:
+            if int(getattr(self.config, "reasoning_effort", 1)) > 1:
+                kwargs["use_cache"] = False
+            if messages is None:
+                return super().generate(*args, **kwargs)
+            tokenizer = kwargs.pop("tokenizer")
+            max_new_tokens = kwargs.pop("max_new_tokens", 256)
+            return self.generate_from_messages(messages, tokenizer, max_new_tokens=max_new_tokens, **kwargs)
+        finally:
+            self.config.reasoning_effort = previous
+
+
+def sample_reasoning_effort(phase: str) -> int:
+    """One pass in pretraining. Supervised phases draw 1 through 10.
+
+    Effort 1 is twice as likely as each of 2 through 10. A phase named ``sft``
+    or ending in ``_sft`` is supervised, so the checkpoint copies loop too.
+    """
+    name = str(phase or "")
+    if name != "sft" and not name.endswith("_sft"):
+        return 1
+    choices = list(range(1, 11))
+    weights = [2, *([1] * (len(choices) - 1))]
+    return int(random.choices(choices, weights=weights, k=1)[0])
 
 
 def build_rag_config(**kwargs) -> TeapotConfig:

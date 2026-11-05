@@ -195,14 +195,24 @@ class TeapotTrainer:
         self._checkpointing = False
 
         tokenizer_short = self.config.tokenizer.split("/")[-1]
-        try:
-            safe_dict = self.config.model_dump(exclude_defaults=True, mode="json")
-            # This flag only decides whether copies are fine-tuned at checkpoints.
-            # It must not fork the run directory, or a resume would miss its weights.
-            safe_dict.pop("sft_at_checkpoints", None)
-            run_hash = hashlib.md5(json.dumps(safe_dict, default=str).encode()).hexdigest()[:6]
-        except Exception:
-            run_hash = hashlib.md5(repr(self.config).encode()).hexdigest()[:6]
+        safe_dict = self.config.model_dump(exclude_defaults=True)
+        # This flag only decides whether copies are fine-tuned at checkpoints.
+        # It must not fork the run directory, or a resume would miss its weights.
+        safe_dict.pop("sft_at_checkpoints", None)
+        safe_dict.pop("sample_reasoning_effort", None)
+
+        def freeze(value):
+            if isinstance(value, dict):
+                return {key: freeze(item) for key, item in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [freeze(item) for item in value]
+            if isinstance(value, type):
+                return f"{value.__module__}.{value.__qualname__}"
+            if callable(value):
+                return getattr(value, "__qualname__", type(value).__name__)
+            return value
+
+        run_hash = hashlib.md5(json.dumps(freeze(safe_dict), sort_keys=True, default=str).encode()).hexdigest()[:6]
         self.output_dir = f"./runs/teapot-{tokenizer_short}-{run_hash}"
         os.makedirs(self.output_dir, exist_ok=True)
         tb_log_path = self.config.logging_dir or os.path.join(self.output_dir, "runs")
@@ -317,7 +327,19 @@ class TeapotTrainer:
             sources.append(src)
         return sources
 
-    def _forward_backward(self, model, batch, tokenizer):
+    def _apply_reasoning_effort(self, model, phase_name: str) -> None:
+        """Let the run pick how many times this step loops the language model."""
+        sampler = self.config.sample_reasoning_effort
+        if sampler is None:
+            self._reasoning_effort = int(getattr(model.config, "reasoning_effort", 1))
+            return
+        effort = int(sampler(phase_name))
+        if effort < 1:
+            raise ValueError(f"sample_reasoning_effort({phase_name!r}) returned {effort}.")
+        model.config.reasoning_effort = effort
+        self._reasoning_effort = effort
+
+    def _forward_backward(self, model, batch, tokenizer, phase_name: str):
         pad_id = tokenizer.pad_token_id
         if pad_id is None:
             pad_id = tokenizer.eos_token_id or 0
@@ -349,6 +371,9 @@ class TeapotTrainer:
             kwargs["labels"] = label_tensor
         if any(row.count(0) for row in mask):
             kwargs["attention_mask"] = torch.tensor(mask, dtype=torch.long, device=self.device)
+        live = _unwrap(model)
+        previous_effort = getattr(live.config, "reasoning_effort", None)
+        self._apply_reasoning_effort(live, phase_name)
         try:
             if self.device.type == "cuda":
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -376,6 +401,9 @@ class TeapotTrainer:
                 )
                 sys.exit(1)
             raise
+        finally:
+            if previous_effort is not None and hasattr(live.config, "reasoning_effort"):
+                live.config.reasoning_effort = previous_effort
         return float(loss.detach().float().item()), real_tokens
 
     def _phase_uses_chat(self, phase_name: str | None) -> bool:
@@ -895,7 +923,7 @@ class TeapotTrainer:
                     samples_taken += 1
                 if not batch:
                     break
-                loss, real_tokens = self._forward_backward(model, batch, tokenizer)
+                loss, real_tokens = self._forward_backward(model, batch, tokenizer, phase_name)
                 if first_loss is None:
                     first_loss = loss
                 last_loss = loss
@@ -916,6 +944,10 @@ class TeapotTrainer:
                     self.writer.add_scalar(f"train_{phase_name}/loss", loss, global_step)
                     self.writer.add_scalar(f"train_{phase_name}/lr", lr, global_step)
                     self.writer.add_scalar(f"train_{phase_name}/tokens_per_sec", speed, global_step)
+                    if getattr(self, "_reasoning_effort", None) is not None:
+                        self.writer.add_scalar(
+                            f"train_{phase_name}/reasoning_effort", self._reasoning_effort, global_step
+                        )
                     # One pretrain curve. Side SFT copies keep their own step axis
                     # and must not draw on top of this series.
                     if phase_name == "pretrain":

@@ -13,6 +13,7 @@ from teapottrainer.modeling_teapot import (
     TeapotForCausalLM,
     llama_parameter_count,
     pack_conversation,
+    sample_reasoning_effort,
     split_conversation,
 )
 from teapottrainer.trainer import TeapotTrainer
@@ -331,3 +332,28 @@ def test_custom_builder_receives_kv_heads(tmp_path, monkeypatch):
     assert captured["num_key_value_heads"] == 2
     assert captured["vocab_size"] == 50
     assert captured["max_position_embeddings"] == 16
+
+
+def test_pretrain_effort_is_one_and_sft_prefers_one():
+    assert sample_reasoning_effort("pretrain") == 1
+    assert sample_reasoning_effort("eval") == 1
+    draws = [sample_reasoning_effort("sft") for _ in range(4000)]
+    copies = [sample_reasoning_effort("pretrain_sft") for _ in range(200)]
+    assert set(draws) <= set(range(1, 11))
+    assert set(copies) <= set(range(1, 11))
+    assert draws.count(1) > draws.count(2) * 1.4
+
+
+def test_extra_reasoning_effort_trains_the_same_weights():
+    torch.manual_seed(0)
+    model = TeapotForCausalLM(_tiny_config(max_position_embeddings=32, pack_context_length=32))
+    model.train()
+    ids = torch.randint(1, 30, (2, 8))
+    one = model(input_ids=ids, labels=ids, reasoning_effort=1)
+    many = model(input_ids=ids, labels=ids, reasoning_effort=3)
+    assert one.loss.shape == many.loss.shape
+    many.loss.backward()
+    grad = model.model.layers[0].self_attn.q_proj.weight.grad
+    assert grad is not None
+    assert torch.count_nonzero(grad) > 0
+    assert model.config.reasoning_effort == 1
