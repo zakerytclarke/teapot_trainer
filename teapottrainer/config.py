@@ -32,6 +32,9 @@ class TrainingConfig(BaseModel):
     pretrain_datasets: List[DatasetSpec] = Field(
         default_factory=lambda: [DatasetSpec(source=FINEWEB_EDU, target_tokens=2_000_000_000)]
     )
+    # Raw text trained after pretrain and before supervised training. Empty skips it.
+    # The loop count can change per batch, so this phase stays eager.
+    bridge_datasets: List[DatasetSpec] = Field(default_factory=list)
     sft_datasets: List[DatasetSpec] = Field(default_factory=list)
     eval_datasets: List[DatasetSpec] = Field(default_factory=list)
     
@@ -50,13 +53,23 @@ class TrainingConfig(BaseModel):
     batch_size: int = 4
     grad_accum: int = 32
     lr: float = 5e-4
+    # None uses 0.2x lr after a pretrain phase, and lr when there is no pretrain.
+    sft_lr: Optional[float] = None
     weight_decay: float = 0.1
     compile: bool = True
     logging_dir: Optional[str] = None
     
     eval_every_percent: float = 5.0
-    # At each pretrain eval checkpoint, train a copy on the full SFT mix and
-    # save it beside the base weights. The pretrain model keeps training.
+    # When positive, checkpoint every this many tokens instead of by percent.
+    # Percent mode names folders by the integer percent, so a step under 1%
+    # makes two checkpoints share a folder and the second supervised copy is skipped.
+    eval_every_tokens: int = 0
+    # Stop pretrain when the FineWeb holdout improves by less than this many
+    # nats across plateau_window_tokens. Zero window disables the check.
+    plateau_window_tokens: int = 0
+    plateau_min_loss_drop: float = 0.02
+    # At each pretrain or bridge eval checkpoint, train a copy on the full SFT
+    # mix and save it beside the base weights. The base model keeps training.
     sft_at_checkpoints: bool = False
     holdout_ratio: float = 0.05
     seed: int = 42

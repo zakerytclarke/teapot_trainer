@@ -102,15 +102,22 @@ def role_label(role: str) -> str:
 
 
 def render_prompt(system: str | None, retrieved: list[tuple[str, str]], user: str | None) -> str:
-    """The same System / User / Assistant surface the supervised mix already trains."""
-    parts = []
+    """Render a packed chat in the active supervised format.
+
+    The selected turns stay in conversation order. Turns the retriever did not
+    keep are absent, which is the context a long chat becomes once it no
+    longer fits the position window.
+    """
+    from .formatting import render_prompt as render_messages
+
+    messages = []
     if system:
-        parts.append(f"System: {system}")
+        messages.append({"role": "system", "content": system})
     for role, content in retrieved:
-        parts.append(f"{role_label(role)}: {content}")
+        messages.append({"role": role, "content": content})
     if user:
-        parts.append(f"User: {user}")
-    return "\n\n".join(parts + ["Assistant:"]) + "\n"
+        messages.append({"role": "user", "content": user})
+    return render_messages(messages)
 
 
 def _encode(tokenizer, text: str) -> list[int]:
@@ -472,10 +479,9 @@ class TeapotForCausalLM(LlamaForCausalLM):
                     hidden_states, causal_mask, position_embeddings, position_ids
                 )
         hidden_states = self.model.norm(hidden_states)
-        from transformers.modeling_utils import slice_logits_to_keep
-
-        hidden_states = slice_logits_to_keep(hidden_states, logits_to_keep)
-        logits = self.lm_head(hidden_states)
+        # logits_to_keep=0 means the whole sequence. slice(-0, None) is that slice.
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
         loss = None
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)

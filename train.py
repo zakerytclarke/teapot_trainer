@@ -1,51 +1,69 @@
-"""One-day check of the 16-layer teapot model.
+"""Train a 135M teapot from scratch, then read the assistant at every day.
 
-The shape is the previous Llama run: 16 layers, hidden size 768, 12 query
-heads, 4 key/value heads, SwiGLU width 2048. RoPE theta stays 500,000. The
-position table is 2,048, the same window retrieval packs into, so every
-trained position is a position the packer can fill. The 40B-token mix was
-about a week on this machine. This run keeps the tokenizer and data sources
-and uses about one seventh of those budgets: 5.7B pretrain tokens and 21.11M
-supervised tokens. Tied embeddings and the SmolLM vocabulary of 49,152 put
-the language model at 138,437,376 parameters.
+The shape is the 16-layer Llama: hidden size 768, 12 query heads, 4 key/value
+heads, SwiGLU width 2048, RoPE theta 500,000, position table 2,048. Nothing
+is loaded from the 40B run. Tied embeddings and the SmolLM vocabulary of
+49,152 put the language model at 138,437,376 parameters. The embedder is
+teapotai/teapotembedding and is loaded when the model is built.
 
-The tokenizer is HuggingFaceTB/SmolLM2-135M and is used unchanged. Its
-vocabulary is 49,152. ``<|endoftext|>`` is id 0 and is the beginning, end,
-unknown, and padding token. No special tokens are added, so the embedding
-matrix stays the size the recipe trained. ``<|im_start|>`` and ``<|im_end|>``
-are already in that vocabulary and are left unused: the supervised mix and
-the evals speak System / User / Assistant.
+Pretrain is 66B tokens, one decoder pass, compiled, peaked at 3e-3. The first
+40B run was mostly web text and the holdout had already flattened, so this
+mix spends the new tokens on reading, math, and structured text: FineWeb-Edu
+40%, DCLM-Edu 15%, FineMath 15%, InfiWebMath 10%, Stack-Edu 10%, Cosmopedia
+10%. Every 3B tokens is about 12 hours at 70,463 tokens/s. The trainer saves
+that base checkpoint, scores the holdouts, trains a full supervised copy, and
+then continues the same pretrain optimizer. A copy of the 121.5M-token mix
+is about 5 to 8 hours, so the pair finishes inside a day. Across 66B tokens
+that is 21 interior copies, plus one more from the finished pretrain weights.
+If the FineWeb holdout improves by less than 0.02 nats across 20B tokens,
+pretrain stops and that last base still gets its supervised copy.
 
-The checkpoint also holds teapotai/teapotembedding. That encoder is loaded before
-training. Each message is embedded whole, up to the encoder's context length.
-``retrieval_loss`` trains the ranking with REINFORCE from the language-model
-loss. The ordinary supervised step does not call it.
+The bridge is 4B tokens, so it crosses one 3B checkpoint of its own. It is
+eager, peaked at 3e-4, and the loop is drawn from 1 to 4. The mix is the text
+worth rereading: FineMath 30%, InfiWebMath 20%, Cosmopedia 20%, FineWeb 15%,
+Stack 15%. That interior checkpoint gets its own supervised copy. The real
+supervised run is the last one, from the finished bridge weights.
 
-``before_batch`` runs before every training batch and may assign any field on
-the model config. This script uses it to set ``reasoning_effort``. Pretraining
-sets 1. Supervised training, including the checkpoint copies, draws 1 through
-10. Half the supervised steps use one pass. The other half is split evenly
-across 2 through 10, so the average pass count is 3.5. The trainer puts the
-previous config back after the batch. Each extra pass is recomputed on the
-backward, so the memory stays near one pass. At inference,
-``generate(..., reasoning_effort=N)`` sets the count.
+Supervised tokens, 121.5M per copy. FineWeb replay is 24M, about 20%, after
+an 8% replay let FineWeb perplexity jump from 17 to 74. UltraChat is 8M of
+multi-turn dialogue. Teapot chat is 14M and each SynthQA split is weighted 4,
+with 10M answerable and 6M each of unanswerable and contrastive, so those
+small sets are drawn about as often as the large sources and are not finished
+in the first hour. The rest is passage questions, DROP and CoQA, GSM8K and
+MetaMath, the tool split, Hermes multi-turn calls, constraints, system chats,
+and a thin OpenHermes slice. The loop schedule is unchanged: half the steps
+are one pass, and the rest are spread across 2 through 10. The supervised
+peak is 6e-4. Prompts use the SmolLM2-135M-Instruct chat format, the same
+template as the tokenizer. When a multi-turn chat does not fit in 2,048
+tokens, the supervised step packs it with the retriever: low-scoring earlier
+turns are dropped, the turns that remain stay in conversation order, and the
+encoder is trained on that choice. A single question with one passage has
+nothing earlier to retrieve and stays on the ordinary prompt.
 
-The supervised mix pairs each passage with an unanswerable question about an
-entity in it, and draws a new tool name on every example. config.lr is the
-pretrain peak. After a pretrain phase the trainer uses 0.2x that value for
-supervised training.
+A crash continues from checkpoints/resume. The base optimizer and the sample
+cursor are there. A supervised copy that already wrote metrics.json is not
+trained again. fresh=False is what makes that resume happen. The first launch
+still builds a new model, because init_from is empty.
+
+At the measured checkpoint size of 785MB, 21 pretrain pairs plus the finished
+pretrain pair, two bridge pairs, and the rolling resume are about 40GB.
 """
 
 import random
 
 from teapottrainer import (
     COSMOPEDIA_V2,
+    COQA,
+    COQA_VAL,
     DCLM_EDU,
+    DROP,
+    DROP_VAL,
     DatasetSpec,
     FINEWEB_EDU,
     FINEMATH,
     GSM8K,
     GSM8K_TEST,
+    HERMES_FUNCTION_CALLING,
     HOTPOT,
     HOTPOT_CONTRASTIVE,
     HOTPOT_VAL,
@@ -59,10 +77,9 @@ from teapottrainer import (
     SMOLTALK_APIGEN_UNRELATED,
     SMOLTALK_CONSTRAINTS,
     SMOLTALK_CONSTRAINTS_TEST,
-    SMOLTALK_EVERYDAY,
-    SMOLTALK_MAGPIE,
-    SMOLTALK_REWRITE,
-    SMOLTALK_SUMMARIZE,
+    SMOLTALK_METAMATH,
+    SMOLTALK_OPENHERMES,
+    SMOLTALK_SYSTEMCHATS,
     SQUAD_V2_ANSWERABLE,
     SQUAD_V2_CONTRASTIVE,
     SQUAD_V2_UNANSWERABLE,
@@ -75,6 +92,7 @@ from teapottrainer import (
     TEAPOT_CHAT,
     TeapotForCausalLM,
     TeapotTrainer,
+    ULTRACHAT,
     build_rag_config,
     TrainingConfig,
     WHEN2CALL_ASK,
@@ -86,12 +104,13 @@ from teapottrainer import (
 def set_reasoning_effort(model, phase: str) -> None:
     """Assign ``reasoning_effort`` for this batch. Any model config can hold it.
 
-    Pretraining and eval leave the block at one pass. A phase named ``sft`` or
-    ending in ``_sft`` draws an effort: half of those steps are 1, and the
-    other half is split evenly across 2 through 10.
+    Pretrain and eval stay at one pass. The bridge draws 1 through 4. A phase
+    named ``sft`` or ending in ``_sft`` draws 1 through 10, half of them at 1.
     """
     name = str(phase or "")
-    if name == "sft" or name.endswith("_sft"):
+    if name == "bridge":
+        effort = int(random.randint(1, 4))
+    elif name == "sft" or name.endswith("_sft"):
         choices = list(range(1, 11))
         # 9 / 18 of the draws are 1. Each of 2..10 is 1 / 18.
         weights = [9, *([1] * (len(choices) - 1))]
@@ -102,7 +121,7 @@ def set_reasoning_effort(model, phase: str) -> None:
 
 
 def build_config() -> TrainingConfig:
-    # Previous 16-layer Llama shape. The pack window is the whole position table.
+    # From-scratch 16-layer Llama. The pack window is the whole position table.
     return TrainingConfig(
         model=ModelConfig(
             model_type="custom",
@@ -115,37 +134,50 @@ def build_config() -> TrainingConfig:
             custom_config_cls=build_rag_config,
             custom_model_cls=TeapotForCausalLM,
         ),
+        # 66B tokens. 40/15/15/10/10/10.
         pretrain_datasets=[
-            DatasetSpec(source=DCLM_EDU, target_tokens=3_021_000_000, weight=1.0),
-            DatasetSpec(source=FINEWEB_EDU, target_tokens=1_995_000_000, weight=1.0),
-            DatasetSpec(source=STACK_EDU, target_tokens=342_000_000, weight=1.0),
-            DatasetSpec(source=INFIWEBMATH, target_tokens=114_000_000, weight=1.0),
-            DatasetSpec(source=FINEMATH, target_tokens=100_000_000, weight=1.0),
-            DatasetSpec(source=COSMOPEDIA_V2, target_tokens=128_000_000, weight=1.0),
+            DatasetSpec(source=FINEWEB_EDU, target_tokens=26_400_000_000, weight=1.0),
+            DatasetSpec(source=DCLM_EDU, target_tokens=9_900_000_000, weight=1.0),
+            DatasetSpec(source=FINEMATH, target_tokens=9_900_000_000, weight=1.0),
+            DatasetSpec(source=INFIWEBMATH, target_tokens=6_600_000_000, weight=1.0),
+            DatasetSpec(source=STACK_EDU, target_tokens=6_600_000_000, weight=1.0),
+            DatasetSpec(source=COSMOPEDIA_V2, target_tokens=6_600_000_000, weight=1.0),
+        ],
+        # 4B tokens, so one interior checkpoint fires at 3B. 30/20/20/15/15.
+        bridge_datasets=[
+            DatasetSpec(source=FINEMATH, target_tokens=1_200_000_000, weight=1.0),
+            DatasetSpec(source=INFIWEBMATH, target_tokens=800_000_000, weight=1.0),
+            DatasetSpec(source=COSMOPEDIA_V2, target_tokens=800_000_000, weight=1.0),
+            DatasetSpec(source=FINEWEB_EDU, target_tokens=600_000_000, weight=1.0),
+            DatasetSpec(source=STACK_EDU, target_tokens=600_000_000, weight=1.0),
         ],
         sft_datasets=[
-            DatasetSpec(source=FINEWEB_EDU, target_tokens=1_700_000, weight=1.0),
-            DatasetSpec(source=SQUAD_V2_ANSWERABLE, target_tokens=1_700_000, weight=1.0),
-            DatasetSpec(source=SYNTHQA_ANSWERABLE, target_tokens=1_140_000, weight=1.0),
-            DatasetSpec(source=HOTPOT, target_tokens=860_000, weight=1.0),
-            DatasetSpec(source=SQUAD_V2_CONTRASTIVE, target_tokens=1_140_000, weight=1.0),
-            DatasetSpec(source=SQUAD_V2_UNANSWERABLE, target_tokens=570_000, weight=1.0),
-            DatasetSpec(source=SYNTHQA_CONTRASTIVE, target_tokens=570_000, weight=1.0),
-            DatasetSpec(source=SYNTHQA_UNANSWERABLE, target_tokens=570_000, weight=1.0),
-            DatasetSpec(source=HOTPOT_CONTRASTIVE, target_tokens=860_000, weight=1.0),
-            DatasetSpec(source=SMOLTALK_APIGEN_ALIASED, target_tokens=2_860_000, weight=1.0),
-            DatasetSpec(source=SMOLTALK_APIGEN_DECISION, target_tokens=570_000, weight=1.0),
-            DatasetSpec(source=SMOLTALK_APIGEN_MISSING, target_tokens=860_000, weight=1.0),
-            DatasetSpec(source=SMOLTALK_APIGEN_UNRELATED, target_tokens=860_000, weight=1.0),
-            DatasetSpec(source=WHEN2CALL_ASK, target_tokens=860_000, weight=1.0),
-            DatasetSpec(source=WHEN2CALL_REFUSE, target_tokens=860_000, weight=1.0),
-            DatasetSpec(source=TEAPOT_CHAT, target_tokens=1_140_000, weight=1.0),
-            DatasetSpec(source=SMOLTALK_EVERYDAY, target_tokens=1_140_000, weight=1.0),
-            DatasetSpec(source=SMOLTALK_CONSTRAINTS, target_tokens=860_000, weight=1.0),
-            DatasetSpec(source=SMOLTALK_REWRITE, target_tokens=570_000, weight=1.0),
-            DatasetSpec(source=SMOLTALK_SUMMARIZE, target_tokens=570_000, weight=1.0),
-            DatasetSpec(source=SMOLTALK_MAGPIE, target_tokens=280_000, weight=1.0),
-            DatasetSpec(source=GSM8K, target_tokens=570_000, weight=1.0),
+            DatasetSpec(source=FINEWEB_EDU, target_tokens=24_000_000, weight=1.0),
+            DatasetSpec(source=ULTRACHAT, target_tokens=8_000_000, weight=1.0),
+            # Small sets. Weight 4 keeps them in the draw until their budgets fill.
+            DatasetSpec(source=TEAPOT_CHAT, target_tokens=14_000_000, weight=4.0),
+            DatasetSpec(source=SYNTHQA_ANSWERABLE, target_tokens=10_000_000, weight=4.0),
+            DatasetSpec(source=SYNTHQA_UNANSWERABLE, target_tokens=6_000_000, weight=4.0),
+            DatasetSpec(source=SYNTHQA_CONTRASTIVE, target_tokens=6_000_000, weight=4.0),
+            DatasetSpec(source=SQUAD_V2_ANSWERABLE, target_tokens=5_000_000, weight=1.0),
+            DatasetSpec(source=SQUAD_V2_UNANSWERABLE, target_tokens=2_500_000, weight=1.0),
+            DatasetSpec(source=SQUAD_V2_CONTRASTIVE, target_tokens=3_000_000, weight=1.0),
+            DatasetSpec(source=HOTPOT, target_tokens=3_000_000, weight=1.0),
+            DatasetSpec(source=HOTPOT_CONTRASTIVE, target_tokens=2_000_000, weight=1.0),
+            DatasetSpec(source=DROP, target_tokens=2_000_000, weight=1.0),
+            DatasetSpec(source=COQA, target_tokens=2_000_000, weight=1.0),
+            DatasetSpec(source=GSM8K, target_tokens=4_000_000, weight=1.0),
+            DatasetSpec(source=SMOLTALK_METAMATH, target_tokens=6_000_000, weight=1.0),
+            DatasetSpec(source=SMOLTALK_APIGEN_ALIASED, target_tokens=4_000_000, weight=1.0),
+            DatasetSpec(source=SMOLTALK_APIGEN_DECISION, target_tokens=2_000_000, weight=1.0),
+            DatasetSpec(source=SMOLTALK_APIGEN_MISSING, target_tokens=2_000_000, weight=1.0),
+            DatasetSpec(source=SMOLTALK_APIGEN_UNRELATED, target_tokens=2_000_000, weight=1.0),
+            DatasetSpec(source=WHEN2CALL_ASK, target_tokens=2_000_000, weight=1.0),
+            DatasetSpec(source=WHEN2CALL_REFUSE, target_tokens=2_000_000, weight=1.0),
+            DatasetSpec(source=HERMES_FUNCTION_CALLING, target_tokens=3_000_000, weight=1.0),
+            DatasetSpec(source=SMOLTALK_CONSTRAINTS, target_tokens=2_000_000, weight=1.0),
+            DatasetSpec(source=SMOLTALK_SYSTEMCHATS, target_tokens=2_000_000, weight=1.0),
+            DatasetSpec(source=SMOLTALK_OPENHERMES, target_tokens=3_000_000, weight=1.0),
         ],
         eval_datasets=[
             DatasetSpec(source=FINEWEB_EDU, target_tokens=1_000_000),
@@ -156,17 +188,24 @@ def build_config() -> TrainingConfig:
             DatasetSpec(source=SQUAD_V2_VAL, target_tokens=200_000),
             DatasetSpec(source=HOTPOT_VAL, target_tokens=200_000),
             DatasetSpec(source=SYNTHQA_TEST, target_tokens=200_000),
+            DatasetSpec(source=DROP_VAL, target_tokens=200_000),
+            DatasetSpec(source=COQA_VAL, target_tokens=200_000),
             DatasetSpec(source=GSM8K_TEST, target_tokens=200_000),
             DatasetSpec(source=TEAPOT_CHAT, target_tokens=200_000),
         ],
         tokenizer="HuggingFaceTB/SmolLM2-135M",
+        chat_format="smollm",
+        init_from=None,
         batch_size=8,
         grad_accum=16,
         lr=3e-3,
+        sft_lr=6e-4,
         weight_decay=0.1,
-        eval_every_percent=10.0,
-        # Each pretrain eval also fine-tunes a copy to completion and saves it
-        # next to the base checkpoint. Pretrain itself keeps the base weights.
+        # Unused while eval_every_tokens is set. 100 cannot fire a mid-phase save.
+        eval_every_percent=100.0,
+        eval_every_tokens=3_000_000_000,
+        plateau_window_tokens=20_000_000_000,
+        plateau_min_loss_drop=0.02,
         sft_at_checkpoints=True,
         compile=True,
         before_batch=[set_reasoning_effort],
@@ -177,8 +216,10 @@ def main():
     config = build_config()
     trainer = TeapotTrainer(config=config)
     trainer.eval_example_cap = 32
+    # 64 sequences of 2,048 tokens. The plateau decision reads this holdout.
+    trainer.lm_eval_batches = 64
     # fresh=False continues checkpoints/resume when a previous launch died.
-    # Replay starts at the first sample of that phase so the next draw matches.
+    # The first launch has no resume, and init_from is empty, so the model is new.
     trainer.train(fresh=False)
 
 
