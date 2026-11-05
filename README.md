@@ -2,6 +2,8 @@
 
 `teapottrainer` is a config-driven library for pretraining and supervised fine-tuning of causal language models. You describe the model, the dataset mix, and the token budgets. `TeapotTrainer` runs pretraining, then supervised training, and can resume from the last checkpoint.
 
+The from-scratch month run in `train.py` is written up in [Month-long 135M run](#month-long-135m-run).
+
 ```bash
 pip install teapottrainer
 ```
@@ -164,9 +166,11 @@ print(tokenizer.decode(output[0], skip_special_tokens=True))
 
 A chat is packed into 2,048 tokens. The system prompt and the latest user message are always kept. Earlier user and assistant messages are scored by cosine similarity to that latest user message, in one encoder batch. Each message is embedded whole and truncated at the encoder's position table (512 tokens), not split into pieces. The closest messages are placed in chronological order after the system prompt and before the latest user message. One message may fill whatever room is left.
 
-`retrieval_loss(messages, answer, tokenizer)` trains that ranking with REINFORCE. It samples an earlier message from the softmax over those cosine scores, packs it, and uses the language-model loss of `answer` as the reward, compared with the message the scores already rank first. The ordinary supervised step does not call this loss.
+`retrieval_loss(messages, answer, tokenizer)` trains that ranking with REINFORCE. It samples an earlier message from the softmax over those cosine scores, packs it, and uses the language-model loss of `answer` as the reward, compared with the message the scores already rank first. The language-model weights stay outside that graph.
 
-`TrainingConfig.before_batch` is a hook the trainer calls before each training batch. It receives the model and the phase name and may assign any field on that model's config, whether the model is Llama, Qwen, GPT-2, or teapot. The trainer restores the config after the batch. `train.py` uses the hook to set `reasoning_effort`, which is how many times the teapot language-model block runs. Pretraining sets it to 1. Half of the supervised steps use one pass, and the other half is split evenly across 2 through 10. `generate(..., reasoning_effort=8)` asks for eight passes at inference. The extra passes are recomputed during training, so the memory stays near one pass.
+A supervised phase packs a multi-turn chat that does not fit the window and adds that retrieval loss, so the encoder learns which earlier turn to keep and the language model trains on the packed prompt. The kept turns stay in conversation order. A short chat, and a single question with one passage, skip the encoder. Pretrain and bridge rows stay raw text.
+
+`TrainingConfig.before_batch` is a hook the trainer calls before each training batch. It receives the model and the phase name and may assign any field on that model's config, whether the model is Llama, Qwen, GPT-2, or teapot. The trainer restores the config after the batch. `train.py` uses the hook to set `reasoning_effort`, which is how many times the teapot language-model block runs. Pretraining and eval stay at one pass. The bridge draws 1 through 4. A supervised phase draws 1 through 10, and half of those draws are 1. `generate(..., reasoning_effort=8)` asks for eight passes at inference. The extra passes are recomputed during training, so the memory stays near one pass.
 
 ```python
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -192,9 +196,83 @@ To add a source, build a `DatasetSourceConfig` with a `chat_template_fn` that re
 
 ## Develop
 
-The `train.py` script in this repository is one example run. It is not part of the installed package.
+The `train.py` script in this repository is the month-long run below. It is not part of the installed package.
 
 ```bash
 pip install -e ".[dev]"
 pytest
 ```
+
+## Month-long 135M run
+
+The goal is a 135M assistant that answers from the context and the tools it is given, and that can work a problem. A finished supervised copy is saved at least once a day, so the assistant can be compared as pretraining grows. The run starts from scratch (`init_from` is empty) and is sized to finish inside a month. Nothing is loaded from the earlier 40B checkpoint.
+
+The shape is the 16-layer Llama: hidden size 768, 12 query heads, 4 key/value heads, SwiGLU width 2048, RoPE theta 500,000, position table 2,048. Tied embeddings and the SmolLM vocabulary of 49,152 put the language model at 138,437,376 parameters. The `teapotai/teapotembedding` encoder is loaded when the model is built and saved in every checkpoint. Supervised prompts use `chat_format="smollm"`, the SmolLM2-135M-Instruct template, including its default system line when a chat has no system message. Pretrain checkpoints do not carry that template.
+
+Launch it from the repo with `python train.py`. `fresh=False` continues `checkpoints/resume` after a crash: the base optimizer, the sample cursor, and any supervised copy that already wrote `metrics.json`. The first launch has no resume file, so the model is new.
+
+Measured speeds from the previous run put pretrain near 70,500 tokens/s, the bridge near 10,300 tokens/s, and one supervised copy at about 5 to 8 hours. Long chats also run the retriever, and each checkpoint scores the evals, so a day lands toward the long end of that range. At about 785MB per checkpoint, the saved pairs need about 40GB.
+
+### Pretrain
+
+66B tokens, about 10.8 days of compute. One decoder pass, compiled, learning rate peaked at 3e-3. The mix is web text, math, code, and textbooks.
+
+| Dataset | Tokens | Share |
+| --- | ---: | ---: |
+| FineWeb-Edu | 26.4B | 40% |
+| DCLM-Edu | 9.9B | 15% |
+| FineMath | 9.9B | 15% |
+| InfiWebMath | 6.6B | 10% |
+| Stack-Edu | 6.6B | 10% |
+| Cosmopedia | 6.6B | 10% |
+
+Every 3B tokens is about 11.8 hours. The trainer saves that base checkpoint, scores the holdouts, trains one full supervised copy, and then returns to the same pretrain optimizer. That pair is about 17 to 20 hours, so one base checkpoint and one finished assistant land each day. There are 21 interior copies, at 3B through 63B, plus one more from the finished 66B weights. If the FineWeb holdout improves by less than 0.02 nats across any 20B tokens, pretrain stops and that last base still gets its supervised copy.
+
+### Bridge
+
+4B tokens, about 4.5 days. Eager, learning rate peaked at 3e-4, and the loop is drawn from 1 to 4 passes (average 2.5). The same documents as pretrain, narrowed to the text worth a second read.
+
+| Dataset | Tokens | Share |
+| --- | ---: | ---: |
+| FineMath | 1.2B | 30% |
+| InfiWebMath | 0.8B | 20% |
+| Cosmopedia | 0.8B | 20% |
+| FineWeb-Edu | 0.6B | 15% |
+| Stack-Edu | 0.6B | 15% |
+
+One interior checkpoint fires at 3B, about 3.4 days in, and that base gets its own supervised copy. The last 1B is about 27 hours. The final supervised run then starts from the finished bridge weights.
+
+### Supervised copy
+
+121.5M tokens per copy, about 5 to 8 hours. Learning rate peaked at 6e-4. Half the batches are one decoder pass, and the rest are spread from 2 through 10 (average 3.5). A multi-turn chat that does not fit in 2,048 tokens is packed by the retriever: low-scoring earlier turns are dropped, the rest stay in conversation order, and the encoder is trained on that choice.
+
+A full run trains 24 copies: 21 during pretrain, one from the finished pretrain, one from the bridge checkpoint at 3B, and the last one from the finished bridge. Together that is 2.92B supervised tokens.
+
+| Dataset | Tokens | What it teaches |
+| --- | ---: | --- |
+| FineWeb-Edu | 24M | Replay, so web perplexity stays put |
+| Teapot chat | 14M, weight 4 | In-context answers in the teapot style |
+| SynthQA answerable | 10M, weight 4 | Answer from the passage |
+| SynthQA unanswerable | 6M, weight 4 | Say when the passage is not enough |
+| SynthQA contrastive | 6M, weight 4 | Pick the right span against a distractor |
+| SQuAD answerable / unanswerable / contrastive | 5M / 2.5M / 3M | The same three skills on Wikipedia passages |
+| HotpotQA / Hotpot contrastive | 3M / 2M | Multi-hop reading |
+| DROP | 2M | Discrete reasoning over a paragraph |
+| CoQA | 2M | Conversational questions |
+| GSM8K | 4M | Grade-school problems |
+| MetaMath | 6M | More worked math |
+| APIGen aliased / decision / missing / unrelated | 4M / 2M / 2M / 2M | Call a tool, pick one, notice a missing argument, refuse a tool that does not apply |
+| When2Call ask / refuse | 2M / 2M | Ask for what is missing, or refuse |
+| Hermes function calling | 3M | Multi-turn tool traces |
+| UltraChat | 8M | Multi-turn dialogue |
+| Constraints | 2M | Follow the instruction’s limits |
+| System chats | 2M | Obey a system message |
+| OpenHermes | 3M | A thin general-assistant slice |
+
+Weight 4 keeps teapot chat and SynthQA in the draw until their budgets fill. Teapot chat is about 11% of the copy. The three SynthQA splits together are about 18%.
+
+Each checkpoint scores FineWeb, constraints, APIGen decision and aliased calls, When2Call, SQuAD, Hotpot, SynthQA, DROP, CoQA, GSM8K, and teapot chat.
+
+### Wall clock
+
+Pretrain plus its 22 supervised copies is about 16 to 18 days. The bridge plus its two supervised copies is about 5 to 5.5 days. A full run is about 3 weeks at the measured speeds, and still inside a month if each supervised copy takes 8 hours.
