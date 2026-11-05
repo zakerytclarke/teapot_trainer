@@ -643,6 +643,21 @@ def format_mt_bench(row: dict) -> list[tuple[str, str]] | None:
     return pairs
 
 
+def format_alpaca(row: dict) -> tuple[str, str] | None:
+    """Stanford Alpaca instruction, plus the optional input, in the active chat format.
+
+    The published ``text`` column is the old ``### Instruction`` template. The
+    supervised mix speaks the chat format instead, so that column is ignored.
+    """
+    instruction = _as_text(row.get("instruction"))
+    context = _as_text(row.get("input"))
+    output = _as_text(row.get("output"))
+    if not instruction or not output:
+        return None
+    user = instruction if not context else f"{instruction}\n\n{context}"
+    return _chat_prompt(user), output
+
+
 def format_alpaca_eval(row: dict) -> tuple[str, str] | None:
     instruction = _as_text(row.get("instruction"))
     output = _as_text(row.get("output"))

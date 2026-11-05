@@ -1541,6 +1541,59 @@ def test_added_presets_stay_out_of_the_running_mix():
     assert refused == TOOLS_PRESENT_REFUSAL
 
 
+def test_ultrachat_and_alpaca_are_presets_and_not_in_the_mix():
+    from train import build_config
+    from teapottrainer import ALPACA, ULTRACHAT, ULTRACHAT_TEST
+    from teapottrainer.evals import task_kind
+    from teapottrainer.formatting import format_alpaca
+
+    config = build_config()
+    used = {
+        spec.source.name
+        for spec in config.pretrain_datasets + config.bridge_datasets + config.sft_datasets + config.eval_datasets
+    }
+    assert ULTRACHAT.name not in used
+    assert ALPACA.name not in used
+    assert ULTRACHAT.split == "train_sft"
+    assert ULTRACHAT_TEST.split == "test_sft"
+    assert ULTRACHAT.chat_template_fn is messages_format
+    assert ALPACA.chat_template_fn is format_alpaca
+    assert task_kind(ULTRACHAT) == "sft_loss"
+    assert task_kind(ALPACA) == "sft_loss"
+
+    turns = messages_format({
+        "messages": [
+            {"role": "user", "content": "What theme version am I using?"},
+            {"role": "assistant", "content": "Check the theme settings."},
+            {"role": "user", "content": "Where?"},
+            {"role": "assistant", "content": "On the collection page."},
+        ]
+    })
+    assert len(turns) == 2
+    assert turns[0][1] == "Check the theme settings."
+    assert "What theme version" in turns[1][0]
+    assert turns[1][1] == "On the collection page."
+
+    with_input, answer = format_alpaca({
+        "instruction": "Identify the odd one out.",
+        "input": "Twitter, Instagram, Telegram",
+        "output": "Telegram",
+        "text": "### Instruction:\nignored",
+    })
+    assert "Identify the odd one out." in with_input
+    assert "Twitter, Instagram, Telegram" in with_input
+    assert "### Instruction" not in with_input
+    assert answer == "Telegram"
+    bare, bare_answer = format_alpaca({
+        "instruction": "Give three tips for staying healthy.",
+        "input": "  ",
+        "output": "Sleep.",
+    })
+    assert "Give three tips" in bare
+    assert bare_answer == "Sleep."
+    assert format_alpaca({"instruction": "", "input": "x", "output": "y"}) is None
+
+
 def test_chat_format_names_and_aliases():
     import pytest
 

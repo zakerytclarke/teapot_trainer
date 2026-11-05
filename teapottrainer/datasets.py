@@ -23,6 +23,7 @@ from .chat_formats import current_chat_format, supervised_end
 from .formatting import (
     NO_REFERENCE,
     as_pairs,
+    format_alpaca,
     format_alpaca_eval,
     format_arc,
     format_bfcl,
@@ -447,6 +448,22 @@ HERMES_FUNCTION_CALLING = DatasetSourceConfig(
     split="train",
     is_sft=True,
     chat_template_fn=format_hermes,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+# Multi-turn assistant dialogues and single-turn instructions. Not in train.py.
+ULTRACHAT = DatasetSourceConfig(
+    name="HuggingFaceH4/ultrachat_200k",
+    split="train_sft",
+    is_sft=True,
+    chat_template_fn=messages_format,
+    token_loss_weight_fn=_STOP_WEIGHT,
+)
+ULTRACHAT_TEST = ULTRACHAT.model_copy(update={"split": "test_sft"})
+ALPACA = DatasetSourceConfig(
+    name="tatsu-lab/alpaca",
+    split="train",
+    is_sft=True,
+    chat_template_fn=format_alpaca,
     token_loss_weight_fn=_STOP_WEIGHT,
 )
 BFCL_SIMPLE = DatasetSourceConfig(
