@@ -148,10 +148,10 @@ def test_train_script_uses_the_same_constructor():
     assert TrainingConfig().init_from is None
     assert config.lr == 3e-4
     assert config.sft_lr == 6e-4
-    assert config.sft_at_checkpoints is False
+    assert config.sft_at_checkpoints is True
     assert config.plateau_window_tokens == 20_000_000_000
     assert config.plateau_min_loss_drop == 0.02
-    assert abs(config.eval_every_percent - (10_000_000_000 / 140_000_000_000 * 100)) < 1e-9
+    assert abs(config.eval_every_percent - (3_000_000_000 / 140_000_000_000 * 100)) < 1e-9
     assert sum(spec.target_tokens for spec in config.pretrain_datasets) == 140_000_000_000
     assert sum(spec.target_tokens for spec in config.bridge_datasets) == 2_000_000_000
     pretrain_names = [(spec.source.name, spec.source.subset) for spec in config.pretrain_datasets]
