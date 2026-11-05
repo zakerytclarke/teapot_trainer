@@ -1,6 +1,12 @@
 from .chat_formats import CHAT_FORMATS, chat_format_names, use_chat_format
 from .config import TrainingConfig, ModelConfig, DatasetSpec
-from .modeling_teapot import TeapotConfig, TeapotForCausalLM, build_rag_config, build_smollm_config, pack_conversation
+from .modeling_teapot import (
+    TeapotConfig,
+    TeapotForCausalLM,
+    build_rag_config,
+    build_smollm_config,
+    pack_conversation,
+)
 from .trainer import TeapotTrainer
 from .datasets import (
     DatasetSourceConfig,

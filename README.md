@@ -166,6 +166,8 @@ A chat is packed into 2,048 tokens. The system prompt and the latest user messag
 
 `retrieval_loss(messages, answer, tokenizer)` trains that ranking with REINFORCE. It samples an earlier message from the softmax over those cosine scores, packs it, and uses the language-model loss of `answer` as the reward, compared with the message the scores already rank first. The ordinary supervised step does not call this loss.
 
+`TrainingConfig.before_batch` is a hook the trainer calls before each training batch. It receives the model and the phase name and may assign any field on that model's config, whether the model is Llama, Qwen, GPT-2, or teapot. The trainer restores the config after the batch. `train.py` uses the hook to set `reasoning_effort`, which is how many times the teapot language-model block runs. Pretraining sets it to 1. Half of the supervised steps use one pass, and the other half is split evenly across 2 through 10. `generate(..., reasoning_effort=8)` asks for eight passes at inference. The extra passes are recomputed during training, so the memory stays near one pass.
+
 ```python
 from transformers import AutoTokenizer, AutoModelForCausalLM
 

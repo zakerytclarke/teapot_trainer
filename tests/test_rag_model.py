@@ -331,3 +331,120 @@ def test_custom_builder_receives_kv_heads(tmp_path, monkeypatch):
     assert captured["num_key_value_heads"] == 2
     assert captured["vocab_size"] == 50
     assert captured["max_position_embeddings"] == 16
+
+
+def test_pretrain_effort_is_one_and_sft_prefers_one():
+    from train import set_reasoning_effort
+
+    class Probe:
+        def __init__(self):
+            self.config = type("Config", (), {"reasoning_effort": 0})()
+
+    def draw(phase: str) -> int:
+        probe = Probe()
+        set_reasoning_effort(probe, phase)
+        return probe.config.reasoning_effort
+
+    assert draw("pretrain") == 1
+    assert draw("eval") == 1
+    draws = [draw("sft") for _ in range(6000)]
+    copies = [draw("pretrain_sft") for _ in range(200)]
+    assert set(draws) <= set(range(1, 11))
+    assert set(copies) <= set(range(1, 11))
+    assert abs(draws.count(1) / len(draws) - 0.5) < 0.05
+    assert draws.count(1) > draws.count(2) * 6
+
+
+def test_before_batch_edits_any_config_for_one_batch_only():
+    from transformers import Qwen2Config
+
+    seen = {}
+
+    class Tok:
+        pad_token_id = 0
+        eos_token_id = 0
+
+    def set_width(model, phase):
+        assert phase == "sft"
+        model.config.hidden_size = 48
+        model.config.rope_parameters["rope_theta"] = 1_000.0
+
+    def set_effort(model, phase):
+        model.config.reasoning_effort = 4
+
+    class Model:
+        def __init__(self, config):
+            self.config = config
+
+        def __call__(self, **kwargs):
+            seen["width"] = self.config.hidden_size
+            seen["rope"] = self.config.rope_parameters["rope_theta"]
+            seen["effort"] = self.config.reasoning_effort
+            raise RuntimeError("stop after the hook")
+
+    configs = [
+        LlamaConfig(
+            vocab_size=32,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            max_position_embeddings=8,
+            rope_theta=500_000.0,
+        ),
+        Qwen2Config(
+            vocab_size=32,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=8,
+            rope_theta=500_000.0,
+        ),
+    ]
+    for config in configs:
+        seen.clear()
+        model = Model(config)
+        trainer = TeapotTrainer(
+            TrainingConfig(
+                tokenizer="hook-probe",
+                compile=False,
+                before_batch=[set_width, set_effort],
+            )
+        )
+        try:
+            try:
+                trainer._forward_backward(
+                    model,
+                    [{"input_ids": [1, 2, 3], "labels": [1, 2, 3]}],
+                    Tok(),
+                    "sft",
+                )
+            except RuntimeError as exc:
+                assert "stop after the hook" in str(exc)
+            assert seen["width"] == 48
+            assert seen["rope"] == 1_000.0
+            assert seen["effort"] == 4
+            assert trainer._batch_config_metrics["hidden_size"] == 48.0
+            assert trainer._batch_config_metrics["reasoning_effort"] == 4.0
+            assert model.config.hidden_size == 32
+            assert model.config.rope_parameters["rope_theta"] == 500_000.0
+            assert "reasoning_effort" not in model.config.__dict__
+        finally:
+            trainer.writer.close()
+
+
+def test_extra_reasoning_effort_trains_the_same_weights():
+    torch.manual_seed(0)
+    model = TeapotForCausalLM(_tiny_config(max_position_embeddings=32, pack_context_length=32))
+    model.train()
+    ids = torch.randint(1, 30, (2, 8))
+    one = model(input_ids=ids, labels=ids, reasoning_effort=1)
+    many = model(input_ids=ids, labels=ids, reasoning_effort=3)
+    assert one.loss.shape == many.loss.shape
+    many.loss.backward()
+    grad = model.model.layers[0].self_attn.q_proj.weight.grad
+    assert grad is not None
+    assert torch.count_nonzero(grad) > 0
+    assert model.config.reasoning_effort == 1

@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, ConfigDict, field_validator
+from pydantic import BaseModel, Field, ConfigDict, field_serializer, field_validator
 from typing import Optional, List, Any, Union
 from .chat_formats import get_chat_format
 from .datasets import DatasetSourceConfig, FINEWEB_EDU
@@ -46,6 +46,7 @@ class TrainingConfig(BaseModel):
     @classmethod
     def _known_chat_format(cls, value: str) -> str:
         return get_chat_format(value).name
+
     batch_size: int = 4
     grad_accum: int = 32
     lr: float = 5e-4
@@ -59,5 +60,21 @@ class TrainingConfig(BaseModel):
     sft_at_checkpoints: bool = False
     holdout_ratio: float = 0.05
     seed: int = 42
+    # Called as hook(model, phase_name) before each training batch. A hook may
+    # assign any field on model.config. The trainer restores the config after
+    # the batch. Pass one function or a list of them. None runs nothing.
+    # The same hook works for Llama, Qwen, GPT-2, or a custom model.
+    before_batch: Optional[Any] = None
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, arbitrary_types_allowed=True)
+
+    @field_serializer("before_batch")
+    def _dump_before_batch(self, value):
+        # Keep the callable on the object. The run hash stores a stable name.
+        if value is None:
+            return None
+        hooks = [value] if callable(value) else list(value)
+        labels = []
+        for hook in hooks:
+            labels.append(getattr(hook, "__qualname__", type(hook).__name__))
+        return labels

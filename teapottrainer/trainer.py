@@ -13,6 +13,7 @@ confidence run that starts from an existing checkpoint; it is not a config field
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import json
 import math
@@ -48,6 +49,19 @@ from .evals import evaluate_source, selection_score, source_key, task_kind
 
 def _unwrap(model):
     return model._orig_mod if hasattr(model, "_orig_mod") else model
+
+
+def _numeric_config_changes(saved, config) -> dict[str, float]:
+    """Public numeric config fields a before_batch hook assigned this step."""
+    if not saved or config is None:
+        return {}
+    changes = {}
+    for key, value in config.__dict__.items():
+        if key.startswith("_") or isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if saved.get(key) != value:
+            changes[key] = float(value)
+    return changes
 
 
 # A resume re-reads the phase from the first sample so the shuffle buffer is
@@ -195,14 +209,23 @@ class TeapotTrainer:
         self._checkpointing = False
 
         tokenizer_short = self.config.tokenizer.split("/")[-1]
-        try:
-            safe_dict = self.config.model_dump(exclude_defaults=True, mode="json")
-            # This flag only decides whether copies are fine-tuned at checkpoints.
-            # It must not fork the run directory, or a resume would miss its weights.
-            safe_dict.pop("sft_at_checkpoints", None)
-            run_hash = hashlib.md5(json.dumps(safe_dict, default=str).encode()).hexdigest()[:6]
-        except Exception:
-            run_hash = hashlib.md5(repr(self.config).encode()).hexdigest()[:6]
+        safe_dict = self.config.model_dump(exclude_defaults=True)
+        # This flag only decides whether copies are fine-tuned at checkpoints.
+        # It must not fork the run directory, or a resume would miss its weights.
+        safe_dict.pop("sft_at_checkpoints", None)
+
+        def freeze(value):
+            if isinstance(value, dict):
+                return {key: freeze(item) for key, item in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [freeze(item) for item in value]
+            if isinstance(value, type):
+                return f"{value.__module__}.{value.__qualname__}"
+            if callable(value):
+                return getattr(value, "__qualname__", type(value).__name__)
+            return value
+
+        run_hash = hashlib.md5(json.dumps(freeze(safe_dict), sort_keys=True, default=str).encode()).hexdigest()[:6]
         self.output_dir = f"./runs/teapot-{tokenizer_short}-{run_hash}"
         os.makedirs(self.output_dir, exist_ok=True)
         tb_log_path = self.config.logging_dir or os.path.join(self.output_dir, "runs")
@@ -317,7 +340,24 @@ class TeapotTrainer:
             sources.append(src)
         return sources
 
-    def _forward_backward(self, model, batch, tokenizer):
+    def _before_batch_hooks(self):
+        """The functions that may edit model.config for the next batch."""
+        hook = self.config.before_batch
+        if hook is None:
+            return []
+        if callable(hook):
+            return [hook]
+        return list(hook)
+
+    def _restore_config(self, config, saved) -> None:
+        if config is None or saved is None:
+            return
+        for key in list(config.__dict__):
+            if key not in saved:
+                del config.__dict__[key]
+        config.__dict__.update(saved)
+
+    def _forward_backward(self, model, batch, tokenizer, phase_name: str):
         pad_id = tokenizer.pad_token_id
         if pad_id is None:
             pad_id = tokenizer.eos_token_id or 0
@@ -349,7 +389,16 @@ class TeapotTrainer:
             kwargs["labels"] = label_tensor
         if any(row.count(0) for row in mask):
             kwargs["attention_mask"] = torch.tensor(mask, dtype=torch.long, device=self.device)
+        live = _unwrap(model)
+        config = getattr(live, "config", None)
+        # Deep copy so a hook can replace a field or edit a nested dict, and
+        # both are undone after the batch. Assigning is the normal case.
+        saved = copy.deepcopy(dict(config.__dict__)) if config is not None else None
+        self._batch_config_metrics = {}
         try:
+            for hook in self._before_batch_hooks():
+                hook(live, phase_name)
+            self._batch_config_metrics = _numeric_config_changes(saved, config)
             if self.device.type == "cuda":
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     output = model(**kwargs)
@@ -376,6 +425,8 @@ class TeapotTrainer:
                 )
                 sys.exit(1)
             raise
+        finally:
+            self._restore_config(config, saved)
         return float(loss.detach().float().item()), real_tokens
 
     def _phase_uses_chat(self, phase_name: str | None) -> bool:
@@ -895,7 +946,7 @@ class TeapotTrainer:
                     samples_taken += 1
                 if not batch:
                     break
-                loss, real_tokens = self._forward_backward(model, batch, tokenizer)
+                loss, real_tokens = self._forward_backward(model, batch, tokenizer, phase_name)
                 if first_loss is None:
                     first_loss = loss
                 last_loss = loss
@@ -916,6 +967,8 @@ class TeapotTrainer:
                     self.writer.add_scalar(f"train_{phase_name}/loss", loss, global_step)
                     self.writer.add_scalar(f"train_{phase_name}/lr", lr, global_step)
                     self.writer.add_scalar(f"train_{phase_name}/tokens_per_sec", speed, global_step)
+                    for name, value in getattr(self, "_batch_config_metrics", {}).items():
+                        self.writer.add_scalar(f"train_{phase_name}/{name}", value, global_step)
                     # One pretrain curve. Side SFT copies keep their own step axis
                     # and must not draw on top of this series.
                     if phase_name == "pretrain":
