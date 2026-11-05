@@ -15,8 +15,6 @@ message, measured against the message the current scores already rank first.
 
 from __future__ import annotations
 
-import random
-
 import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
@@ -556,20 +554,6 @@ class TeapotForCausalLM(LlamaForCausalLM):
             return self.generate_from_messages(messages, tokenizer, max_new_tokens=max_new_tokens, **kwargs)
         finally:
             self.config.reasoning_effort = previous
-
-
-def sample_reasoning_effort(phase: str) -> int:
-    """One pass in pretraining. Supervised phases draw 1 through 10.
-
-    Effort 1 is twice as likely as each of 2 through 10. A phase named ``sft``
-    or ending in ``_sft`` is supervised, so the checkpoint copies loop too.
-    """
-    name = str(phase or "")
-    if name != "sft" and not name.endswith("_sft"):
-        return 1
-    choices = list(range(1, 11))
-    weights = [2, *([1] * (len(choices) - 1))]
-    return int(random.choices(choices, weights=weights, k=1)[0])
 
 
 def build_rag_config(**kwargs) -> TeapotConfig:

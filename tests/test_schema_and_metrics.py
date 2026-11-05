@@ -43,7 +43,7 @@ LOCKED_TRAINING_FIELDS = {
     "sft_at_checkpoints",
     "holdout_ratio",
     "seed",
-    "sample_reasoning_effort",
+    "before_batch",
 }
 
 
@@ -102,9 +102,16 @@ def test_train_script_uses_the_same_constructor():
     config = build_config()
     dumped = set(config.model_dump().keys())
     assert dumped == LOCKED_TRAINING_FIELDS
-    assert config.model_dump()["sample_reasoning_effort"] is None
-    assert config.sample_reasoning_effort is not None
-    assert config.sample_reasoning_effort("pretrain") == 1
+    assert config.model_dump()["before_batch"] == ["set_reasoning_effort"]
+    assert config.before_batch[0].__name__ == "set_reasoning_effort"
+
+    class Probe:
+        def __init__(self):
+            self.config = type("Config", (), {"reasoning_effort": 0})()
+
+    probe = Probe()
+    config.before_batch[0](probe, "pretrain")
+    assert probe.config.reasoning_effort == 1
     assert config.model.model_type == "custom"
     assert config.model.layers == 16
     assert config.model.hidden_size == 768
@@ -787,6 +794,32 @@ def test_sft_at_checkpoints_trains_a_copy_and_restores_pretrain_state():
         assert len(calls) == 2
         assert calls[1]["metric_group"] == "sft_checkpoint"
         assert calls[1]["metric_step"] == 10
+
+
+def test_before_batch_name_is_stable_in_the_run_directory():
+    from teapottrainer.trainer import TeapotTrainer
+
+    def make():
+        def hook(model, phase):
+            return None
+
+        return hook
+
+    plain = TeapotTrainer(TrainingConfig(tokenizer="hash-probe-hook", compile=False))
+    one = TeapotTrainer(
+        TrainingConfig(tokenizer="hash-probe-hook", compile=False, before_batch=make())
+    )
+    two = TeapotTrainer(
+        TrainingConfig(tokenizer="hash-probe-hook", compile=False, before_batch=make())
+    )
+    try:
+        assert one.output_dir == two.output_dir
+        assert one.output_dir != plain.output_dir
+        assert "hook" in one.config.model_dump()["before_batch"][0]
+    finally:
+        plain.writer.close()
+        one.writer.close()
+        two.writer.close()
 
 
 def test_sft_at_checkpoints_does_not_change_the_run_directory():

@@ -13,6 +13,7 @@ confidence run that starts from an existing checkpoint; it is not a config field
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import json
 import math
@@ -48,6 +49,19 @@ from .evals import evaluate_source, selection_score, source_key, task_kind
 
 def _unwrap(model):
     return model._orig_mod if hasattr(model, "_orig_mod") else model
+
+
+def _numeric_config_changes(saved, config) -> dict[str, float]:
+    """Public numeric config fields a before_batch hook assigned this step."""
+    if not saved or config is None:
+        return {}
+    changes = {}
+    for key, value in config.__dict__.items():
+        if key.startswith("_") or isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if saved.get(key) != value:
+            changes[key] = float(value)
+    return changes
 
 
 # A resume re-reads the phase from the first sample so the shuffle buffer is
@@ -199,7 +213,6 @@ class TeapotTrainer:
         # This flag only decides whether copies are fine-tuned at checkpoints.
         # It must not fork the run directory, or a resume would miss its weights.
         safe_dict.pop("sft_at_checkpoints", None)
-        safe_dict.pop("sample_reasoning_effort", None)
 
         def freeze(value):
             if isinstance(value, dict):
@@ -327,17 +340,22 @@ class TeapotTrainer:
             sources.append(src)
         return sources
 
-    def _apply_reasoning_effort(self, model, phase_name: str) -> None:
-        """Let the run pick how many times this step loops the language model."""
-        sampler = self.config.sample_reasoning_effort
-        if sampler is None:
-            self._reasoning_effort = int(getattr(model.config, "reasoning_effort", 1))
+    def _before_batch_hooks(self):
+        """The functions that may edit model.config for the next batch."""
+        hook = self.config.before_batch
+        if hook is None:
+            return []
+        if callable(hook):
+            return [hook]
+        return list(hook)
+
+    def _restore_config(self, config, saved) -> None:
+        if config is None or saved is None:
             return
-        effort = int(sampler(phase_name))
-        if effort < 1:
-            raise ValueError(f"sample_reasoning_effort({phase_name!r}) returned {effort}.")
-        model.config.reasoning_effort = effort
-        self._reasoning_effort = effort
+        for key in list(config.__dict__):
+            if key not in saved:
+                del config.__dict__[key]
+        config.__dict__.update(saved)
 
     def _forward_backward(self, model, batch, tokenizer, phase_name: str):
         pad_id = tokenizer.pad_token_id
@@ -372,9 +390,15 @@ class TeapotTrainer:
         if any(row.count(0) for row in mask):
             kwargs["attention_mask"] = torch.tensor(mask, dtype=torch.long, device=self.device)
         live = _unwrap(model)
-        previous_effort = getattr(live.config, "reasoning_effort", None)
-        self._apply_reasoning_effort(live, phase_name)
+        config = getattr(live, "config", None)
+        # Deep copy so a hook can replace a field or edit a nested dict, and
+        # both are undone after the batch. Assigning is the normal case.
+        saved = copy.deepcopy(dict(config.__dict__)) if config is not None else None
+        self._batch_config_metrics = {}
         try:
+            for hook in self._before_batch_hooks():
+                hook(live, phase_name)
+            self._batch_config_metrics = _numeric_config_changes(saved, config)
             if self.device.type == "cuda":
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     output = model(**kwargs)
@@ -402,8 +426,7 @@ class TeapotTrainer:
                 sys.exit(1)
             raise
         finally:
-            if previous_effort is not None and hasattr(live.config, "reasoning_effort"):
-                live.config.reasoning_effort = previous_effort
+            self._restore_config(config, saved)
         return float(loss.detach().float().item()), real_tokens
 
     def _phase_uses_chat(self, phase_name: str | None) -> bool:
@@ -944,10 +967,8 @@ class TeapotTrainer:
                     self.writer.add_scalar(f"train_{phase_name}/loss", loss, global_step)
                     self.writer.add_scalar(f"train_{phase_name}/lr", lr, global_step)
                     self.writer.add_scalar(f"train_{phase_name}/tokens_per_sec", speed, global_step)
-                    if getattr(self, "_reasoning_effort", None) is not None:
-                        self.writer.add_scalar(
-                            f"train_{phase_name}/reasoning_effort", self._reasoning_effort, global_step
-                        )
+                    for name, value in getattr(self, "_batch_config_metrics", {}).items():
+                        self.writer.add_scalar(f"train_{phase_name}/{name}", value, global_step)
                     # One pretrain curve. Side SFT copies keep their own step axis
                     # and must not draw on top of this series.
                     if phase_name == "pretrain":

@@ -60,13 +60,21 @@ class TrainingConfig(BaseModel):
     sft_at_checkpoints: bool = False
     holdout_ratio: float = 0.05
     seed: int = 42
-    # Called with the phase name before each training step. None leaves the
-    # model's own reasoning_effort alone. Return an int of at least 1.
-    sample_reasoning_effort: Optional[Any] = None
+    # Called as hook(model, phase_name) before each training batch. A hook may
+    # assign any field on model.config. The trainer restores the config after
+    # the batch. Pass one function or a list of them. None runs nothing.
+    # The same hook works for Llama, Qwen, GPT-2, or a custom model.
+    before_batch: Optional[Any] = None
 
     model_config = ConfigDict(populate_by_name=True, arbitrary_types_allowed=True)
 
-    @field_serializer("sample_reasoning_effort")
-    def _dump_reasoning_hook(self, _value):
-        # The callable stays on the object. The run hash only needs a stable dump.
-        return None
+    @field_serializer("before_batch")
+    def _dump_before_batch(self, value):
+        # Keep the callable on the object. The run hash stores a stable name.
+        if value is None:
+            return None
+        hooks = [value] if callable(value) else list(value)
+        labels = []
+        for hook in hooks:
+            labels.append(getattr(hook, "__qualname__", type(hook).__name__))
+        return labels

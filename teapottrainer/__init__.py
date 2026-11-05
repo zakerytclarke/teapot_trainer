@@ -6,7 +6,6 @@ from .modeling_teapot import (
     build_rag_config,
     build_smollm_config,
     pack_conversation,
-    sample_reasoning_effort,
 )
 from .trainer import TeapotTrainer
 from .datasets import (
@@ -89,7 +88,6 @@ __all__ = [
     "TeapotForCausalLM",
     "build_rag_config",
     "build_smollm_config",
-    "sample_reasoning_effort",
     "pack_conversation",
     "TeapotTrainer",
     "TrainingConfig",
