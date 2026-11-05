@@ -218,6 +218,7 @@ class TeapotTrainer:
                 hidden_size=self.m_cfg.hidden_size,
                 num_hidden_layers=self.m_cfg.layers,
                 num_attention_heads=self.m_cfg.heads,
+                num_key_value_heads=self.m_cfg.kv_heads,
                 intermediate_size=self.m_cfg.intermediate,
                 max_position_embeddings=self.m_cfg.seq_len,
             )

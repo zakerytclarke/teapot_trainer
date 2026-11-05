@@ -68,7 +68,7 @@ config = TrainingConfig(
 
 ## Model
 
-`model_type` chooses how the trainer builds a new model. `llama` and `gpt2` are built in. Any other Hugging Face architecture is `custom`: pass the config class and the model class. The trainer calls the config class with `vocab_size`, `hidden_size`, `num_hidden_layers`, `num_attention_heads`, `intermediate_size`, and `max_position_embeddings`. It does not pass `kv_heads`. A wrapper can set fields the class needs beyond those six.
+`model_type` chooses how the trainer builds a new model. `llama` and `gpt2` are built in. Any other Hugging Face architecture is `custom`: pass the config class and the model class. The trainer calls the config class with `vocab_size`, `hidden_size`, `num_hidden_layers`, `num_attention_heads`, `num_key_value_heads`, `intermediate_size`, and `max_position_embeddings`. A wrapper can set fields the class needs beyond those.
 
 ```python
 from transformers import Qwen2Config, Qwen2ForCausalLM
@@ -154,6 +154,32 @@ prompt = "User: What is 2 + 2?\n\nAssistant:\n"
 inputs = tokenizer(prompt, return_tensors="pt")
 output = model.generate(**inputs, max_new_tokens=64)
 print(tokenizer.decode(output[0], skip_special_tokens=True))
+```
+
+`train.py` builds `TeapotForCausalLM`. Loading that checkpoint needs `trust_remote_code=True`.
+
+## Retrieval
+
+`TeapotForCausalLM` is the SmolLM2-135M Llama shape plus the `sentence-transformers/all-MiniLM-L6-v2` encoder. The language model is trained from scratch. MiniLM is loaded before training and saved in the same checkpoint.
+
+A chat is packed into 2,048 tokens. The system prompt and the latest user message are always kept. Earlier user and assistant messages are scored by cosine similarity to that latest user message, in one encoder batch. Each message is embedded whole and truncated at MiniLM's position table (512 tokens), not split into pieces. The closest messages are placed in chronological order after the system prompt and before the latest user message. One message may fill whatever room is left.
+
+`retrieval_loss(messages, answer, tokenizer)` trains that ranking with REINFORCE. It samples an earlier message from the softmax over those cosine scores, packs it, and uses the language-model loss of `answer` as the reward, compared with the message the scores already rank first. The ordinary supervised step does not call this loss.
+
+```python
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+ckpt = "./runs/teapot-SmolLM2-135M-4c2004"
+tokenizer = AutoTokenizer.from_pretrained(ckpt)
+model = AutoModelForCausalLM.from_pretrained(ckpt, trust_remote_code=True, device_map="auto")
+messages = [
+    {"role": "system", "content": "You are a careful assistant."},
+    {"role": "user", "content": "The gate code is 1428."},
+    {"role": "assistant", "content": "I will remember that."},
+    {"role": "user", "content": "What is the gate code?"},
+]
+outputs = model.generate(messages=messages, tokenizer=tokenizer, max_new_tokens=64)
+print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 ```
 
 ## Datasets

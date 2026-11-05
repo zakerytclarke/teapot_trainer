@@ -1,12 +1,31 @@
-"""From-scratch week run in a 16-layer Llama shape.
+"""One-day check of the SmolLM2-135M teapot model.
 
-Hidden size 768, 12 query heads, 4 key/value heads, SwiGLU width 2048.
-Sixteen layers stays inside the compute of the 30-layer run this machine
-already timed, so 40B tokens still fits in about a week. The tokenizer stays
-SmolLM2-135M. The supervised mix pairs each passage with an unanswerable
-question about an entity in it, and draws a new tool name on every example.
-config.lr is the pretrain peak. After a pretrain phase the trainer uses 0.2x
-that value for supervised training.
+The 40B-token mix was about a week on this machine. This run keeps the same
+shape, tokenizer, and data sources, and uses about one seventh of those
+budgets: 5.7B pretrain tokens and 21.11M supervised tokens.
+
+Thirty layers, hidden size 576, 9 query heads, 3 key/value heads, SwiGLU width
+1536. Tied embeddings and the SmolLM vocabulary of 49,152 put the language
+model at 134,515,008 parameters. RoPE theta is 100,000 and the position table
+is 8,192, matching the released SmolLM2-135M config. Training sequences and
+the retrieval pack window stay 2,048.
+
+The tokenizer is HuggingFaceTB/SmolLM2-135M and is used unchanged. Its
+vocabulary is 49,152. ``<|endoftext|>`` is id 0 and is the beginning, end,
+unknown, and padding token. No special tokens are added, so the embedding
+matrix stays the size the recipe trained. ``<|im_start|>`` and ``<|im_end|>``
+are already in that vocabulary and are left unused: the supervised mix and
+the evals speak System / User / Assistant.
+
+The checkpoint also holds all-MiniLM-L6-v2. That encoder is loaded before
+training. Each message is embedded whole, up to the encoder's context length.
+``retrieval_loss`` trains the ranking with REINFORCE from the language-model
+loss. The ordinary supervised step does not call it.
+
+The supervised mix pairs each passage with an unanswerable question about an
+entity in it, and draws a new tool name on every example. config.lr is the
+pretrain peak. After a pretrain phase the trainer uses 0.2x that value for
+supervised training.
 """
 
 from teapottrainer import (
@@ -44,7 +63,9 @@ from teapottrainer import (
     SYNTHQA_TEST,
     SYNTHQA_UNANSWERABLE,
     TEAPOT_CHAT,
+    TeapotForCausalLM,
     TeapotTrainer,
+    build_smollm_config,
     TrainingConfig,
     WHEN2CALL_ASK,
     WHEN2CALL_REFUSE,
@@ -53,50 +74,50 @@ from teapottrainer import (
 
 
 def build_config() -> TrainingConfig:
-    # 16 layers, hidden 768, 12 query heads, 4 key/value heads.
-    # Feed-forward 2048 is 8/3 of the hidden size, the low end of 2048–2304.
-    # Sequence length stays 2048. The SmolLM2 tokenizer is unchanged.
+    # Same SmolLM2-135M teapot model as the week run. Token budgets are ~1/7.
     return TrainingConfig(
         model=ModelConfig(
-            model_type="llama",
-            hidden_size=768,
-            num_hidden_layers=16,
-            num_attention_heads=12,
-            num_key_value_heads=4,
-            intermediate_size=2048,
+            model_type="custom",
+            hidden_size=576,
+            num_hidden_layers=30,
+            num_attention_heads=9,
+            num_key_value_heads=3,
+            intermediate_size=1536,
             max_position_embeddings=2048,
+            custom_config_cls=build_smollm_config,
+            custom_model_cls=TeapotForCausalLM,
         ),
         pretrain_datasets=[
-            DatasetSpec(source=DCLM_EDU, target_tokens=21_200_000_000, weight=1.0),
-            DatasetSpec(source=FINEWEB_EDU, target_tokens=14_000_000_000, weight=1.0),
-            DatasetSpec(source=STACK_EDU, target_tokens=2_400_000_000, weight=1.0),
-            DatasetSpec(source=INFIWEBMATH, target_tokens=800_000_000, weight=1.0),
-            DatasetSpec(source=FINEMATH, target_tokens=700_000_000, weight=1.0),
-            DatasetSpec(source=COSMOPEDIA_V2, target_tokens=900_000_000, weight=1.0),
+            DatasetSpec(source=DCLM_EDU, target_tokens=3_021_000_000, weight=1.0),
+            DatasetSpec(source=FINEWEB_EDU, target_tokens=1_995_000_000, weight=1.0),
+            DatasetSpec(source=STACK_EDU, target_tokens=342_000_000, weight=1.0),
+            DatasetSpec(source=INFIWEBMATH, target_tokens=114_000_000, weight=1.0),
+            DatasetSpec(source=FINEMATH, target_tokens=100_000_000, weight=1.0),
+            DatasetSpec(source=COSMOPEDIA_V2, target_tokens=128_000_000, weight=1.0),
         ],
         sft_datasets=[
-            DatasetSpec(source=FINEWEB_EDU, target_tokens=12_000_000, weight=1.0),
-            DatasetSpec(source=SQUAD_V2_ANSWERABLE, target_tokens=12_000_000, weight=1.0),
-            DatasetSpec(source=SYNTHQA_ANSWERABLE, target_tokens=8_000_000, weight=1.0),
-            DatasetSpec(source=HOTPOT, target_tokens=6_000_000, weight=1.0),
-            DatasetSpec(source=SQUAD_V2_CONTRASTIVE, target_tokens=8_000_000, weight=1.0),
-            DatasetSpec(source=SQUAD_V2_UNANSWERABLE, target_tokens=4_000_000, weight=1.0),
-            DatasetSpec(source=SYNTHQA_CONTRASTIVE, target_tokens=4_000_000, weight=1.0),
-            DatasetSpec(source=SYNTHQA_UNANSWERABLE, target_tokens=4_000_000, weight=1.0),
-            DatasetSpec(source=HOTPOT_CONTRASTIVE, target_tokens=6_000_000, weight=1.0),
-            DatasetSpec(source=SMOLTALK_APIGEN_ALIASED, target_tokens=20_000_000, weight=1.0),
-            DatasetSpec(source=SMOLTALK_APIGEN_DECISION, target_tokens=4_000_000, weight=1.0),
-            DatasetSpec(source=SMOLTALK_APIGEN_MISSING, target_tokens=6_000_000, weight=1.0),
-            DatasetSpec(source=SMOLTALK_APIGEN_UNRELATED, target_tokens=6_000_000, weight=1.0),
-            DatasetSpec(source=WHEN2CALL_ASK, target_tokens=6_000_000, weight=1.0),
-            DatasetSpec(source=WHEN2CALL_REFUSE, target_tokens=6_000_000, weight=1.0),
-            DatasetSpec(source=TEAPOT_CHAT, target_tokens=8_000_000, weight=1.0),
-            DatasetSpec(source=SMOLTALK_EVERYDAY, target_tokens=8_000_000, weight=1.0),
-            DatasetSpec(source=SMOLTALK_CONSTRAINTS, target_tokens=6_000_000, weight=1.0),
-            DatasetSpec(source=SMOLTALK_REWRITE, target_tokens=4_000_000, weight=1.0),
-            DatasetSpec(source=SMOLTALK_SUMMARIZE, target_tokens=4_000_000, weight=1.0),
-            DatasetSpec(source=SMOLTALK_MAGPIE, target_tokens=2_000_000, weight=1.0),
-            DatasetSpec(source=GSM8K, target_tokens=4_000_000, weight=1.0),
+            DatasetSpec(source=FINEWEB_EDU, target_tokens=1_700_000, weight=1.0),
+            DatasetSpec(source=SQUAD_V2_ANSWERABLE, target_tokens=1_700_000, weight=1.0),
+            DatasetSpec(source=SYNTHQA_ANSWERABLE, target_tokens=1_140_000, weight=1.0),
+            DatasetSpec(source=HOTPOT, target_tokens=860_000, weight=1.0),
+            DatasetSpec(source=SQUAD_V2_CONTRASTIVE, target_tokens=1_140_000, weight=1.0),
+            DatasetSpec(source=SQUAD_V2_UNANSWERABLE, target_tokens=570_000, weight=1.0),
+            DatasetSpec(source=SYNTHQA_CONTRASTIVE, target_tokens=570_000, weight=1.0),
+            DatasetSpec(source=SYNTHQA_UNANSWERABLE, target_tokens=570_000, weight=1.0),
+            DatasetSpec(source=HOTPOT_CONTRASTIVE, target_tokens=860_000, weight=1.0),
+            DatasetSpec(source=SMOLTALK_APIGEN_ALIASED, target_tokens=2_860_000, weight=1.0),
+            DatasetSpec(source=SMOLTALK_APIGEN_DECISION, target_tokens=570_000, weight=1.0),
+            DatasetSpec(source=SMOLTALK_APIGEN_MISSING, target_tokens=860_000, weight=1.0),
+            DatasetSpec(source=SMOLTALK_APIGEN_UNRELATED, target_tokens=860_000, weight=1.0),
+            DatasetSpec(source=WHEN2CALL_ASK, target_tokens=860_000, weight=1.0),
+            DatasetSpec(source=WHEN2CALL_REFUSE, target_tokens=860_000, weight=1.0),
+            DatasetSpec(source=TEAPOT_CHAT, target_tokens=1_140_000, weight=1.0),
+            DatasetSpec(source=SMOLTALK_EVERYDAY, target_tokens=1_140_000, weight=1.0),
+            DatasetSpec(source=SMOLTALK_CONSTRAINTS, target_tokens=860_000, weight=1.0),
+            DatasetSpec(source=SMOLTALK_REWRITE, target_tokens=570_000, weight=1.0),
+            DatasetSpec(source=SMOLTALK_SUMMARIZE, target_tokens=570_000, weight=1.0),
+            DatasetSpec(source=SMOLTALK_MAGPIE, target_tokens=280_000, weight=1.0),
+            DatasetSpec(source=GSM8K, target_tokens=570_000, weight=1.0),
         ],
         eval_datasets=[
             DatasetSpec(source=FINEWEB_EDU, target_tokens=1_000_000),
