@@ -177,7 +177,7 @@ def test_train_script_uses_the_same_constructor():
     assert ("teapotai/synthqa", None) in names
     assert ("teapotai/teapot-chat", None) in names
     assert ("NousResearch/hermes-function-calling-v1", "func_calling") in names
-    assert ("tatsu-lab/alpaca", None) not in names
+    assert ("tatsu-lab/alpaca", None) in names
     answerable = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn and spec.source.chat_template_fn.__name__ == "format_squad_answerable")
     unanswerable = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn and spec.source.chat_template_fn.__name__ == "format_squad_unanswerable")
     contrastive = next(spec.target_tokens for spec in config.sft_datasets if spec.source.chat_template_fn and spec.source.chat_template_fn.__name__ == "format_squad_contrastive")
@@ -195,7 +195,10 @@ def test_train_script_uses_the_same_constructor():
     assert teapot.weight == 4.0
     replay = next(spec.target_tokens for spec in config.sft_datasets if spec.source.name == "HuggingFaceFW/fineweb-edu")
     assert replay == 24_000_000
-    assert sum(spec.target_tokens for spec in config.sft_datasets) == 121_500_000
+    assert sum(spec.target_tokens for spec in config.sft_datasets) == 126_500_000
+    alpaca = next(spec for spec in config.sft_datasets if spec.source.name == "tatsu-lab/alpaca")
+    assert alpaca.target_tokens == 5_000_000
+    assert alpaca.weight == 1.0
     eval_names = [(spec.source.name, spec.source.split) for spec in config.eval_datasets]
     assert ("teapotai/synthqa", "test") in eval_names
     assert ("teapotai/teapot-chat", "train") in eval_names
@@ -1615,19 +1618,22 @@ def test_bridge_checkpoint_gets_a_supervised_copy():
         assert trainer._completed_phases == ["pretrain"]
 
 
-def test_ultrachat_and_alpaca_are_presets_and_not_in_the_mix():
+def test_ultrachat_and_alpaca_are_supervised_presets():
     from train import build_config
     from teapottrainer import ALPACA, ULTRACHAT, ULTRACHAT_TEST
     from teapottrainer.evals import task_kind
     from teapottrainer.formatting import format_alpaca
 
     config = build_config()
-    used = {
-        spec.source.name
-        for spec in config.pretrain_datasets + config.bridge_datasets + config.sft_datasets + config.eval_datasets
-    }
     assert ULTRACHAT.name in {spec.source.name for spec in config.sft_datasets}
-    assert ALPACA.name not in used
+    assert ALPACA.name in {spec.source.name for spec in config.sft_datasets}
+    assert ALPACA.name not in {
+        spec.source.name for spec in config.pretrain_datasets + config.bridge_datasets
+    }
+    eval_rows = [(spec.source.name, spec.source.subset, spec.source.split) for spec in config.eval_datasets]
+    assert ("HuggingFaceH4/ultrachat_200k", None, "test_sft") in eval_rows
+    assert ("HuggingFaceTB/smoltalk", "openhermes-100k", "train") in eval_rows
+    assert ("tatsu-lab/alpaca", None, "train") in eval_rows
     assert ULTRACHAT.split == "train_sft"
     assert ULTRACHAT_TEST.split == "test_sft"
     assert ULTRACHAT.chat_template_fn is messages_format

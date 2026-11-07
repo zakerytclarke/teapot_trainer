@@ -453,7 +453,7 @@ HERMES_FUNCTION_CALLING = DatasetSourceConfig(
     chat_template_fn=format_hermes,
     token_loss_weight_fn=_STOP_WEIGHT,
 )
-# Multi-turn assistant dialogues and single-turn instructions. Not in train.py.
+# Multi-turn assistant dialogues and single-turn instructions.
 ULTRACHAT = DatasetSourceConfig(
     name="HuggingFaceH4/ultrachat_200k",
     split="train_sft",

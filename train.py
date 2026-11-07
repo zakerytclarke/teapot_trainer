@@ -12,7 +12,7 @@ mix spends the new tokens on reading, math, and structured text: FineWeb-Edu
 40%, DCLM-Edu 15%, FineMath 15%, InfiWebMath 10%, Stack-Edu 10%, Cosmopedia
 10%. Every 3B tokens is about 12 hours at 70,463 tokens/s. The trainer saves
 that base checkpoint, scores the holdouts, trains a full supervised copy, and
-then continues the same pretrain optimizer. A copy of the 121.5M-token mix
+then continues the same pretrain optimizer. A copy of the 126.5M-token mix
 is about 5 to 8 hours, so the pair finishes inside a day. Across 66B tokens
 that is 21 interior copies, plus one more from the finished pretrain weights.
 If the FineWeb holdout improves by less than 0.02 nats across 20B tokens,
@@ -24,9 +24,10 @@ worth rereading: FineMath 30%, InfiWebMath 20%, Cosmopedia 20%, FineWeb 15%,
 Stack 15%. That interior checkpoint gets its own supervised copy. The real
 supervised run is the last one, from the finished bridge weights.
 
-Supervised tokens, 121.5M per copy. FineWeb replay is 24M, about 20%, after
+Supervised tokens, 126.5M per copy. FineWeb replay is 24M, about 19%, after
 an 8% replay let FineWeb perplexity jump from 17 to 74. UltraChat is 8M of
-multi-turn dialogue. Teapot chat is 14M and each SynthQA split is weighted 4,
+multi-turn dialogue. Alpaca is 5M, one pass over the instruction set after
+the holdout. Teapot chat is 14M and each SynthQA split is weighted 4,
 with 10M answerable and 6M each of unanswerable and contrastive, so those
 small sets are drawn about as often as the large sources and are not finished
 in the first hour. The rest is passage questions, DROP and CoQA, GSM8K and
@@ -58,6 +59,7 @@ from teapottrainer import (
     DCLM_EDU,
     DROP,
     DROP_VAL,
+    ALPACA,
     DatasetSpec,
     FINEWEB_EDU,
     FINEMATH,
@@ -93,6 +95,7 @@ from teapottrainer import (
     TeapotForCausalLM,
     TeapotTrainer,
     ULTRACHAT,
+    ULTRACHAT_TEST,
     build_rag_config,
     TrainingConfig,
     WHEN2CALL_ASK,
@@ -154,6 +157,8 @@ def build_config() -> TrainingConfig:
         sft_datasets=[
             DatasetSpec(source=FINEWEB_EDU, target_tokens=24_000_000, weight=1.0),
             DatasetSpec(source=ULTRACHAT, target_tokens=8_000_000, weight=1.0),
+            # One pass after the 5% holdout. The set is about 5M supervised tokens.
+            DatasetSpec(source=ALPACA, target_tokens=5_000_000, weight=1.0),
             # Small sets. Weight 4 keeps them in the draw until their budgets fill.
             DatasetSpec(source=TEAPOT_CHAT, target_tokens=14_000_000, weight=4.0),
             DatasetSpec(source=SYNTHQA_ANSWERABLE, target_tokens=10_000_000, weight=4.0),
@@ -192,6 +197,11 @@ def build_config() -> TrainingConfig:
             DatasetSpec(source=COQA_VAL, target_tokens=200_000),
             DatasetSpec(source=GSM8K_TEST, target_tokens=200_000),
             DatasetSpec(source=TEAPOT_CHAT, target_tokens=200_000),
+            # Loss only. UltraChat has a real test split. OpenHermes and Alpaca
+            # are train files, so the scorer uses the same 5% holdout training skips.
+            DatasetSpec(source=ULTRACHAT_TEST, target_tokens=200_000),
+            DatasetSpec(source=SMOLTALK_OPENHERMES, target_tokens=200_000),
+            DatasetSpec(source=ALPACA, target_tokens=200_000),
         ],
         tokenizer="HuggingFaceTB/SmolLM2-135M",
         chat_format="smollm",
@@ -215,7 +225,8 @@ def build_config() -> TrainingConfig:
 def main():
     config = build_config()
     trainer = TeapotTrainer(config=config)
-    trainer.eval_example_cap = 32
+    # 1,000 rows from each task split. Smaller splits are scored whole.
+    trainer.eval_example_cap = 1000
     # 64 sequences of 2,048 tokens. The plateau decision reads this holdout.
     trainer.lm_eval_batches = 64
     # fresh=False continues checkpoints/resume when a previous launch died.
