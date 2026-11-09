@@ -1,6 +1,6 @@
 """Schema lock plus scorers that do not need a GPU."""
 
-from teapottrainer.config import DatasetSpec, ModelConfig, TrainingConfig
+from teapottrainer.config import DatasetSpec, ModelConfig, TrainingConfig, TrainingPhase
 from teapottrainer.datasets import (
     STOP_TOKEN_LOSS_WEIGHT,
     DatasetSourceConfig,
@@ -49,6 +49,7 @@ LOCKED_TRAINING_FIELDS = {
     "holdout_ratio",
     "seed",
     "before_batch",
+    "phases",
 }
 
 
@@ -66,6 +67,8 @@ def test_training_config_fields_are_unchanged():
         "preprocess_fn",
         "chat_template_fn",
         "token_loss_weight_fn",
+        "role",
+        "metric",
     }
     assert set(ModelConfig.model_fields) == {
         "model_type",
@@ -1823,4 +1826,201 @@ def test_supervised_save_writes_the_chat_template():
         trainer.writer.close()
         import shutil
         shutil.rmtree(created, ignore_errors=True)
+
+
+def test_splits_say_train_or_test_and_carry_their_metric():
+    import teapottrainer.datasets as datasets
+    from teapottrainer.datasets import DatasetSourceConfig
+    from teapottrainer.evals import task_kind
+    from teapottrainer.formatting import messages_format
+
+    missing = sorted(
+        name
+        for name, value in vars(datasets).items()
+        if isinstance(value, DatasetSourceConfig) and not value.metric
+    )
+    assert missing == []
+    assert datasets.gsm8k.train is datasets.GSM8K
+    assert datasets.gsm8k.test is datasets.GSM8K_TEST
+    assert datasets.GSM8K.role == "train"
+    assert datasets.GSM8K_TEST.role == "test"
+    assert datasets.squad_v2.validation is datasets.SQUAD_V2_VAL
+    assert datasets.SQUAD_V2_VAL.role == "validation"
+    assert datasets.ULTRACHAT.role == "train"
+    assert datasets.ULTRACHAT_TEST.role == "test"
+    assert task_kind(datasets.GSM8K) == "gsm8k"
+    copied = datasets.gsm8k.train.formatted(messages_format, metric="sft_loss")
+    assert copied.metric == "sft_loss"
+    assert copied.chat_template_fn is messages_format
+    assert copied.token_loss_weight_fn is datasets.GSM8K.token_loss_weight_fn
+    assert datasets.GSM8K.metric == "gsm8k"
+    assert datasets.GSM8K.chat_template_fn is not messages_format
+    assert task_kind(copied) == "sft_loss"
+    whole = datasets.gsm8k.formatted(messages_format)
+    assert whole.train.chat_template_fn is messages_format
+    assert whole.test.role == "test"
+    assert datasets.gsm8k.train.chat_template_fn is not messages_format
+
+
+def test_legacy_fields_build_the_same_phase_recipe():
+    from teapottrainer.phases import phases_from_legacy
+
+    config = TrainingConfig(
+        pretrain_datasets=[DatasetSpec(source="toy", target_tokens=8)],
+        bridge_datasets=[DatasetSpec(source="toy", target_tokens=4)],
+        sft_datasets=[DatasetSpec(source="toy", target_tokens=2)],
+        sft_at_checkpoints=True,
+        compile=False,
+        eval_every_tokens=3,
+        plateau_window_tokens=20,
+        plateau_min_loss_drop=0.02,
+    )
+    phases = phases_from_legacy(config)
+    assert [phase.name for phase in phases] == ["pretrain", "bridge", "sft"]
+    assert phases[0].on_checkpoint[0].__name__ == "fork_sft"
+    assert phases[0].on_complete[0].__name__ == "fork_sft"
+    assert phases[0].early_stop.patience == 1
+    assert phases[0].reset_step is True
+    assert phases[1].lr_scale == 0.1
+    assert phases[1].on_complete == []
+    assert phases[2].fork is True
+    assert phases[2].fork_from == "latest"
+    assert phases[2].load_fork is True
+    assert phases[2].task_eval is False
+
+    only_sft = phases_from_legacy(
+        TrainingConfig(
+            pretrain_datasets=[],
+            sft_datasets=[DatasetSpec(source="toy", target_tokens=2)],
+            compile=False,
+        )
+    )
+    assert [phase.name for phase in only_sft] == ["sft"]
+    assert only_sft[0].fork is False
+    assert only_sft[0].task_eval is True
+    assert only_sft[0].restore_boundary_rng is True
+
+
+def test_explicit_recipe_keeps_the_legacy_run_directory():
+    import os
+    import tempfile
+
+    from train import build_config
+    from teapottrainer.phases import phases_from_legacy, same_recipe
+    from teapottrainer.trainer import TeapotTrainer
+
+    config = build_config()
+    assert [phase.name for phase in config.phases] == ["pretrain", "bridge", "sft"]
+    assert same_recipe(list(config.phases), phases_from_legacy(config), config)
+    assert config.phases[0].token_budget == 66_000_000_000
+    assert config.phases[0].early_stop.window_tokens == 20_000_000_000
+    assert config.phases[1].token_budget == 4_000_000_000
+    assert config.phases[2].token_budget == 126_500_000
+    assert config.phases[2].fork_required is True
+    previous = os.getcwd()
+    workspace = tempfile.mkdtemp()
+    try:
+        os.chdir(workspace)
+        explicit = TeapotTrainer(config)
+        legacy = TeapotTrainer(config.model_copy(update={"phases": []}))
+        try:
+            assert explicit.output_dir == legacy.output_dir
+        finally:
+            explicit.writer.close()
+            legacy.writer.close()
+    finally:
+        os.chdir(previous)
+
+
+def test_a_different_phase_budget_changes_the_run_directory():
+    import os
+    import tempfile
+
+    from teapottrainer.trainer import TeapotTrainer
+
+    def recipe(budget):
+        phase = TrainingPhase(
+            name="sft",
+            datasets=[DatasetSpec(source="toy", target_tokens=10)],
+            token_budget=budget,
+            compile=False,
+            save=False,
+        )
+        return TrainingConfig(
+            tokenizer="hash-probe-phase-budget",
+            compile=False,
+            pretrain_datasets=[],
+            phases=[phase],
+        )
+
+    previous = os.getcwd()
+    workspace = tempfile.mkdtemp()
+    try:
+        os.chdir(workspace)
+        same = TeapotTrainer(recipe(10))
+        omitted = TeapotTrainer(recipe(None))
+        shorter = TeapotTrainer(recipe(4))
+        try:
+            assert same.output_dir == omitted.output_dir
+            assert same.output_dir != shorter.output_dir
+            assert shorter._datasets_for_phase(shorter.config.phases[0])[0].target_tokens == 4
+        finally:
+            same.writer.close()
+            omitted.writer.close()
+            shorter.writer.close()
+    finally:
+        os.chdir(previous)
+
+
+def test_token_budget_scales_the_mix_and_keeps_the_last_token():
+    import os
+    import tempfile
+
+    from teapottrainer.trainer import TeapotTrainer
+
+    previous = os.getcwd()
+    workspace = tempfile.mkdtemp()
+    try:
+        os.chdir(workspace)
+        trainer = TeapotTrainer(TrainingConfig(tokenizer="hash-probe-scale", compile=False, pretrain_datasets=[]))
+        phase = TrainingPhase(
+            name="mix",
+            token_budget=100,
+            datasets=[
+                DatasetSpec(source="a", target_tokens=10),
+                DatasetSpec(source="b", target_tokens=30),
+            ],
+        )
+        try:
+            scaled = trainer._datasets_for_phase(phase)
+        finally:
+            trainer.writer.close()
+    finally:
+        os.chdir(previous)
+    assert [spec.target_tokens for spec in scaled] == [25, 75]
+
+
+def test_early_stop_patience_waits_for_a_second_flat_window():
+    import os
+    import tempfile
+
+    from teapottrainer.config import EarlyStop
+    from teapottrainer.trainer import TeapotTrainer
+
+    previous = os.getcwd()
+    workspace = tempfile.mkdtemp()
+    try:
+        os.chdir(workspace)
+        trainer = TeapotTrainer(TrainingConfig(tokenizer="patience-probe", compile=False, pretrain_datasets=[]))
+        rule = EarlyStop(metric="fineweb", window_tokens=20, min_delta=0.02, patience=2)
+        try:
+            assert trainer._early_stop(10, {"fineweb-edu/train/loss": 3.0}, rule, "pretrain") is False
+            assert trainer._early_stop(30, {"fineweb-edu/train/loss": 2.90}, rule, "pretrain") is False
+            assert trainer._early_stop(50, {"fineweb-edu/train/loss": 2.89}, rule, "pretrain") is False
+            assert trainer._plateau_stalls == 1
+            assert trainer._early_stop(70, {"fineweb-edu/train/loss": 2.88}, rule, "pretrain") is True
+        finally:
+            trainer.writer.close()
+    finally:
+        os.chdir(previous)
 

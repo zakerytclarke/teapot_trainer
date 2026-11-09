@@ -1,8 +1,8 @@
 """Held-out evals for assistant, tool, and RAG behavior.
 
-Task choice comes from the dataset name and subset, so ``DatasetSpec`` does
-not grow a new field. Generation is greedy. Loss is reported beside the task
-scores, not instead of them.
+A dataset's ``metric`` selects the scorer. When it is unset, the dataset name
+and subset still decide, so older sources keep their eval. Generation is
+greedy. Loss is reported beside the task scores, not instead of them.
 """
 
 from __future__ import annotations
@@ -31,6 +31,9 @@ from .metrics import (
 
 
 def task_kind(src: DatasetSourceConfig) -> str:
+    metric = getattr(src, "metric", None)
+    if metric:
+        return str(metric)
     name = (src.name or "").lower()
     subset = (src.subset or "").lower()
     if "berkeley-function-calling" in name or "berkeley_function_calling" in name:

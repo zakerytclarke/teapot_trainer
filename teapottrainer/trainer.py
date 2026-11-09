@@ -1,6 +1,8 @@
-"""Sequential pretrain then SFT.
+"""Run a recipe of training phases, then save the last weights.
 
 The public surface is still ``TeapotTrainer(TrainingConfig).train(fresh=True)``.
+``config.phases`` is the recipe. When it is empty, the pretrain, bridge, and
+supervised dataset lists are that recipe.
 ``fresh=False`` continues from ``checkpoints/resume`` when that directory
 exists: weights, optimizer, and the exact sample cursor. The cursor is
 rebuilt by replaying the seeded mixture from the start of the phase, then
@@ -42,7 +44,12 @@ disable_hub_progress()
 from transformers import AutoModelForCausalLM, AutoTokenizer, GPT2Config, GPT2LMHeadModel, LlamaConfig, LlamaForCausalLM
 
 from .chat_formats import get_chat_format, pop_chat_format, push_chat_format, single_token_id
-from .config import TrainingConfig
+from .config import TrainingConfig, TrainingPhase
+from .phases import phases_from_legacy, phase_view, same_recipe
+
+# A phase hook of None means "use the config hook", which is different from
+# a phase that explicitly runs nothing.
+_INHERIT = object()
 from .datasets import (
     SPAN_TOKEN_LOSS_WEIGHT,
     STOP_TOKEN_LOSS_WEIGHT,
@@ -244,12 +251,21 @@ class TeapotTrainer:
         self._checkpointing = False
         self.lm_eval_batches = 16
         self._plateau_history: list[list[float]] = []
+        self._plateau_stalls = 0
+        self._plateau_phase: str | None = None
+        self._active_eval_datasets = None
+        self._phase_before_batch = _INHERIT
 
         tokenizer_short = self.config.tokenizer.split("/")[-1]
         safe_dict = self.config.model_dump(exclude_defaults=True)
         # This flag only decides whether copies are fine-tuned at checkpoints.
         # It must not fork the run directory, or a resume would miss its weights.
         safe_dict.pop("sft_at_checkpoints", None)
+        # The same recipe written as phases= keeps the directory the older
+        # fields would have hashed. A different order or budget is part of the id.
+        safe_dict.pop("phases", None)
+        if self.config.phases and not same_recipe(list(self.config.phases), phases_from_legacy(self.config), self.config):
+            safe_dict["phases"] = [phase_view(phase, self.config) for phase in self.config.phases]
 
         def freeze(value):
             if isinstance(value, dict):
@@ -363,12 +379,25 @@ class TeapotTrainer:
 
     def _plateau_reached(self, tokens: int, metrics: dict) -> bool:
         """True when the FineWeb holdout has stopped moving across the window."""
-        window = int(self.config.plateau_window_tokens or 0)
+        from .config import EarlyStop
+
+        rule = EarlyStop(
+            metric="fineweb",
+            window_tokens=int(self.config.plateau_window_tokens or 0),
+            min_delta=float(self.config.plateau_min_loss_drop),
+            patience=1,
+        )
+        return self._early_stop(tokens, metrics, rule, "pretrain")
+
+    def _early_stop(self, tokens: int, metrics: dict, rule, phase_name: str) -> bool:
+        """True when ``rule`` has seen ``patience`` flat windows in a row."""
+        window = 0 if rule is None else int(rule.window_tokens or 0)
         if window <= 0:
             return False
+        needle = str(rule.metric or "").lower()
         loss = None
         for key, value in metrics.items():
-            if key.endswith("/loss") and "fineweb" in key:
+            if key.endswith("/loss") and needle in key.lower():
                 loss = float(value)
                 break
         if loss is None:
@@ -384,11 +413,26 @@ class TeapotTrainer:
         if baseline is None:
             return False
         drop = baseline[1] - loss
-        if drop >= float(self.config.plateau_min_loss_drop):
+        if drop >= float(rule.min_delta):
+            self._plateau_stalls = 0
+            return False
+        self._plateau_stalls = int(getattr(self, "_plateau_stalls", 0)) + 1
+        patience = max(1, int(rule.patience or 1))
+        if self._plateau_stalls < patience:
+            print(
+                f"{phase_name} holdout moved {drop:.4f} nats over {tokens - baseline[0]:,.0f} tokens "
+                f"(from {baseline[1]:.4f} to {loss:.4f}), under {rule.min_delta}. "
+                f"Patience {self._plateau_stalls}/{patience}."
+            )
             return False
         print(
             f"Pretrain holdout moved {drop:.4f} nats over {tokens - baseline[0]:,.0f} tokens "
-            f"(from {baseline[1]:.4f} to {loss:.4f}), under {self.config.plateau_min_loss_drop}. Stopping pretrain."
+            f"(from {baseline[1]:.4f} to {loss:.4f}), under {rule.min_delta}. Stopping pretrain."
+            if phase_name == "pretrain"
+            else (
+                f"{phase_name} holdout moved {drop:.4f} nats over {tokens - baseline[0]:,.0f} tokens "
+                f"(from {baseline[1]:.4f} to {loss:.4f}), under {rule.min_delta}. Stopping {phase_name}."
+            )
         )
         return True
 
@@ -444,24 +488,13 @@ class TeapotTrainer:
             if isinstance(source, str):
                 src = DatasetSourceConfig(name=source)
             else:
-                src = DatasetSourceConfig(
-                    name=source.name,
-                    subset=source.subset,
-                    split=source.split,
-                    text_column=source.text_column,
-                    is_sft=source.is_sft,
-                    preprocess_fn=source.preprocess_fn,
-                    chat_template_fn=source.chat_template_fn,
-                    token_loss_weight_fn=source.token_loss_weight_fn,
-                    target_tokens=spec.target_tokens,
-                    weight=spec.weight,
-                )
+                src = source.model_copy(update={"target_tokens": spec.target_tokens, "weight": spec.weight})
             sources.append(src)
         return sources
 
     def _before_batch_hooks(self):
         """The functions that may edit model.config for the next batch."""
-        hook = self.config.before_batch
+        hook = self.config.before_batch if self._phase_before_batch is _INHERIT else self._phase_before_batch
         if hook is None:
             return []
         if callable(hook):
@@ -711,12 +744,13 @@ class TeapotTrainer:
         print("\n" + "=" * 78)
         print(f" EVAL  {phase_name}  step {global_step}")
         print("=" * 78)
-        if not self.config.eval_datasets:
+        eval_specs = self._active_eval_datasets if self._active_eval_datasets is not None else self.config.eval_datasets
+        if not eval_specs:
             print(" No eval datasets configured.")
             print("=" * 78 + "\n")
             return flat
 
-        for spec in self.config.eval_datasets:
+        for spec in eval_specs:
             sources = self._materialize_sources([spec])
             src = sources[0]
             kind = task_kind(src)
@@ -840,6 +874,7 @@ class TeapotTrainer:
         payload["best_loss"] = self.best_loss
         payload["best_behavior"] = self.best_behavior
         payload["plateau_history"] = list(getattr(self, "_plateau_history", []))
+        payload["plateau_stalls"] = int(getattr(self, "_plateau_stalls", 0))
         with open(os.path.join(temporary, "trainer_state.json"), "w", encoding="utf-8") as handle:
             json.dump(payload, handle)
         previous = directory + ".old"
@@ -922,23 +957,36 @@ class TeapotTrainer:
         print(f"Fast-forward complete at {sum(produced):,} tokens.")
 
     def _sft_from_base_checkpoint(
-        self, model, tokenizer, phase_name: str, global_step: int, required: bool = False
+        self,
+        model,
+        tokenizer,
+        phase_name: str,
+        global_step: int,
+        required: bool = False,
+        mix=None,
+        peak_lr: float | None = None,
+        allow_any_name: bool = False,
+        honor_flag: bool = True,
+        label_suffix: str = "sft",
     ) -> None:
-        """Fine-tune a copy of a saved base checkpoint on the full SFT mix.
+        """Fine-tune a copy of a saved base checkpoint on a supervised mix.
 
         The live pretrain weights, optimizer, mixture cursor, and resume file
         stay where they are. The copy is written to ``checkpoints/<phase>_sft``
         with the held-out metrics from the finished supervised run.
         ``required`` runs the copy even when ``sft_at_checkpoints`` is off, which
         is how the end-of-run SFT stays the same pass as these checkpoints.
+        ``mix`` selects a different supervised phase than ``config.sft_datasets``.
         """
-        if not self.config.sft_datasets:
+        datasets = list(self.config.sft_datasets if mix is None else mix)
+        if not datasets:
             return
-        if not required and not self.config.sft_at_checkpoints:
+        if honor_flag and not required and not self.config.sft_at_checkpoints:
             return
-        if phase_name != "bridge" and not phase_name.startswith("pretrain") and not phase_name.startswith("bridge_"):
+        base_name = phase_name == "bridge" or phase_name.startswith("pretrain") or phase_name.startswith("bridge_")
+        if not allow_any_name and not base_name:
             return
-        label = f"{phase_name}_sft"
+        label = f"{phase_name}_{label_suffix}"
         directory = os.path.join(self.output_dir, "checkpoints", label)
         if os.path.isfile(os.path.join(directory, "metrics.json")):
             print(f"SFT checkpoint already saved at {directory}")
@@ -969,11 +1017,11 @@ class TeapotTrainer:
                 except TypeError:
                     side.gradient_checkpointing_enable()
                 side.config.use_cache = False
-            sft_lr = self._supervised_lr()
+            sft_lr = self._supervised_lr() if peak_lr is None else float(peak_lr)
             print(f"SFT copy peak lr is {sft_lr:.3e}.")
             self._train_phase(
                 label,
-                list(self.config.sft_datasets),
+                datasets,
                 side,
                 tokenizer,
                 global_step,
@@ -1029,6 +1077,11 @@ class TeapotTrainer:
         final_phase_name: str | None = None,
         metric_group: str = "eval",
         metric_step: int | None = None,
+        *,
+        every_tokens: int | None = None,
+        every_percent: float | None = None,
+        on_checkpoint=None,
+        early_stop=None,
     ):
         if not dataset_specs:
             return starting_step
@@ -1061,8 +1114,12 @@ class TeapotTrainer:
         first_loss = None
         last_loss = None
         best_train_loss = None
-        every_tokens = int(self.config.eval_every_tokens or 0)
-        next_eval = float(every_tokens if every_tokens > 0 else self.config.eval_every_percent)
+        if every_tokens is None:
+            every_tokens = int(self.config.eval_every_tokens or 0)
+        else:
+            every_tokens = int(every_tokens)
+        percent_step = float(self.config.eval_every_percent if every_percent is None else every_percent)
+        next_eval = float(every_tokens if every_tokens > 0 else percent_step)
         if resume:
             tokens = int(resume["tokens"])
             samples_target = int(resume["samples_taken"])
@@ -1151,7 +1208,7 @@ class TeapotTrainer:
                         total_tokens,
                         next_eval,
                         every_tokens,
-                        float(self.config.eval_every_percent),
+                        percent_step,
                     )
                     if eval_during and due:
                         progress.write(f"\n[eval at {tokens:,} tokens]")
@@ -1159,16 +1216,27 @@ class TeapotTrainer:
                         flat = self.run_evaluation_suite(
                             model, tokenizer, checkpoint_name, global_step, update_best=update_best
                         )
-                        plateau = phase_name == "pretrain" and self._plateau_reached(tokens, flat)
-                        if phase_name in ("pretrain", "bridge"):
-                            self._sft_from_base_checkpoint(model, tokenizer, checkpoint_name, global_step)
+                        if early_stop is not None:
+                            plateau = self._early_stop(tokens, flat, early_stop, phase_name)
+                        elif phase_name == "pretrain":
+                            plateau = self._plateau_reached(tokens, flat)
+                        else:
+                            plateau = False
+                        if on_checkpoint is None:
+                            if phase_name in ("pretrain", "bridge"):
+                                self._sft_from_base_checkpoint(model, tokenizer, checkpoint_name, global_step)
+                        else:
+                            self._run_hooks(on_checkpoint, model, tokenizer, checkpoint_name, global_step)
                         if every_tokens > 0:
                             next_eval += every_tokens
                         else:
-                            next_eval += self.config.eval_every_percent
+                            next_eval += percent_step
                         model.train()
                         if plateau:
-                            progress.write("\n[pretrain plateau, stopping this phase]")
+                            if phase_name == "pretrain":
+                                progress.write("\n[pretrain plateau, stopping this phase]")
+                            else:
+                                progress.write(f"\n[{phase_name} early stop, stopping this phase]")
                             break
                     # After eval, so the saved generator and eval cursor include it.
                     if persist_resume and tokens >= next_resume_tokens:
@@ -1255,6 +1323,222 @@ class TeapotTrainer:
             )
         return global_step
 
+    def _active_phases(self) -> list[TrainingPhase]:
+        if self.config.phases:
+            return list(self.config.phases)
+        return phases_from_legacy(self.config)
+
+    def _run_hooks(self, hooks, model, tokenizer, checkpoint_name: str, step: int) -> None:
+        if hooks is None:
+            return
+        if callable(hooks):
+            hooks = [hooks]
+        for hook in hooks:
+            hook(self, model, tokenizer, checkpoint_name, step)
+
+    def _datasets_for_phase(self, phase: TrainingPhase):
+        specs = list(phase.datasets)
+        budget = phase.token_budget
+        if not budget:
+            return specs
+        total = sum(int(spec.target_tokens) for spec in specs)
+        if total == int(budget) or total <= 0:
+            return specs
+        scaled = []
+        remaining = int(budget)
+        for index, spec in enumerate(specs):
+            if index == len(specs) - 1:
+                tokens = remaining
+            else:
+                tokens = int(round(int(budget) * int(spec.target_tokens) / total))
+                remaining -= tokens
+            scaled.append(spec.model_copy(update={"target_tokens": max(int(tokens), 1)}))
+        return scaled
+
+    def _phase_peak_lr(self, phase: TrainingPhase) -> float:
+        if phase.lr is not None:
+            return float(phase.lr)
+        if phase.lr_scale is not None:
+            return float(self.config.lr) * float(phase.lr_scale)
+        if phase.fork or phase.name == "sft" or str(phase.name).endswith("_sft"):
+            return self._supervised_lr()
+        return float(self.config.lr)
+
+    def _use_phase_context(self, phase: TrainingPhase) -> None:
+        self._active_eval_datasets = None if phase.eval_datasets is None else list(phase.eval_datasets)
+        self._phase_before_batch = _INHERIT if phase.before_batch is None else phase.before_batch
+
+    def _clear_phase_context(self) -> None:
+        self._active_eval_datasets = None
+        self._phase_before_batch = _INHERIT
+
+    def fork_training_phase(
+        self,
+        phase: TrainingPhase,
+        model,
+        tokenizer,
+        checkpoint_name: str,
+        step: int,
+        required: bool = False,
+    ) -> None:
+        """Train ``phase`` as a copy of ``checkpoint_name`` and leave ``model`` as it was."""
+        previous_eval = self._active_eval_datasets
+        previous_hook = self._phase_before_batch
+        self._use_phase_context(phase)
+        try:
+            self._sft_from_base_checkpoint(
+                model,
+                tokenizer,
+                checkpoint_name,
+                step,
+                required=required,
+                mix=list(phase.datasets),
+                peak_lr=self._phase_peak_lr(phase),
+                allow_any_name=True,
+                honor_flag=False,
+                label_suffix=phase.name,
+            )
+        finally:
+            self._active_eval_datasets = previous_eval
+            self._phase_before_batch = previous_hook
+
+    def _done_message(self, name: str) -> str:
+        if name == "pretrain":
+            return "Pretrain is already complete in the resume checkpoint."
+        if name == "bridge":
+            return "Bridge is already complete in the resume checkpoint."
+        if name == "sft":
+            return "Supervised training is already complete in the resume checkpoint."
+        return f"{name} is already complete in the resume checkpoint."
+
+    def _ensure_saved(self, model, tokenizer, name: str) -> str:
+        directory = os.path.join(self.output_dir, "checkpoints", name)
+        if not os.path.isfile(os.path.join(directory, "config.json")):
+            self._save_weights(model, tokenizer, directory)
+            print(f"Saved {name} weights to {directory}")
+        return directory
+
+    def _run_inline_phase(self, phase: TrainingPhase, model, tokenizer, global_step: int, resume):
+        if self.config.compile and (phase.name == "sft" or str(phase.name).endswith("_sft")):
+            print(
+                "SFT stays eager. Variable-length chats crash torch.compile "
+                "after it specializes on the first padded width."
+            )
+        if phase.name in self._completed_phases:
+            print(self._done_message(phase.name))
+            model = _unwrap(model)
+            if phase.on_complete:
+                self._ensure_saved(model, tokenizer, phase.name)
+                self._run_hooks(phase.on_complete, model, tokenizer, phase.name, global_step)
+            return model, global_step
+
+        model = _unwrap(model)
+        training_model = model
+        if phase.compile and hasattr(torch, "compile") and self.device.type == "cuda":
+            print("Compiling model with torch.compile() for fixed-length pretraining.")
+            training_model = torch.compile(model)
+        elif phase.name == "bridge":
+            print("Bridge stays eager so the loop count can change on every batch.")
+        peak = self._phase_peak_lr(phase)
+        if phase.name == "bridge" and phase.lr_scale == 0.1:
+            print(f"Bridge peak lr is 0.1x config.lr ({peak:.3e}).")
+        phase_resume = None
+        if resume and not resume.get("phase_done") and resume.get("phase") == phase.name:
+            phase_resume = resume
+        if phase_resume is None and phase.restore_boundary_rng:
+            self._restore_phase_boundary_rng()
+        # Patience belongs to this phase. A later phase must not inherit a stall
+        # counted on an earlier holdout. Resuming this phase keeps its history.
+        if phase.early_stop is not None:
+            if phase_resume is None and self._plateau_phase not in (None, phase.name):
+                self._plateau_history = []
+                self._plateau_stalls = 0
+            self._plateau_phase = phase.name
+        starting = global_step if phase_resume else (0 if phase.reset_step else global_step)
+        self._use_phase_context(phase)
+        try:
+            global_step = self._train_phase(
+                phase.name,
+                self._datasets_for_phase(phase),
+                training_model,
+                tokenizer,
+                starting,
+                peak_lr=peak,
+                task_eval=phase.task_eval,
+                resume=phase_resume,
+                eval_during=phase.eval_during,
+                every_tokens=int(phase.checkpoint.every_tokens or 0),
+                every_percent=float(phase.checkpoint.every_percent),
+                on_checkpoint=list(phase.on_checkpoint),
+                early_stop=phase.early_stop,
+            )
+        finally:
+            self._clear_phase_context()
+        model = _unwrap(training_model)
+        if phase.save:
+            directory = os.path.join(self.output_dir, "checkpoints", phase.name)
+            self._save_weights(model, tokenizer, directory)
+            print(f"Saved {phase.name} weights to {directory}")
+        self._run_hooks(phase.on_complete, model, tokenizer, phase.name, global_step)
+        return model, global_step
+
+    def _run_fork_phase(self, phase: TrainingPhase, model, tokenizer, global_step: int, resume):
+        if self.config.compile and (phase.name == "sft" or str(phase.name).endswith("_sft")):
+            print(
+                "SFT stays eager. Variable-length chats crash torch.compile "
+                "after it specializes on the first padded width."
+            )
+        if phase.name in self._completed_phases:
+            print(self._done_message(phase.name))
+            return _unwrap(model), global_step
+        if resume and not resume.get("phase_done") and resume.get("phase") == phase.name:
+            print("In-progress SFT resume is unused. The final pass reruns the full checkpoint copy.")
+        model = _unwrap(model)
+        if phase.fork_from in (None, "latest"):
+            if any(item.name == "pretrain" and not item.fork for item in self._active_phases()):
+                self._ensure_saved(model, tokenizer, "pretrain")
+            bridge_dir = os.path.join(self.output_dir, "checkpoints", "bridge")
+            base = "bridge" if os.path.isfile(os.path.join(bridge_dir, "config.json")) else "pretrain"
+        else:
+            base = phase.fork_from
+        self.fork_training_phase(phase, model, tokenizer, base, global_step, required=True)
+        if not phase.load_fork:
+            if phase.name not in self._completed_phases:
+                self._completed_phases.append(phase.name)
+            return model, global_step
+        sft_dir = os.path.join(self.output_dir, "checkpoints", f"{base}_{phase.name}")
+        if not os.path.isfile(os.path.join(sft_dir, "config.json")):
+            raise SystemExit(f"Final SFT did not write {sft_dir}.")
+        model = AutoModelForCausalLM.from_pretrained(sft_dir, dtype=torch.float32, trust_remote_code=True)
+        align_tokenizer_ids(model, tokenizer)
+        model.to(self.device)
+        finished_key = f"{base}_{phase.name}"
+        if finished_key in self.phase_stats:
+            self.phase_stats[phase.name] = self.phase_stats[finished_key]
+        if phase.name not in self._completed_phases:
+            self._completed_phases.append(phase.name)
+        self._write_resume(
+            model,
+            tokenizer,
+            None,
+            {
+                "phase": phase.name,
+                "phase_done": True,
+                "completed_phases": list(self._completed_phases),
+                "tokens": 0,
+                "samples_taken": 0,
+                "produced": [],
+                "restarts": [],
+                "global_step": global_step,
+                "micro_steps": 0,
+                "next_eval": float(phase.checkpoint.every_percent),
+                "first_loss": None,
+                "best_train_loss": (self.phase_stats.get(phase.name) or {}).get("best_train_loss"),
+                "peak_lr": self._phase_peak_lr(phase),
+            },
+        )
+        return model, global_step
+
     def train(self, fresh: bool = True, init_from: str | None = None):
         # Supervised rendering uses this format. Pretrain packing never reads it.
         token = push_chat_format(self.config.chat_format)
@@ -1289,6 +1573,9 @@ class TeapotTrainer:
                 f"({resume.get('phase')}{finished}, {int(resume.get('tokens') or 0):,} tokens)."
             )
             self._plateau_history = [list(item) for item in resume.get("plateau_history") or []]
+            self._plateau_stalls = int(resume.get("plateau_stalls") or 0)
+            if self._plateau_history:
+                self._plateau_phase = resume.get("phase")
             model = self._load_model_weights(resume["dir"], tokenizer)
         # A train() argument overrides the config field. Either one is used
         # before pretrain or supervised training starts.
@@ -1314,134 +1601,13 @@ class TeapotTrainer:
         print(f"Run directory: {self.output_dir}")
         print(f"TensorBoard: {self.writer.log_dir}")
         global_step = int(resume["global_step"]) if resume else 0
-        pretrain = list(self.config.pretrain_datasets or [])
-        sft = list(self.config.sft_datasets or [])
-        if pretrain and "pretrain" not in self._completed_phases:
-            # Pretrain sequences are always seq_len, so one compiled graph is stable.
-            # SFT chats are not, and compile then asserts on a later padded width.
-            training_model = model
-            if self.config.compile and hasattr(torch, "compile") and self.device.type == "cuda":
-                print("Compiling model with torch.compile() for fixed-length pretraining.")
-                training_model = torch.compile(model)
-            pretrain_resume = resume if resume and not resume.get("phase_done") and resume.get("phase") == "pretrain" else None
-            global_step = self._train_phase(
-                "pretrain",
-                pretrain,
-                training_model,
-                tokenizer,
-                global_step if pretrain_resume else 0,
-                peak_lr=self.config.lr,
-                # No suite before the first token. Later suites score holdouts and tasks.
-                task_eval=False,
-                resume=pretrain_resume,
-            )
-            model = _unwrap(training_model)
-            pretrain_dir = os.path.join(self.output_dir, "checkpoints", "pretrain")
-            self._save_weights(model, tokenizer, pretrain_dir)
-            print(f"Saved pretrain weights to {pretrain_dir}")
-        elif resume and "pretrain" in self._completed_phases:
-            print("Pretrain is already complete in the resume checkpoint.")
-            model = _unwrap(model)
-        if pretrain and "pretrain" in self._completed_phases and self.config.sft_at_checkpoints:
-            # The daily copies cover the interior. This one is the finished base,
-            # before the bridge moves those weights.
-            pretrain_dir = os.path.join(self.output_dir, "checkpoints", "pretrain")
-            if not os.path.isfile(os.path.join(pretrain_dir, "config.json")):
-                self._save_weights(model, tokenizer, pretrain_dir)
-                print(f"Saved pretrain weights to {pretrain_dir}")
-            self._sft_from_base_checkpoint(model, tokenizer, "pretrain", global_step)
-        bridge = list(self.config.bridge_datasets or [])
-        if bridge and "bridge" not in self._completed_phases:
-            # Fixed length, but the loop count changes every batch, so one
-            # compiled graph would not stay valid.
-            print("Bridge stays eager so the loop count can change on every batch.")
-            model = _unwrap(model)
-            bridge_resume = resume if resume and not resume.get("phase_done") and resume.get("phase") == "bridge" else None
-            bridge_lr = self.config.lr * 0.1
-            print(f"Bridge peak lr is 0.1x config.lr ({bridge_lr:.3e}).")
-            global_step = self._train_phase(
-                "bridge",
-                bridge,
-                model,
-                tokenizer,
-                global_step,
-                peak_lr=bridge_lr,
-                task_eval=False,
-                resume=bridge_resume,
-            )
-            bridge_dir = os.path.join(self.output_dir, "checkpoints", "bridge")
-            self._save_weights(model, tokenizer, bridge_dir)
-            print(f"Saved bridge weights to {bridge_dir}")
-        elif resume and "bridge" in self._completed_phases:
-            print("Bridge is already complete in the resume checkpoint.")
-            model = _unwrap(model)
-        if sft:
-            if self.config.compile:
-                print(
-                    "SFT stays eager. Variable-length chats crash torch.compile "
-                    "after it specializes on the first padded width."
-                )
-            if "sft" in self._completed_phases:
-                print("Supervised training is already complete in the resume checkpoint.")
-            elif pretrain:
-                # The 100% pass is the same copy as pretrain_10pct_sft: load the
-                # saved base, train a fresh model on the full SFT mix, score it once.
-                pretrain_dir = os.path.join(self.output_dir, "checkpoints", "pretrain")
-                if not os.path.isfile(os.path.join(pretrain_dir, "config.json")):
-                    self._save_weights(model, tokenizer, pretrain_dir)
-                    print(f"Saved pretrain weights to {pretrain_dir}")
-                if resume and not resume.get("phase_done") and resume.get("phase") == "sft":
-                    print("In-progress SFT resume is unused. The final pass reruns the full checkpoint copy.")
-                bridge_dir = os.path.join(self.output_dir, "checkpoints", "bridge")
-                base_phase = "bridge" if os.path.isfile(os.path.join(bridge_dir, "config.json")) else "pretrain"
-                self._sft_from_base_checkpoint(model, tokenizer, base_phase, global_step, required=True)
-                sft_dir = os.path.join(self.output_dir, "checkpoints", f"{base_phase}_sft")
-                if not os.path.isfile(os.path.join(sft_dir, "config.json")):
-                    raise SystemExit(f"Final SFT did not write {sft_dir}.")
-                model = AutoModelForCausalLM.from_pretrained(sft_dir, dtype=torch.float32, trust_remote_code=True)
-                align_tokenizer_ids(model, tokenizer)
-                model.to(self.device)
-                finished_key = f"{base_phase}_sft"
-                if finished_key in self.phase_stats:
-                    self.phase_stats["sft"] = self.phase_stats[finished_key]
-                if "sft" not in self._completed_phases:
-                    self._completed_phases.append("sft")
-                self._write_resume(
-                    model,
-                    tokenizer,
-                    None,
-                    {
-                        "phase": "sft",
-                        "phase_done": True,
-                        "completed_phases": list(self._completed_phases),
-                        "tokens": 0,
-                        "samples_taken": 0,
-                        "produced": [],
-                        "restarts": [],
-                        "global_step": global_step,
-                        "micro_steps": 0,
-                        "next_eval": float(self.config.eval_every_percent),
-                        "first_loss": None,
-                        "best_train_loss": (self.phase_stats.get("sft") or {}).get("best_train_loss"),
-                        "peak_lr": self._supervised_lr(),
-                    },
-                )
+        for phase in self._active_phases():
+            if phase.fork:
+                model, global_step = self._run_fork_phase(phase, model, tokenizer, global_step, resume)
             else:
-                sft_resume = resume if resume and not resume.get("phase_done") and resume.get("phase") == "sft" else None
-                if sft_resume is None:
-                    self._restore_phase_boundary_rng()
-                global_step = self._train_phase(
-                    "sft",
-                    sft,
-                    model,
-                    tokenizer,
-                    global_step,
-                    peak_lr=self._supervised_lr(),
-                    task_eval=True,
-                    resume=sft_resume,
-                )
+                model, global_step = self._run_inline_phase(phase, model, tokenizer, global_step, resume)
 
-        self._save_chat = "sft" in self._completed_phases
+        self._save_chat = any(self._phase_uses_chat(name) for name in self._completed_phases)
         self._save_weights(model, tokenizer, self.output_dir)
         with open(os.path.join(self.output_dir, "phase_stats.json"), "w", encoding="utf-8") as handle:
             json.dump(self.phase_stats, handle, indent=2)
