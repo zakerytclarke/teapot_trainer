@@ -1,6 +1,6 @@
 # teapottrainer
 
-`teapottrainer` is a config-driven library for pretraining and supervised fine-tuning of causal language models. You describe the model, the dataset mix, and the token budgets. `TeapotTrainer` runs pretraining, then supervised training, and can resume from the last checkpoint.
+`teapottrainer` is a config-driven library for pretraining and supervised fine-tuning of causal language models. You describe the model and a recipe of training phases. Each phase has a dataset mix, a token budget, checkpoints, and hooks. `TeapotTrainer` runs that list in order and can resume from the last checkpoint.
 
 The from-scratch month run in `train.py` is written up in [Month-long 135M run](#month-long-135m-run).
 
@@ -12,14 +12,29 @@ pip install teapottrainer
 
 ```python
 from teapottrainer import (
+    CheckpointRule,
     DatasetSpec,
-    FINEWEB_EDU,
-    GSM8K,
+    EarlyStop,
     ModelConfig,
     TeapotTrainer,
     TrainingConfig,
+    TrainingPhase,
+    fineweb_edu,
+    fork_phase,
+    gsm8k,
 )
 
+supervised = TrainingPhase(
+    name="sft",
+    token_budget=4_000_000,
+    datasets=[DatasetSpec(source=gsm8k.train, target_tokens=4_000_000)],
+    eval_datasets=[DatasetSpec(source=gsm8k.test, target_tokens=200_000)],
+    lr=1e-4,
+    compile=False,
+    fork=True,
+    fork_from="latest",
+    load_fork=True,
+)
 config = TrainingConfig(
     model=ModelConfig(
         model_type="llama",
@@ -30,25 +45,36 @@ config = TrainingConfig(
         intermediate=2048,
         seq_len=2048,
     ),
-    pretrain_datasets=[
-        DatasetSpec(source=FINEWEB_EDU, target_tokens=1_000_000_000),
-    ],
-    sft_datasets=[
-        DatasetSpec(source=GSM8K, target_tokens=4_000_000),
+    phases=[
+        TrainingPhase(
+            name="pretrain",
+            token_budget=1_000_000_000,
+            datasets=[DatasetSpec(source=fineweb_edu.train, target_tokens=1_000_000_000)],
+            eval_datasets=supervised.eval_datasets,
+            lr=5e-4,
+            checkpoint=CheckpointRule(every_tokens=200_000_000),
+            early_stop=EarlyStop(metric="fineweb", window_tokens=400_000_000, min_delta=0.02, patience=1),
+            on_checkpoint=[fork_phase(supervised)],
+            on_complete=[fork_phase(supervised)],
+        ),
+        supervised,
     ],
     tokenizer="HuggingFaceTB/SmolLM2-135M",
     batch_size=4,
     grad_accum=8,
-    lr=5e-4,
 )
 
 trainer = TeapotTrainer(config)
 trainer.train(fresh=True)
 ```
 
-`train(fresh=False)` continues from `checkpoints/resume` in the run directory: weights, optimizer, and the sample cursor. Pass `init_from` to start from an existing Hugging Face model or a local checkpoint instead of randomly initialized weights.
+`gsm8k.train` and `gsm8k.test` are the two splits. `gsm8k.train.formatted(...)` copies a split with a different prompt, loss weight, or metric. The metric on the split is the eval that runs.
 
-Set `sft_at_checkpoints=True` to fine-tune a copy of the base model at each pretrain eval and save that copy beside the base weights. Pretraining keeps going from the base model.
+`on_checkpoint` runs after each interior save. `fork_phase` trains the supervised mix from that checkpoint and leaves the live model on the pretrain optimizer. `on_complete` is the same hook for the finished phase, which is the save the token interval does not fire. `early_stop` ends the phase after `patience` flat windows.
+
+The older `pretrain_datasets`, `bridge_datasets`, and `sft_datasets` fields still build this same shape, including `sft_at_checkpoints=True`.
+
+`train(fresh=False)` continues from `checkpoints/resume` in the run directory: weights, optimizer, and the sample cursor. Pass `init_from` to start from an existing Hugging Face model or a local checkpoint instead of randomly initialized weights.
 
 Runs are written under `./runs/`. Loss and task scores go to TensorBoard and to `metrics.jsonl` in the run directory.
 
@@ -190,9 +216,9 @@ print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 
 ## Datasets
 
-Preset sources live on the package: `FINEWEB_EDU`, `DCLM_EDU`, `STACK_EDU`, `FINEMATH`, `GSM8K`, `SQUAD_V2`, `HOTPOT`, `SYNTHQA`, `TEAPOT_CHAT`, the SmolTalk subsets, and the reading, tool-calling, and instruction-following evals. A `DatasetSpec` assigns a source a token budget and a mix weight.
+Preset corpora live on the package: `fineweb_edu`, `gsm8k`, `squad_v2`, `hotpot`, `synthqa`, `drop`, `coqa`, and the SmolTalk subsets. Use `.train`, `.validation`, or `.test`. The uppercase names (`GSM8K`, `GSM8K_TEST`) are those same splits. A `DatasetSpec` assigns a split a token budget and a mix weight.
 
-To add a source, build a `DatasetSourceConfig` with a `chat_template_fn` that returns a prompt and an answer. The trainer supervises the answer tokens.
+Each split carries its `metric` and its `chat_template_fn`. `formatted` returns a copy with a different prompt or metric. The trainer supervises the answer tokens. A new corpus is a `Dataset` of `DatasetSourceConfig` splits.
 
 ## Develop
 

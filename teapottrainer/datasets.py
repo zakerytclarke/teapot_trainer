@@ -1,9 +1,12 @@
 """Dataset presets and the streaming encoder.
 
-New presets are additional constants. ``chat_template_fn`` may return one
-``(prompt, answer)`` pair or a list of pairs (one per assistant turn).
-``token_loss_weight_fn`` is optional and, when set, returns one loss weight
-per label. The trainer applies those weights; it does not decide them.
+Import a corpus and take the split you mean: ``gsm8k.train`` and ``gsm8k.test``.
+The uppercase constants are those same splits, so older imports keep working.
+``chat_template_fn`` may return one ``(prompt, answer)`` pair or a list of
+pairs (one per assistant turn). ``token_loss_weight_fn`` is optional and, when
+set, returns one loss weight per label. The trainer applies those weights; it
+does not decide them. ``metric`` is the eval the scorer should run.
+``formatted`` copies a split with a different template, metric, or loss weight.
 """
 
 from __future__ import annotations
@@ -17,6 +20,10 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
+
+# Declared here so a split can name its eval without importing the scorer.
+# ``task_kind`` returns this when it is set, and otherwise reads the dataset id.
+MetricName = str
 from datasets import load_dataset
 
 from .chat_formats import current_chat_format, supervised_end
@@ -63,11 +70,16 @@ from .formatting import (
 
 
 class DatasetSourceConfig(BaseModel):
-    """Configuration for an individual dataset source in a mix."""
+    """One split of a corpus: its file, its prompt format, and its eval."""
 
     name: str
     subset: Optional[str] = None
     split: str = "train"
+    # train, validation, or test. Test and validation are read whole.
+    # A train split keeps a hash holdout out of the training stream.
+    role: str = Field(default="train", exclude=True)
+    # Eval name (squad, gsm8k, lm, sft_loss, ...). None keeps the name heuristic.
+    metric: Optional[MetricName] = Field(default=None, exclude=True)
     target_tokens: int = 100_000_000
     weight: float = 1.0
     text_column: str = "text"
@@ -79,6 +91,76 @@ class DatasetSourceConfig(BaseModel):
     token_loss_weight_fn: Optional[Callable[[dict, Any], list[float]]] = Field(default=None, exclude=True)
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    def formatted(
+        self,
+        chat_template_fn: Optional[Callable] = None,
+        *,
+        preprocess_fn: Optional[Callable] = None,
+        token_loss_weight_fn: Optional[Callable] = None,
+        metric: Optional[str] = None,
+        role: Optional[str] = None,
+        split: Optional[str] = None,
+    ) -> "DatasetSourceConfig":
+        """Copy this split with a new prompt, loss weight, metric, or role.
+
+        Omitted arguments stay as they are, so a format change does not drop
+        the eval or the stop-token weight.
+        """
+        updates: dict[str, Any] = {}
+        if chat_template_fn is not None:
+            updates["chat_template_fn"] = chat_template_fn
+        if preprocess_fn is not None:
+            updates["preprocess_fn"] = preprocess_fn
+        if token_loss_weight_fn is not None:
+            updates["token_loss_weight_fn"] = token_loss_weight_fn
+        if metric is not None:
+            updates["metric"] = metric
+        if role is not None:
+            updates["role"] = role
+        if split is not None:
+            updates["split"] = split
+        if not updates:
+            return self
+        return self.model_copy(update=updates)
+
+
+class Dataset(BaseModel):
+    """One corpus. Import this and use ``.train``, ``.validation``, or ``.test``."""
+
+    train: Optional[DatasetSourceConfig] = None
+    validation: Optional[DatasetSourceConfig] = None
+    test: Optional[DatasetSourceConfig] = None
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    def get(self, role: str) -> DatasetSourceConfig:
+        value = getattr(self, role, None)
+        if not isinstance(value, DatasetSourceConfig):
+            raise KeyError(role)
+        return value
+
+    def formatted(
+        self,
+        chat_template_fn: Optional[Callable] = None,
+        *,
+        preprocess_fn: Optional[Callable] = None,
+        token_loss_weight_fn: Optional[Callable] = None,
+        metric: Optional[str] = None,
+    ) -> "Dataset":
+        """Copy every split with the same format change."""
+
+        def apply(src: Optional[DatasetSourceConfig]) -> Optional[DatasetSourceConfig]:
+            if src is None:
+                return None
+            return src.formatted(
+                chat_template_fn,
+                preprocess_fn=preprocess_fn,
+                token_loss_weight_fn=token_loss_weight_fn,
+                metric=metric,
+            )
+
+        return Dataset(train=apply(self.train), validation=apply(self.validation), test=apply(self.test))
 
 
 # End-of-answer token, relative to a normal supervised token.
@@ -480,6 +562,125 @@ BFCL_SIMPLE = DatasetSourceConfig(
 BFCL_MULTIPLE = BFCL_SIMPLE.model_copy(update={"subset": "multiple"})
 BFCL_PARALLEL = BFCL_SIMPLE.model_copy(update={"subset": "parallel"})
 BFCL_IRRELEVANCE = BFCL_SIMPLE.model_copy(update={"subset": "irrelevance"})
+
+
+def _split_role(split: str) -> str:
+    """Train splits stay train, including ``train_sft``. Validation stays validation."""
+    if split == "validation":
+        return "validation"
+    if split == "train" or str(split).startswith("train"):
+        return "train"
+    return "test"
+
+
+# The scorer reads ``metric`` off the split. The name heuristic remains the fallback.
+_PRESET_METRICS = {
+    "FINEWEB_EDU": "lm",
+    "DCLM_EDU": "lm",
+    "STACK_EDU": "lm",
+    "FINEMATH": "lm",
+    "INFIWEBMATH": "lm",
+    "COSMOPEDIA_V2": "lm",
+    "SMOLTALK": "sft_loss",
+    "SMOLTALK_MAGPIE": "sft_loss",
+    "SMOLTALK_EVERYDAY": "sft_loss",
+    "SMOLTALK_OPENHERMES": "sft_loss",
+    "SMOLTALK_SYSTEMCHATS": "sft_loss",
+    "SMOLTALK_SUMMARIZE": "sft_loss",
+    "SMOLTALK_REWRITE": "sft_loss",
+    "SMOLTALK_METAMATH": "sft_loss",
+    "SMOLTALK_MAGPIE_TEST": "sft_loss",
+    "ULTRACHAT": "sft_loss",
+    "ULTRACHAT_TEST": "sft_loss",
+    "ALPACA": "sft_loss",
+    "TEAPOT_CHAT": "chat",
+    "SMOLTALK_APIGEN": "tools",
+    "SMOLTALK_APIGEN_DECISION": "tools",
+    "SMOLTALK_APIGEN_ALIASED": "tools",
+    "SMOLTALK_APIGEN_MISSING": "tools",
+    "SMOLTALK_APIGEN_UNRELATED": "tools",
+    "SMOLTALK_APIGEN_TEST": "tools",
+    "SMOLTALK_APIGEN_DECISION_TEST": "tools",
+    "SMOLTALK_APIGEN_ALIASED_TEST": "tools",
+    "HERMES_FUNCTION_CALLING": "tools",
+    "SMOLTALK_CONSTRAINTS": "constraints",
+    "SMOLTALK_CONSTRAINTS_TEST": "constraints",
+    "GSM8K": "gsm8k",
+    "GSM8K_TEST": "gsm8k",
+    "WHEN2CALL": "when2call",
+    "WHEN2CALL_TEST": "when2call",
+    "WHEN2CALL_ASK": "when2call",
+    "WHEN2CALL_REFUSE": "when2call",
+    "SQUAD_V2": "squad",
+    "SQUAD_V2_VAL": "squad",
+    "SQUAD_V2_ANSWERABLE": "squad",
+    "SQUAD_V2_UNANSWERABLE": "squad",
+    "SQUAD_V2_CONTRASTIVE": "squad",
+    "HOTPOT": "hotpot",
+    "HOTPOT_VAL": "hotpot",
+    "HOTPOT_CONTRASTIVE": "hotpot",
+    "SYNTHQA": "synthqa",
+    "SYNTHQA_TEST": "synthqa",
+    "SYNTHQA_ANSWERABLE": "synthqa",
+    "SYNTHQA_UNANSWERABLE": "synthqa",
+    "SYNTHQA_CONTRASTIVE": "synthqa",
+    "IFEVAL": "ifeval",
+    "MT_BENCH": "mtbench",
+    "ALPACA_EVAL": "alpaca",
+    "ARENA_HARD": "arena",
+    "ARC_EASY": "choice",
+    "ARC_EASY_VAL": "choice",
+    "HELLASWAG": "choice",
+    "HELLASWAG_VAL": "choice",
+    "PIQA": "choice",
+    "PIQA_VAL": "choice",
+    "WINOGRANDE": "choice",
+    "WINOGRANDE_VAL": "choice",
+    "COQA": "coqa",
+    "COQA_VAL": "coqa",
+    "DROP": "drop",
+    "DROP_VAL": "drop",
+    "BFCL_SIMPLE": "bfcl",
+    "BFCL_MULTIPLE": "bfcl",
+    "BFCL_PARALLEL": "bfcl",
+    "BFCL_IRRELEVANCE": "bfcl",
+}
+
+for _preset_name, _preset_metric in _PRESET_METRICS.items():
+    _preset = globals()[_preset_name]
+    globals()[_preset_name] = _preset.model_copy(
+        update={"metric": _preset_metric, "role": _split_role(_preset.split)}
+    )
+del _preset, _preset_name, _preset_metric
+
+fineweb_edu = Dataset(train=FINEWEB_EDU)
+dclm_edu = Dataset(train=DCLM_EDU)
+stack_edu = Dataset(train=STACK_EDU)
+finemath = Dataset(train=FINEMATH)
+infiwebmath = Dataset(train=INFIWEBMATH)
+cosmopedia = Dataset(train=COSMOPEDIA_V2)
+smoltalk = Dataset(train=SMOLTALK)
+smoltalk_magpie = Dataset(train=SMOLTALK_MAGPIE, test=SMOLTALK_MAGPIE_TEST)
+smoltalk_constraints = Dataset(train=SMOLTALK_CONSTRAINTS, test=SMOLTALK_CONSTRAINTS_TEST)
+smoltalk_openhermes = Dataset(train=SMOLTALK_OPENHERMES)
+smoltalk_apigen = Dataset(train=SMOLTALK_APIGEN, test=SMOLTALK_APIGEN_TEST)
+smoltalk_apigen_decision = Dataset(train=SMOLTALK_APIGEN_DECISION, test=SMOLTALK_APIGEN_DECISION_TEST)
+smoltalk_apigen_aliased = Dataset(train=SMOLTALK_APIGEN_ALIASED, test=SMOLTALK_APIGEN_ALIASED_TEST)
+gsm8k = Dataset(train=GSM8K, test=GSM8K_TEST)
+when2call = Dataset(train=WHEN2CALL, test=WHEN2CALL_TEST)
+squad_v2 = Dataset(train=SQUAD_V2, validation=SQUAD_V2_VAL)
+hotpot = Dataset(train=HOTPOT, validation=HOTPOT_VAL)
+synthqa = Dataset(train=SYNTHQA, test=SYNTHQA_TEST)
+teapot_chat = Dataset(train=TEAPOT_CHAT)
+arc_easy = Dataset(train=ARC_EASY, validation=ARC_EASY_VAL)
+hellaswag = Dataset(train=HELLASWAG, validation=HELLASWAG_VAL)
+piqa = Dataset(train=PIQA, validation=PIQA_VAL)
+winogrande = Dataset(train=WINOGRANDE, validation=WINOGRANDE_VAL)
+coqa = Dataset(train=COQA, validation=COQA_VAL)
+drop = Dataset(train=DROP, validation=DROP_VAL)
+hermes = Dataset(train=HERMES_FUNCTION_CALLING)
+ultrachat = Dataset(train=ULTRACHAT, test=ULTRACHAT_TEST)
+alpaca = Dataset(train=ALPACA)
 
 
 class _RowDataset:
