@@ -27,6 +27,8 @@ dependencies = [
     "tensorboard>=2.14",
     "tqdm>=4.66",
     "huggingface_hub>=0.20",
+    # transformers apply_chat_template / tools path needs modern Jinja.
+    "jinja2>=3.1.6",
 ]
 
 [project.optional-dependencies]
@@ -38,7 +40,12 @@ Repository = "https://github.com/zakerytclarke/teapot_trainer"
 Issues = "https://github.com/zakerytclarke/teapot_trainer/issues"
 
 [tool.setuptools]
-packages = ["teapottrainer"]
+packages = [
+    "teapottrainer",
+    "teapottrainer.rl",
+    "teapottrainer.rl.algorithms",
+    "teapottrainer.rl.tasks",
+]
 
 [tool.setuptools.dynamic]
 version = { attr = "teapottrainer.__version__" }
