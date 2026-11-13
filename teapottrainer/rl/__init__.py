@@ -6,9 +6,21 @@ This ``__init__`` only exposes leaf modules so dataset presets can import
 tools/rewards without circular imports.
 """
 
+from .search import (
+    SearchSettings,
+    build_search_tools,
+    make_brave_search,
+    make_exa_search,
+    make_llm_search,
+)
 from .tools import calculator, call_tool, call_tool_by_name, tool_schemas
 
 __all__ = [
+    "SearchSettings",
+    "build_search_tools",
+    "make_brave_search",
+    "make_exa_search",
+    "make_llm_search",
     "calculator",
     "call_tool",
     "call_tool_by_name",

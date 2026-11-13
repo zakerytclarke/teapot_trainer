@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_valid
 
 from .config import DatasetSpec
 from .rl.datasets import SYNTH_MATH, RlDataset
+from .rl.search import SearchSettings
 from .tool_formats import get_tool_format
 
 
@@ -36,6 +37,9 @@ class RlConfig(BaseModel):
     eval_datasets: List[DatasetSpec] = Field(default_factory=list)
     eval_example_cap: int = 64
     holdout_ratio: float = 0.05
+    # Optional search backend knobs (Brave / Exa / LLM-search). Datasets still
+    # need ``bind_tools(..., build_search_tools(search))`` to expose them.
+    search: Optional[SearchSettings] = None
 
     algorithm: str = "grpo"
     group_size: int = 4

@@ -8,7 +8,23 @@ from .modeling_teapot import (
     pack_conversation,
 )
 from .rl_config import RlConfig
-from .rl.datasets import SYNTH_MATH, RlDataset
+from .rl.datasets import (
+    GSM8K_RL,
+    HOTPOT_RL,
+    NQ_OPEN_RL,
+    RlDataset,
+    SYNTH_MATH,
+    TRIVIA_QA_RL,
+    WEB_QUESTIONS_RL,
+    bind_tools,
+)
+from .rl.search import (
+    SearchSettings,
+    build_search_tools,
+    make_brave_search,
+    make_exa_search,
+    make_llm_search,
+)
 from .rl.trainer import RlTrainer
 from .tool_formats import TOOL_FORMATS, get_tool_format, tool_format_names
 from .trainer import TeapotTrainer
@@ -86,7 +102,7 @@ from .datasets import (
     BFCL_IRRELEVANCE,
 )
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 __all__ = [
     "CHAT_FORMATS",
     "chat_format_names",
@@ -104,6 +120,17 @@ __all__ = [
     "RlConfig",
     "RlDataset",
     "SYNTH_MATH",
+    "GSM8K_RL",
+    "NQ_OPEN_RL",
+    "HOTPOT_RL",
+    "WEB_QUESTIONS_RL",
+    "TRIVIA_QA_RL",
+    "bind_tools",
+    "SearchSettings",
+    "build_search_tools",
+    "make_brave_search",
+    "make_exa_search",
+    "make_llm_search",
     "TrainingConfig",
     "ModelConfig",
     "DatasetSpec",
