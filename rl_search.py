@@ -4,11 +4,8 @@ No separate SFT step. Math and open-web search get tools; SynthQA and TeapotChat
 stay tool-free and grade with exact answer match so GRPO does not wash out
 grounding / chat style.
 
-API keys (optional; falls back to mock stubs when unset):
-
-* ``BRAVE_API_KEY``
-* ``EXA_API_KEY``
-* ``LLM_SEARCH_API_KEY`` + ``LLM_SEARCH_BASE_URL`` (+ optional ``LLM_SEARCH_MODEL``)
+Search backend defaults to local **llmsearchindex** (``web_search`` tool).
+Install with ``pip install llmsearchindex``. Brave / Exa are opt-in only.
 
 Example::
 
@@ -39,6 +36,17 @@ from teapottrainer import (
 )
 
 
+def _default_mock_search() -> bool:
+    """Use mock stubs when llmsearchindex is not installed (or forced via env)."""
+    if os.environ.get("LLMSEARCHINDEX_MOCK", "").strip().lower() in {"1", "true", "yes"}:
+        return True
+    try:
+        import llmsearchindex  # noqa: F401
+    except Exception:
+        return True
+    return False
+
+
 def build_full_rl_config(
     *,
     init_from: str = "Qwen/Qwen2.5-0.5B-Instruct",
@@ -49,22 +57,16 @@ def build_full_rl_config(
 ) -> RlConfig:
     """Assemble the mixed RL config (tool tasks + exact-match keepalives)."""
     if mock_search is None:
-        mock_search = not any(
-            os.environ.get(name)
-            for name in (
-                "BRAVE_API_KEY",
-                "BRAVE_SEARCH_API_KEY",
-                "EXA_API_KEY",
-                "LLM_SEARCH_API_KEY",
-                "OPENAI_API_KEY",
-            )
-        )
-    search = SearchSettings.from_env(mock=bool(mock_search))
+        mock_search = _default_mock_search()
+    search = SearchSettings.from_env(
+        mock=bool(mock_search),
+        default_providers=["llmsearchindex"],
+    )
     search_tools = build_search_tools(search)
     if not search_tools:
         raise SystemExit(
-            "No search tools configured. Set BRAVE_API_KEY / EXA_API_KEY / "
-            "LLM_SEARCH_API_KEY+LLM_SEARCH_BASE_URL, or pass mock_search=True."
+            "No search tools configured. Default is llmsearchindex "
+            "(pip install llmsearchindex), or pass mock_search=True."
         )
     print(f"search tools: {[fn.__name__ for fn in search_tools]}  mock={search.mock}")
 

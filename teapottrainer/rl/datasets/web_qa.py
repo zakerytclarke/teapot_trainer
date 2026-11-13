@@ -1,7 +1,7 @@
 """Open-domain / multi-hop QA datasets meant to be paired with search tools.
 
-Presets ship with an empty tool list. Bind Brave / Exa / LLM-search tools at
-config time::
+Presets ship with an empty tool list. Bind search tools at config time
+(default backend: local ``llmsearchindex`` via ``web_search``)::
 
     from teapottrainer import NQ_OPEN_RL, SearchSettings, bind_tools, build_search_tools
 
@@ -20,8 +20,8 @@ from ._hf import load_hf_rows, pick_row
 from .base import RlDataset
 
 _SEARCH_SYSTEM = (
-    "You are a helpful research assistant with web search tools. "
-    "For factual questions, call a search tool before answering. "
+    "You are a helpful research assistant with a web_search tool backed by a "
+    "local web index. For factual questions, call web_search before answering. "
     "After tool results arrive, reply in natural language with a concise answer."
 )
 

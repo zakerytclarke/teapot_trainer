@@ -20,6 +20,7 @@ from teapottrainer import (
     make_brave_search,
     make_exa_search,
     make_llm_search,
+    make_llmsearchindex,
     tool_format_names,
 )
 from teapottrainer.formatting import ABSTAIN_TEXT, RAG_SYSTEM
@@ -38,16 +39,26 @@ def test_search_tool_factories_mock_and_schemas():
     settings = SearchSettings(mock=True)
     tools = build_search_tools(settings)
     names = {fn.__name__ for fn in tools}
-    assert names == {"brave_search", "exa_search", "llm_search"}
+    assert names == {"web_search"}
     schemas = tool_schemas(tools)
     assert {row["function"]["name"] for row in schemas} == names
 
-    brave = make_brave_search(settings)
-    exa = make_exa_search(settings)
-    llm = make_llm_search(settings)
-    assert "Mock Brave" in brave("who invented the telephone")
-    assert "Mock Exa" in exa("who invented the telephone")
-    assert "Mock LLM" in llm("who invented the telephone")
+    web = make_llmsearchindex(settings)
+    assert "Mock llmsearchindex" in web("who invented the telephone")
+
+    # Opt-in API backends still work when requested explicitly.
+    all_tools = build_search_tools(
+        settings, providers=["llmsearchindex", "brave", "exa", "llm_search"]
+    )
+    assert [fn.__name__ for fn in all_tools] == [
+        "web_search",
+        "brave_search",
+        "exa_search",
+        "llm_search",
+    ]
+    assert "Mock Brave" in make_brave_search(settings)("q")
+    assert "Mock Exa" in make_exa_search(settings)("q")
+    assert "Mock LLM" in make_llm_search(settings)("q")
 
 
 def test_search_settings_from_env(monkeypatch):
@@ -58,15 +69,19 @@ def test_search_settings_from_env(monkeypatch):
     settings = SearchSettings.from_env()
     assert settings.brave_api_key == "brave-test"
     assert settings.exa_api_key == "exa-test"
+    assert settings.default_providers == ["llmsearchindex"]
+    # Default build ignores Brave/Exa keys and uses llmsearchindex only.
+    tools = build_search_tools(settings)
+    assert [fn.__name__ for fn in tools] == ["web_search"]
     tools = build_search_tools(settings, providers=["brave", "exa"])
     assert [fn.__name__ for fn in tools] == ["brave_search", "exa_search"]
 
 
 def test_bind_tools_onto_web_datasets():
-    tools = build_search_tools(SearchSettings(mock=True), providers=["brave"])
+    tools = build_search_tools(SearchSettings(mock=True))
     bound = bind_tools(NQ_OPEN_RL, tools)
     assert NQ_OPEN_RL.tools == []
-    assert [fn.__name__ for fn in bound.tools] == ["brave_search"]
+    assert [fn.__name__ for fn in bound.tools] == ["web_search"]
     assert bound.name == "nq_open"
 
 
@@ -122,11 +137,11 @@ def test_web_qa_grade_requires_search_by_default():
             "tool_calls": [
                 {
                     "type": "function",
-                    "function": {"name": "brave_search", "arguments": {"query": "telephone inventor"}},
+                    "function": {"name": "web_search", "arguments": {"query": "telephone inventor"}},
                 }
             ],
         },
-        {"role": "tool", "name": "brave_search", "content": "Alexander Graham Bell ..."},
+        {"role": "tool", "name": "web_search", "content": "Alexander Graham Bell ..."},
         {"role": "assistant", "content": "Alexander Graham Bell invented the telephone."},
     ]
     reward2, metrics2 = grade_episode(NQ_OPEN_RL, with_tool, meta)
@@ -190,6 +205,7 @@ def test_reward_helpers_and_hermes_still_listed():
     gsm_r, gsm_m = score_gsm8k_answer("#### 42", "foo #### 42", used_calculator=True)
     assert gsm_m["accuracy"] == 1.0
     assert gsm_r > 0.0
+    assert used_search_tools([{"name": "web_search", "arguments": {"query": "x"}}])
     assert used_search_tools([{"name": "exa_search", "arguments": {"query": "x"}}])
     assert "hermes" in tool_format_names()
     assert get_tool_format("hermes").name == "hermes"

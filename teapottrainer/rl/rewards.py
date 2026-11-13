@@ -10,7 +10,9 @@ from ..metrics import best_span_scores, gold_gsm_number, is_abstention, pred_gsm
 
 _NUM = re.compile(r"[-+]?(?:\d+\.\d+|\d+|\.\d+)(?:[eE][-+]?\d+)?")
 
-_SEARCH_TOOL_NAMES = frozenset({"brave_search", "exa_search", "llm_search", "web_search"})
+_SEARCH_TOOL_NAMES = frozenset(
+    {"web_search", "brave_search", "exa_search", "llm_search", "llmsearchindex"}
+)
 
 
 def extract_number(text: str) -> float | None:

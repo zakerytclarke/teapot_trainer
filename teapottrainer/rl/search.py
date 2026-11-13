@@ -1,10 +1,13 @@
-"""Configurable web-search tools for RL (Brave, Exa, LLM-search).
+"""Configurable web-search tools for RL.
+
+Default backend is **llmsearchindex** (local FineWeb+Wikipedia index) via
+``pip install llmsearchindex``. Brave / Exa / OpenAI-compatible ``llm_search``
+remain available but are opt-in.
 
 Each factory returns a plain Python function whose name/docstring/type hints
-become the Hugging Face tool schema. API keys and knobs come from
-``SearchSettings`` (explicit fields or environment variables).
+become the Hugging Face tool schema. Knobs come from ``SearchSettings``.
 
-Environment variables (used when a field is omitted):
+Environment variables (optional backends):
 
 * ``BRAVE_API_KEY`` / ``BRAVE_SEARCH_API_KEY``
 * ``EXA_API_KEY``
@@ -22,9 +25,13 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 
 ToolFn = Callable[..., Any]
+
+# Shared LLMIndex instance — download/load is expensive.
+_LLMSEARCH_INDEX = None
+_LLMSEARCH_IMPORT_ERROR: Exception | None = None
 
 
 def _env(*names: str) -> str | None:
@@ -37,6 +44,10 @@ def _env(*names: str) -> str | None:
 
 class SearchSettings(BaseModel):
     """Shared knobs for search tool backends."""
+
+    # Default / primary: local llmsearchindex (https://pypi.org/project/llmsearchindex/)
+    llmsearchindex_top_k: int = 5
+    llmsearchindex_rerank: bool = False
 
     brave_api_key: Optional[str] = None
     brave_count: int = 5
@@ -55,9 +66,11 @@ class SearchSettings(BaseModel):
     )
 
     timeout_s: float = 20.0
-    # When True, tools never hit the network; they return deterministic stubs.
-    # Useful for unit tests and dry runs without API keys.
+    # When True, tools never load the index / hit APIs; they return stubs.
     mock: bool = False
+    # Default provider list when ``build_search_tools`` is called without providers.
+    # ``llmsearchindex`` only for now; pass brave/exa/llm_search explicitly later.
+    default_providers: list[str] = ["llmsearchindex"]
 
     model_config = ConfigDict(extra="ignore")
 
@@ -73,6 +86,24 @@ class SearchSettings(BaseModel):
         }
         data.update({k: v for k, v in overrides.items() if v is not None})
         return cls(**data)
+
+
+def _get_llmsearch_index():
+    """Lazy-load the shared ``LLMIndex`` (downloads ~GB on first use)."""
+    global _LLMSEARCH_INDEX, _LLMSEARCH_IMPORT_ERROR
+    if _LLMSEARCH_INDEX is not None:
+        return _LLMSEARCH_INDEX
+    if _LLMSEARCH_IMPORT_ERROR is not None:
+        raise _LLMSEARCH_IMPORT_ERROR
+    try:
+        from llmsearchindex import LLMIndex  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        _LLMSEARCH_IMPORT_ERROR = RuntimeError(
+            "llmsearchindex is not installed. Run: pip install llmsearchindex"
+        )
+        raise _LLMSEARCH_IMPORT_ERROR from exc
+    _LLMSEARCH_INDEX = LLMIndex()
+    return _LLMSEARCH_INDEX
 
 
 def _http_json(
@@ -123,8 +154,57 @@ def _format_hits(hits: list[dict[str, str]], *, limit: int) -> str:
     return "\n".join(lines)
 
 
+def make_llmsearchindex(settings: SearchSettings | None = None, **overrides: Any) -> ToolFn:
+    """Local web search via ``llmsearchindex`` (FineWeb + Wikipedia index)."""
+    cfg = (settings or SearchSettings.from_env()).model_copy(update=overrides)
+
+    def web_search(query: str, top_k: int | None = None) -> str:
+        """Search a local web index (Wikipedia + FineWeb) for passages.
+
+        Args:
+            query: Search query string.
+            top_k: Number of hits to return (defaults to configured top_k).
+        """
+        q = str(query or "").strip()
+        if not q:
+            return "ERROR: empty query"
+        k = int(top_k) if top_k is not None else int(cfg.llmsearchindex_top_k)
+        k = max(1, min(k, 20))
+        if cfg.mock:
+            return _format_hits(
+                [
+                    {
+                        "title": f"Mock llmsearchindex hit for {q}",
+                        "url": "https://example.com/llmsearchindex",
+                        "snippet": f"Stub indexed passage about {q}.",
+                    }
+                ],
+                limit=k,
+            )
+        try:
+            index = _get_llmsearch_index()
+            raw = index.search(q, top_k=k, rerank=bool(cfg.llmsearchindex_rerank))
+        except Exception as exc:  # noqa: BLE001
+            return f"ERROR: llmsearchindex failed: {exc}"
+        hits = []
+        for row in raw or []:
+            if not isinstance(row, dict):
+                continue
+            snippet = str(row.get("snippet") or row.get("text") or "")[:500]
+            hits.append(
+                {
+                    "title": str(row.get("title") or row.get("url") or "(untitled)"),
+                    "url": str(row.get("url") or ""),
+                    "snippet": snippet,
+                }
+            )
+        return _format_hits(hits, limit=k)
+
+    return web_search
+
+
 def make_brave_search(settings: SearchSettings | None = None, **overrides: Any) -> ToolFn:
-    """Brave Web Search API tool."""
+    """Brave Web Search API tool (opt-in; not used by default)."""
     cfg = (settings or SearchSettings.from_env()).model_copy(update=overrides)
 
     def brave_search(query: str, count: int | None = None) -> str:
@@ -298,28 +378,26 @@ def build_search_tools(
 ) -> list[ToolFn]:
     """Return configured search tools.
 
-    ``providers`` defaults to every backend that has credentials (or all three
-    when ``mock=True``). Names: ``brave``, ``exa``, ``llm_search``.
+    Default providers: ``[\"llmsearchindex\"]`` only. Pass
+    ``providers=[\"brave\", \"exa\", ...]`` to opt into API backends.
+    Aliases: ``llmsearchindex``, ``index``, ``web_search``.
     """
     cfg = (settings or SearchSettings.from_env()).model_copy(update=overrides)
-    wanted = [str(p).strip().lower() for p in (providers or [])]
+    raw = providers if providers is not None else list(cfg.default_providers or ["llmsearchindex"])
+    wanted = []
+    for item in raw:
+        key = str(item).strip().lower()
+        if key in {"index", "web_search", "llmsearch", "llm_search_index"}:
+            key = "llmsearchindex"
+        wanted.append(key)
     tools: list[ToolFn] = []
 
-    def _want(name: str, ready: bool) -> bool:
-        if wanted:
-            return name in wanted
-        return bool(ready or cfg.mock)
-
-    if _want("brave", bool(cfg.brave_api_key or _env("BRAVE_API_KEY", "BRAVE_SEARCH_API_KEY"))):
+    if "llmsearchindex" in wanted:
+        tools.append(make_llmsearchindex(cfg))
+    if "brave" in wanted:
         tools.append(make_brave_search(cfg))
-    if _want("exa", bool(cfg.exa_api_key or _env("EXA_API_KEY"))):
+    if "exa" in wanted:
         tools.append(make_exa_search(cfg))
-    if _want(
-        "llm_search",
-        bool(
-            (cfg.llm_search_api_key or _env("LLM_SEARCH_API_KEY", "OPENAI_API_KEY"))
-            and (cfg.llm_search_base_url or _env("LLM_SEARCH_BASE_URL", "OPENAI_BASE_URL"))
-        ),
-    ):
+    if "llm_search" in wanted:
         tools.append(make_llm_search(cfg))
     return tools

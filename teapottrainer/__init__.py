@@ -26,6 +26,7 @@ from .rl.search import (
     make_brave_search,
     make_exa_search,
     make_llm_search,
+    make_llmsearchindex,
 )
 from .rl.trainer import RlTrainer
 from .tool_formats import TOOL_FORMATS, get_tool_format, tool_format_names
@@ -104,7 +105,7 @@ from .datasets import (
     BFCL_IRRELEVANCE,
 )
 
-__version__ = "0.1.7"
+__version__ = "0.1.8"
 __all__ = [
     "CHAT_FORMATS",
     "chat_format_names",
@@ -135,6 +136,7 @@ __all__ = [
     "make_brave_search",
     "make_exa_search",
     "make_llm_search",
+    "make_llmsearchindex",
     "TrainingConfig",
     "ModelConfig",
     "DatasetSpec",
