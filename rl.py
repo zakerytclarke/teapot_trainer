@@ -1,33 +1,27 @@
-"""RL recipe: synthetic math with a calculator tool on a small instruct model.
+"""RL recipe: synthetic math with a calculator Python tool on a small instruct model.
 
 Assumes supervised fine-tuning is already done. While Teapot SFT checkpoints
-are training, this defaults to Qwen2.5-1.5B-Instruct so the RL loop can be
-exercised end-to-end. Swap ``init_from`` to a local Teapot SFT directory later.
+are training, this defaults to Qwen2.5-1.5B-Instruct. Swap ``init_from`` later.
 
-Tool formatting defaults to Hugging Face ``apply_chat_template(..., tools=)``
-via ``tool_format="tokenizer"``. Set ``tool_format`` to ``hermes``,
-``llama3_json``, ``mistral``, or ``json`` to force a fixed wire format for both
-prompt-side tool listings and call/result parsing.
+RL datasets are extensible triples:
+  init_fn() -> state
+  sample_fn(state, rng) -> {messages, meta, tools?}
+  grade_fn(conversation_json, meta) -> float | {score, ...}
+
+Tools are plain Python functions (HF schemas come from type hints/docstrings).
+``tool_format="tokenizer"`` uses Hugging Face chat templates for prompt-side
+tool injection and response parsing when available.
 """
 
-from teapottrainer import EnvSpec, RlConfig, RlTrainer
+from teapottrainer import RlConfig, RlTrainer, SYNTH_MATH
 
 
 def main() -> None:
     config = RlConfig(
         init_from="Qwen/Qwen2.5-1.5B-Instruct",
         tokenizer="Qwen/Qwen2.5-1.5B-Instruct",
-        # Prefer the tokenizer chat template + parse_response for tools.
         tool_format="tokenizer",
-        tools=["calculator"],
-        envs=[
-            EnvSpec(
-                name="synth_math",
-                weight=1.0,
-                target_episodes=1_000,
-                options={"difficulty": "mixed"},
-            )
-        ],
+        datasets=[SYNTH_MATH],
         algorithm="grpo",
         group_size=4,
         batch_prompts=1,

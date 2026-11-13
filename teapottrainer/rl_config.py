@@ -1,30 +1,17 @@
 """Config surface for reinforcement learning runs.
 
-Parallel to ``TrainingConfig``, but the unit of work is an episode in a tool
-environment rather than a supervised (prompt, answer) pair.
+Parallel to ``TrainingConfig``. The unit of work is an episode sampled from an
+``RlDataset`` (init / sample / grade), not a supervised (prompt, answer) pair.
 """
 
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 
-from .tool_formats import get_tool_format, tool_format_names
-
-
-class EnvSpec(BaseModel):
-    """One environment in the RL mixture."""
-
-    name: str
-    weight: float = 1.0
-    # Soft budget used for scheduling / logging. Training may stop earlier via
-    # ``RlConfig.max_train_episodes``.
-    target_episodes: int = 1_000
-    # Env-specific options (difficulty, allow_tools, etc.).
-    options: dict[str, Any] = Field(default_factory=dict)
-
-    model_config = ConfigDict(populate_by_name=True, arbitrary_types_allowed=True)
+from .rl_datasets import RlDataset, SYNTH_MATH
+from .tool_formats import get_tool_format
 
 
 class RlConfig(BaseModel):
@@ -41,9 +28,8 @@ class RlConfig(BaseModel):
     # Optional override of chat role markers. None keeps the tokenizer template.
     chat_format: Optional[str] = None
 
-    envs: List[EnvSpec] = Field(default_factory=list)
-    # Registered tool names exposed to every env unless an env narrows them.
-    tools: List[str] = Field(default_factory=lambda: ["calculator"])
+    # Mixture of RL datasets. Each has init_fn / sample_fn / grade_fn / tools.
+    datasets: List[RlDataset] = Field(default_factory=lambda: [SYNTH_MATH])
 
     algorithm: str = "grpo"
     group_size: int = 4
@@ -63,10 +49,8 @@ class RlConfig(BaseModel):
     max_train_episodes: int = 200
     eval_every_episodes: int = 50
     eval_episodes: int = 32
-    # Save resume state this often.
     resume_every_episodes: int = 50
 
-    # Called as hook(model, phase_name) before a rollout batch. Same idea as SFT.
     before_batch: Optional[Any] = None
 
     model_config = ConfigDict(populate_by_name=True, arbitrary_types_allowed=True)
@@ -74,8 +58,7 @@ class RlConfig(BaseModel):
     @field_validator("tool_format")
     @classmethod
     def _known_tool_format(cls, value: str) -> str:
-        fmt = get_tool_format(value)
-        return fmt.name
+        return get_tool_format(value).name
 
     @field_validator("algorithm")
     @classmethod
@@ -91,6 +74,13 @@ class RlConfig(BaseModel):
         if int(value) < 2:
             raise ValueError("group_size must be >= 2 for GRPO")
         return int(value)
+
+    @field_validator("datasets")
+    @classmethod
+    def _datasets_nonempty(cls, value: List[RlDataset]) -> List[RlDataset]:
+        if not value:
+            raise ValueError("RlConfig.datasets must contain at least one RlDataset")
+        return value
 
     @field_serializer("before_batch")
     def _dump_before_batch(self, value):

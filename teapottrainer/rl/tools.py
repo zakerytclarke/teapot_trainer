@@ -1,17 +1,19 @@
-"""Built-in tools for RL environments.
+"""Tools are ordinary Python functions.
 
-Tools are ordinary Python functions with type hints and docstrings so Hugging
-Face ``get_json_schema`` / ``apply_chat_template(..., tools=)`` can describe
-them. The registry maps stable names used in ``RlConfig.tools``.
+Hugging Face ``get_json_schema`` / ``apply_chat_template(..., tools=)`` read
+type hints and docstrings. The RL loop calls the same functions when the model
+emits a tool request.
 """
 
 from __future__ import annotations
 
 import ast
 import operator
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from ..tool_formats import normalize_tool_schemas
+
+ToolFn = Callable[..., Any]
 
 
 _ALLOWED_BINOPS = {
@@ -60,39 +62,74 @@ def calculator(expression: str) -> str:
     return repr(float(value))
 
 
-TOOL_REGISTRY: dict[str, Callable[..., Any]] = {
-    "calculator": calculator,
-}
+def tool_name(fn: ToolFn) -> str:
+    return str(getattr(fn, "__name__", "tool"))
 
 
-def resolve_tools(names: list[str] | None) -> list[Callable[..., Any]]:
-    """Look up tool callables by config name."""
-    if not names:
-        return []
-    out = []
-    for name in names:
-        key = str(name).strip()
-        if key not in TOOL_REGISTRY:
-            known = ", ".join(sorted(TOOL_REGISTRY))
-            raise ValueError(f"Unknown tool {name!r}. Registered: {known}")
-        out.append(TOOL_REGISTRY[key])
+def index_tools(tools: Iterable[ToolFn] | None) -> dict[str, ToolFn]:
+    """Map tool name -> Python function."""
+    out: dict[str, ToolFn] = {}
+    for fn in tools or []:
+        if not callable(fn):
+            raise TypeError(f"tools must be Python callables, got {type(fn)!r}")
+        out[tool_name(fn)] = fn
     return out
 
 
-def tool_schemas_for(names: list[str] | None) -> list[dict]:
-    return normalize_tool_schemas(resolve_tools(names))
+def tool_schemas(tools: Iterable[ToolFn] | None) -> list[dict]:
+    return normalize_tool_schemas(list(tools or []))
 
 
-def run_tool(name: str, arguments: dict | None) -> str:
-    """Execute one tool call and return a string observation."""
-    key = str(name or "").strip()
-    if key not in TOOL_REGISTRY:
-        return f"ERROR: unknown tool {name!r}"
+def call_tool(fn: ToolFn, arguments: dict | None) -> str:
+    """Execute one tool function and always return a string observation."""
     args = arguments if isinstance(arguments, dict) else {}
     try:
-        result = TOOL_REGISTRY[key](**args)
+        result = fn(**args)
     except TypeError as exc:
-        return f"ERROR: bad arguments for {key}: {exc}"
+        return f"ERROR: bad arguments for {tool_name(fn)}: {exc}"
     except Exception as exc:  # noqa: BLE001
         return f"ERROR: {exc}"
     return str(result)
+
+
+def call_tool_by_name(tools: Iterable[ToolFn] | None, name: str, arguments: dict | None) -> str:
+    table = index_tools(tools)
+    key = str(name or "").strip()
+    if key not in table:
+        known = ", ".join(sorted(table)) or "(none)"
+        return f"ERROR: unknown tool {name!r}. Available: {known}"
+    return call_tool(table[key], arguments)
+
+
+def final_assistant_text(messages: list[dict]) -> str:
+    """Last assistant content that is not only a tool call."""
+    for message in reversed(messages):
+        if message.get("role") != "assistant":
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return content
+        if message.get("tool_calls"):
+            continue
+        if content is None:
+            continue
+        return str(content)
+    return ""
+
+
+def conversation_tool_calls(messages: list[dict]) -> list[dict]:
+    """Flatten assistant tool_calls in a conversation JSON."""
+    calls = []
+    for message in messages:
+        if message.get("role") != "assistant":
+            continue
+        for call in message.get("tool_calls") or []:
+            fn = call.get("function") if isinstance(call, dict) else None
+            if isinstance(fn, dict):
+                calls.append(
+                    {
+                        "name": fn.get("name"),
+                        "arguments": fn.get("arguments") or {},
+                    }
+                )
+    return calls

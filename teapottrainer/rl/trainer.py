@@ -1,18 +1,24 @@
 """Config-driven RL trainer.
 
 Public surface: ``RlTrainer(RlConfig).train(fresh=True)``.
-Assumes supervised fine-tuning is already done and loads ``init_from``.
+
+Flow per episode:
+1. pick an ``RlDataset`` by weight
+2. ``sample_fn(state, rng)`` → messages + meta + Python tool fns
+3. roll out tool-using conversation
+4. ``grade_fn(conversation_json, meta)`` → numeric reward
+5. GRPO update over the group of rollouts for that sample
 """
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import os
 import random
 import time
 from pathlib import Path
+from typing import Any
 
 import torch
 from torch.optim import AdamW
@@ -20,11 +26,11 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from ..rl_config import EnvSpec, RlConfig
+from ..rl_config import RlConfig
+from ..rl_datasets import RlDataset, grade_episode, prepare_dataset, sample_episode
 from ..tool_formats import get_tool_format
 from .algorithms.grpo import build_batch_tensors, group_advantages, grpo_loss
-from .rollouts import rollout_episode
-from .tasks import build_env
+from .rollouts import Trajectory, rollout_episode
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -35,13 +41,11 @@ def _run_hash(config: RlConfig) -> str:
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:10]
 
 
-def _select_env(specs: list[EnvSpec], rng: random.Random) -> EnvSpec:
-    weights = [max(float(spec.weight), 0.0) for spec in specs]
-    if not specs:
-        raise ValueError("RlConfig.envs must contain at least one EnvSpec")
+def _select_dataset(datasets: list[RlDataset], rng: random.Random) -> RlDataset:
+    weights = [max(float(ds.weight), 0.0) for ds in datasets]
     if sum(weights) <= 0:
-        return specs[0]
-    return rng.choices(specs, weights=weights, k=1)[0]
+        return datasets[0]
+    return rng.choices(datasets, weights=weights, k=1)[0]
 
 
 class RlTrainer:
@@ -68,6 +72,9 @@ class RlTrainer:
         random.seed(self.config.seed)
         torch.manual_seed(self.config.seed)
         rng = random.Random(self.config.seed)
+
+        # Initialize every RL dataset once (downloads, indexes, …).
+        dataset_state = {ds.name: prepare_dataset(ds) for ds in self.config.datasets}
 
         tokenizer = AutoTokenizer.from_pretrained(self.config.tokenizer_name(), trust_remote_code=True)
         if tokenizer.pad_token is None:
@@ -104,31 +111,31 @@ class RlTrainer:
             start_episodes = self._load_resume(model, optimizer, resume_path)
 
         writer = SummaryWriter(log_dir=str(self.run_dir / "tb"))
-        env_cache = {spec.name: build_env(spec.name, spec.options) for spec in self.config.envs}
-
         episodes_done = start_episodes
-        best_acc = -1.0
+        best_score = float("-inf")
         pbar = tqdm(total=int(self.config.max_train_episodes), initial=episodes_done, desc="rl")
 
         while episodes_done < int(self.config.max_train_episodes):
-            spec = _select_env(self.config.envs, rng)
-            env = env_cache[spec.name]
-            task = env.sample_task(rng)
+            dataset = _select_dataset(self.config.datasets, rng)
+            state = dataset_state[dataset.name]
+            sample = sample_episode(dataset, state, rng)
 
-            trajectories = []
+            trajectories: list[Trajectory] = []
             for _ in range(int(self.config.group_size)):
                 self._run_before_batch(model, phase="rl")
                 traj = rollout_episode(
                     model,
                     tokenizer,
-                    env,
-                    task,
+                    sample,
                     self.tool_format,
                     max_turns=self.config.max_turns,
                     max_new_tokens=self.config.max_new_tokens,
                     temperature=self.config.temperature,
                     top_p=self.config.top_p,
                 )
+                reward, metrics = grade_episode(dataset, traj.messages, traj.meta)
+                traj.reward = reward
+                traj.metrics = metrics
                 trajectories.append(traj)
 
             rewards = [t.reward for t in trajectories]
@@ -145,11 +152,13 @@ class RlTrainer:
             episodes_done += 1
             pbar.update(1)
             mean_reward = sum(rewards) / max(len(rewards), 1)
-            mean_acc = sum(t.metrics.get("accuracy", 0.0) for t in trajectories) / max(len(trajectories), 1)
+            mean_acc = sum(t.metrics.get("accuracy", t.metrics.get("score", 0.0)) for t in trajectories) / max(
+                len(trajectories), 1
+            )
             row = {
                 "episode": episodes_done,
-                "env": spec.name,
-                "task_id": task.task_id,
+                "dataset": dataset.name,
+                "sample_id": sample.get("sample_id"),
                 "reward_mean": mean_reward,
                 "accuracy_mean": mean_acc,
                 "reward_group": rewards,
@@ -161,21 +170,20 @@ class RlTrainer:
             writer.add_scalar("rl/loss", update_metrics.get("loss", 0.0), episodes_done)
 
             if episodes_done % int(self.config.eval_every_episodes) == 0:
-                eval_stats = self.evaluate(model, tokenizer, env_cache, rng)
+                eval_stats = self.evaluate(model, tokenizer, dataset_state, rng)
                 row = {"episode": episodes_done, "split": "eval", **eval_stats}
                 self._append_metrics(row)
                 writer.add_scalar("eval/accuracy", eval_stats.get("accuracy", 0.0), episodes_done)
                 writer.add_scalar("eval/reward", eval_stats.get("reward", 0.0), episodes_done)
-                if eval_stats.get("accuracy", -1.0) >= best_acc:
-                    best_acc = float(eval_stats["accuracy"])
+                if eval_stats.get("reward", float("-inf")) >= best_score:
+                    best_score = float(eval_stats["reward"])
                     self._save_checkpoint(model, optimizer, episodes_done, self.ckpt_dir / "best")
 
             if episodes_done % int(self.config.resume_every_episodes) == 0:
                 self._save_checkpoint(model, optimizer, episodes_done, resume_path)
 
         pbar.close()
-        # Final eval + save.
-        eval_stats = self.evaluate(model, tokenizer, env_cache, rng)
+        eval_stats = self.evaluate(model, tokenizer, dataset_state, rng)
         self._append_metrics({"episode": episodes_done, "split": "final_eval", **eval_stats})
         self._save_checkpoint(model, optimizer, episodes_done, resume_path)
         final_dir = self.ckpt_dir / "final"
@@ -185,30 +193,29 @@ class RlTrainer:
         return self.run_dir
 
     @torch.no_grad()
-    def evaluate(self, model, tokenizer, env_cache, rng: random.Random) -> dict[str, float]:
+    def evaluate(self, model, tokenizer, dataset_state: dict[str, Any], rng: random.Random) -> dict[str, float]:
         was_training = model.training
         model.eval()
         rewards = []
         accs = []
         tool_rates = []
         for _ in range(int(self.config.eval_episodes)):
-            spec = _select_env(self.config.envs, rng)
-            env = env_cache[spec.name]
-            task = env.sample_task(rng)
+            dataset = _select_dataset(self.config.datasets, rng)
+            sample = sample_episode(dataset, dataset_state[dataset.name], rng)
             traj = rollout_episode(
                 model,
                 tokenizer,
-                env,
-                task,
+                sample,
                 self.tool_format,
                 max_turns=self.config.max_turns,
                 max_new_tokens=self.config.max_new_tokens,
                 temperature=0.0,
                 top_p=1.0,
             )
-            rewards.append(traj.reward)
-            accs.append(traj.metrics.get("accuracy", 0.0))
-            tool_rates.append(1.0 if traj.metrics.get("used_calculator", 0.0) > 0 else 0.0)
+            reward, metrics = grade_episode(dataset, traj.messages, traj.meta)
+            rewards.append(reward)
+            accs.append(metrics.get("accuracy", metrics.get("score", 0.0)))
+            tool_rates.append(1.0 if metrics.get("used_calculator", 0.0) > 0 else 0.0)
         if was_training:
             model.train()
         return {

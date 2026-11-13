@@ -1,4 +1,4 @@
-"""RL skeleton: tool formats, math env rewards, and a tiny end-to-end GRPO run."""
+"""RL skeleton: dataset API, tool formats, and a tiny end-to-end GRPO run."""
 
 from __future__ import annotations
 
@@ -6,16 +6,20 @@ import json
 import random
 from pathlib import Path
 
-import torch
 from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM
 
-from teapottrainer import EnvSpec, RlConfig, RlTrainer, get_tool_format, tool_format_names
+from teapottrainer import (
+    RlConfig,
+    RlDataset,
+    RlTrainer,
+    SYNTH_MATH,
+    get_tool_format,
+    tool_format_names,
+)
 from teapottrainer.rl.algorithms.grpo import group_advantages
-from teapottrainer.rl.env import Trajectory
 from teapottrainer.rl.rewards import extract_number, score_numeric_answer
-from teapottrainer.rl.tasks import build_env
-from teapottrainer.rl.tools import calculator, run_tool, tool_schemas_for
-from teapottrainer.tool_formats import normalize_tool_schemas
+from teapottrainer.rl.tools import calculator, call_tool, tool_schemas
+from teapottrainer.rl_datasets import grade_episode, prepare_dataset, sample_episode
 
 
 CHAT_TEMPLATE = (
@@ -31,7 +35,6 @@ def _tiny_tokenizer_and_model(tmp_path: Path):
     tok.chat_template = CHAT_TEMPLATE
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    tok.save_pretrained(tmp_path / "tok")
 
     config = LlamaConfig(
         vocab_size=tok.vocab_size,
@@ -57,15 +60,17 @@ def test_tool_format_names_include_hf_default():
     assert "json" in names
 
 
-def test_hf_schema_from_calculator_function():
-    schemas = tool_schemas_for(["calculator"])
+def test_tools_are_python_functions_with_hf_schemas():
+    schemas = tool_schemas([calculator])
     assert schemas[0]["type"] == "function"
     assert schemas[0]["function"]["name"] == "calculator"
     assert "expression" in schemas[0]["function"]["parameters"]["properties"]
+    assert call_tool(calculator, {"expression": "2+2"}) == "4"
+    assert "ERROR" in calculator("__import__('os')")
 
 
 def test_named_tool_formats_roundtrip_prompt_and_calls():
-    schemas = tool_schemas_for(["calculator"])
+    schemas = tool_schemas([calculator])
     calls = [{"type": "function", "function": {"name": "calculator", "arguments": {"expression": "2+3"}}}]
     messages = [{"role": "user", "content": "What is 2+3?"}]
 
@@ -79,47 +84,62 @@ def test_named_tool_formats_roundtrip_prompt_and_calls():
         parsed = fmt.parse_tool_calls(rendered)
         assert parsed[0]["function"]["name"] == "calculator"
         assert parsed[0]["function"]["arguments"]["expression"] == "2+3"
-
-        result = fmt.format_tool_result("calculator", "5")
-        assert "5" in result
+        assert "5" in fmt.format_tool_result("calculator", "5")
 
 
-def test_calculator_tool_evaluates_expressions():
-    assert calculator("6 * 7") == "42"
-    assert calculator("(10 - 3) * 2") == "14"
-    assert run_tool("calculator", {"expression": "2+2"}) == "4"
-    assert "ERROR" in calculator("__import__('os')")
-
-
-def test_math_env_scores_numeric_answers():
-    env = build_env("synth_math", {"difficulty": "easy"})
+def test_synth_math_dataset_init_sample_grade():
+    state = prepare_dataset(SYNTH_MATH)
     rng = random.Random(0)
-    task = env.sample_task(rng)
-    gold = float(task.gold["value"])
+    sample = sample_episode(SYNTH_MATH, state, rng)
+    assert sample["messages"]
+    assert "value" in sample["meta"]
+    assert all(callable(fn) for fn in sample["tools"])
+    assert tool_name_set(sample["tools"]) == {"calculator"}
 
-    good = Trajectory(
-        task=task,
-        messages=task.messages
-        + [{"role": "assistant", "content": f"The answer is {int(gold) if gold.is_integer() else gold}."}],
-    )
-    reward, metrics = env.score(good)
+    gold = float(sample["meta"]["value"])
+    good = sample["messages"] + [
+        {"role": "assistant", "content": f"The answer is {int(gold) if gold.is_integer() else gold}."}
+    ]
+    reward, metrics = grade_episode(SYNTH_MATH, good, sample["meta"])
     assert metrics["accuracy"] == 1.0
     assert reward >= 1.0
 
-    bad = Trajectory(
-        task=task,
-        messages=task.messages + [{"role": "assistant", "content": "The answer is 0."}],
-    )
-    reward_bad, metrics_bad = env.score(bad)
-    # 0 might randomly be correct; force mismatch when needed.
-    if metrics_bad["accuracy"] == 1.0:
-        bad = Trajectory(
-            task=task,
-            messages=task.messages + [{"role": "assistant", "content": "The answer is 123456."}],
-        )
-        reward_bad, metrics_bad = env.score(bad)
+    bad = sample["messages"] + [{"role": "assistant", "content": "The answer is 123456."}]
+    reward_bad, metrics_bad = grade_episode(SYNTH_MATH, bad, sample["meta"])
     assert metrics_bad["accuracy"] == 0.0
     assert reward_bad == 0.0
+
+
+def tool_name_set(tools):
+    return {getattr(fn, "__name__", "") for fn in tools}
+
+
+def test_custom_rl_dataset_is_extensible():
+    """Users can define their own init/sample/grade without a registry."""
+
+    def init_fn():
+        return {"answers": {"hi": "hello"}}
+
+    def sample_fn(state, rng):
+        return {
+            "sample_id": "echo",
+            "messages": [{"role": "user", "content": "hi"}],
+            "meta": {"expected": state["answers"]["hi"]},
+            "tools": [],
+        }
+
+    def grade_fn(conversation, meta):
+        text = " ".join(
+            str(m.get("content") or "") for m in conversation if m.get("role") == "assistant"
+        ).lower()
+        return 1.0 if meta["expected"] in text else 0.0
+
+    ds = RlDataset(name="echo", init_fn=init_fn, sample_fn=sample_fn, grade_fn=grade_fn, tools=[])
+    state = prepare_dataset(ds)
+    sample = sample_episode(ds, state, random.Random(0))
+    good = sample["messages"] + [{"role": "assistant", "content": "hello there"}]
+    score, _ = grade_episode(ds, good, sample["meta"])
+    assert score == 1.0
 
 
 def test_group_advantages_zero_mean():
@@ -132,34 +152,33 @@ def test_rl_config_validates_tool_format_and_group_size():
     cfg = RlConfig(
         init_from="dummy",
         tool_format="qwen",  # alias -> hermes
-        envs=[EnvSpec(name="synth_math")],
+        datasets=[SYNTH_MATH],
         group_size=4,
     )
     assert cfg.tool_format == "hermes"
     try:
-        RlConfig(init_from="dummy", envs=[EnvSpec(name="synth_math")], group_size=1)
+        RlConfig(init_from="dummy", datasets=[SYNTH_MATH], group_size=1)
         assert False, "expected group_size validation error"
     except Exception:
         pass
 
 
 def test_e2e_grpo_synth_math_tiny_model(tmp_path: Path):
-    """Full train+eval loop on synthetic math with a tiny random Llama."""
+    """Full train+eval loop on SYNTH_MATH with a tiny random Llama."""
     model_dir = _tiny_tokenizer_and_model(tmp_path)
     run_root = tmp_path / "runs"
     config = RlConfig(
         init_from=str(model_dir),
         tokenizer=str(model_dir),
         tool_format="hermes",
-        tools=["calculator"],
-        envs=[EnvSpec(name="synth_math", weight=1.0, options={"difficulty": "easy"})],
+        datasets=[SYNTH_MATH],
         algorithm="grpo",
         group_size=2,
         max_turns=2,
         max_new_tokens=24,
         temperature=0.8,
         lr=1e-4,
-        kl_coef=0.0,  # skip second model copy on CPU
+        kl_coef=0.0,
         max_train_episodes=2,
         eval_every_episodes=2,
         eval_episodes=2,
@@ -175,10 +194,9 @@ def test_e2e_grpo_synth_math_tiny_model(tmp_path: Path):
     assert any("reward_mean" in row for row in rows)
     assert any(row.get("split") == "final_eval" for row in rows)
     assert (run_dir / "checkpoints" / "final").exists()
-    # Config snapshot written for reproducibility.
     saved = json.loads((run_dir / "rl_config.json").read_text(encoding="utf-8"))
     assert saved["tool_format"] == "hermes"
-    assert saved["envs"][0]["name"] == "synth_math"
+    assert saved["datasets"][0]["name"] == "synth_math"
 
 
 def test_score_numeric_helper():

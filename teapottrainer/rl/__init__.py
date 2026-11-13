@@ -1,18 +1,15 @@
-"""Reinforcement learning package for teapottrainer."""
+"""Reinforcement learning helpers.
 
-from ..rl_config import EnvSpec, RlConfig
-from .trainer import RlTrainer
-from .tasks import ENV_REGISTRY, build_env
-from .tools import TOOL_REGISTRY, calculator, resolve_tools, run_tool
+``RlTrainer`` lives in ``teapottrainer.rl.trainer`` and is re-exported from the
+top-level package. This ``__init__`` only exposes leaf modules so
+``rl_datasets`` can import tools/rewards without circular imports.
+"""
+
+from .tools import calculator, call_tool, call_tool_by_name, tool_schemas
 
 __all__ = [
-    "EnvSpec",
-    "RlConfig",
-    "RlTrainer",
-    "ENV_REGISTRY",
-    "TOOL_REGISTRY",
-    "build_env",
     "calculator",
-    "resolve_tools",
-    "run_tool",
+    "call_tool",
+    "call_tool_by_name",
+    "tool_schemas",
 ]

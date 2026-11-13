@@ -7,8 +7,9 @@ from .modeling_teapot import (
     build_smollm_config,
     pack_conversation,
 )
-from .rl_config import EnvSpec, RlConfig
-from .rl import RlTrainer
+from .rl_config import RlConfig
+from .rl_datasets import SYNTH_MATH, RlDataset
+from .rl.trainer import RlTrainer
 from .tool_formats import TOOL_FORMATS, get_tool_format, tool_format_names
 from .trainer import TeapotTrainer
 from .datasets import (
@@ -101,7 +102,8 @@ __all__ = [
     "TeapotTrainer",
     "RlTrainer",
     "RlConfig",
-    "EnvSpec",
+    "RlDataset",
+    "SYNTH_MATH",
     "TrainingConfig",
     "ModelConfig",
     "DatasetSpec",
