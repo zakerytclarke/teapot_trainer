@@ -137,26 +137,35 @@ def score_text_answer(
     used_search: bool = False,
     require_search: bool = False,
 ) -> tuple[float, dict[str, float]]:
-    """Open-domain / web QA reward via exact match, containment, and token F1."""
+    """Open-domain / web QA reward.
+
+    Success is **containment-first**: if any gold answer string appears in the
+    reply (after normalization), the model gets full credit even when it adds
+    surrounding prose. Token F1 is only a fallback for paraphrases that do not
+    literally contain the gold span — long answers are not punished for length.
+    """
     if isinstance(gold_answers, str):
         golds = [gold_answers]
     else:
         golds = [str(g) for g in (gold_answers or []) if str(g).strip()]
     em, f1, contained = best_span_scores(prediction or "", golds)
-    # Prefer soft F1 so short paraphrases still get credit; EM/contain boost.
-    correct = max(f1, contained, em)
     prose = 1.0 if (prediction or "").strip() else 0.0
     search = 1.0 if used_search else 0.0
 
     if require_search and not used_search:
         reward = 0.0
-    else:
-        reward = float(correct)
-        if correct >= 0.5 and used_search:
+    elif contained or em:
+        # Has the answer somewhere in the reply — surrounding text is fine.
+        reward = 1.0
+        if used_search:
             reward += 0.15
-
-    if reward > 0 and prose and len((prediction or "").split()) > 2:
-        reward += 0.05
+    elif f1 >= 0.5:
+        # Paraphrase without literal span; keep soft credit, no length penalty.
+        reward = float(f1)
+        if used_search:
+            reward += 0.1
+    else:
+        reward = 0.0
 
     metrics = {
         "accuracy": float(em),

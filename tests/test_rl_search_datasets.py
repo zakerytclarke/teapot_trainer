@@ -169,9 +169,17 @@ def test_web_dataset_samplers_use_injected_state():
 
 
 def test_reward_helpers_and_hermes_still_listed():
-    reward, metrics = score_text_answer("Paris is the capital.", ["Paris"], used_search=True)
+    # Surrounding prose is fine as long as the gold span is present.
+    reward, metrics = score_text_answer(
+        "Sure — after checking sources, Paris is the capital of France.",
+        ["Paris"],
+        used_search=True,
+    )
     assert metrics["contained"] == 1.0
-    assert reward > 0.0
+    assert reward >= 1.0
+    # Verbose answers must not be punished relative to a short exact span.
+    short, _ = score_text_answer("Paris", ["Paris"], used_search=True)
+    assert reward >= short - 1e-6
     gsm_r, gsm_m = score_gsm8k_answer("#### 42", "foo #### 42", used_calculator=True)
     assert gsm_m["accuracy"] == 1.0
     assert gsm_r > 0.0
