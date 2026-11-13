@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Iterable
 
-from ..metrics import best_span_scores, gold_gsm_number, pred_gsm_number, score_gsm
+from ..metrics import best_span_scores, gold_gsm_number, is_abstention, pred_gsm_number, score_gsm
 
 
 _NUM = re.compile(r"[-+]?(?:\d+\.\d+|\d+|\.\d+)(?:[eE][-+]?\d+)?")
@@ -164,5 +164,43 @@ def score_text_answer(
         "contained": float(contained),
         "used_search": search,
         "prose": prose,
+    }
+    return float(reward), metrics
+
+
+def score_synthqa_answer(
+    prediction: str,
+    *,
+    gold_answer: str,
+    unanswerable: bool,
+) -> tuple[float, dict[str, float]]:
+    """Context-grounded SynthQA reward (mirrors supervised eval rules).
+
+    Unanswerable rows must abstain with the exact SynthQA refusal sentence.
+    Answerable rows are scored with span EM / F1 / containment; abstaining when
+    an answer exists is penalized.
+    """
+    text = prediction or ""
+    abstained = 1.0 if is_abstention(text) else 0.0
+    if unanswerable:
+        correct = abstained
+        em, f1, contained = (correct, correct, correct)
+        reward = float(correct)
+    else:
+        em, f1, contained = best_span_scores(text, [gold_answer])
+        correct = max(f1, contained, em)
+        reward = float(correct)
+        if abstained:
+            # Refused even though the context had the answer.
+            reward = 0.0
+            correct = 0.0
+
+    metrics = {
+        "accuracy": float(em),
+        "f1": float(f1),
+        "contained": float(contained),
+        "abstained": abstained,
+        "unanswerable": 1.0 if unanswerable else 0.0,
+        "prose": 1.0 if text.strip() else 0.0,
     }
     return float(reward), metrics

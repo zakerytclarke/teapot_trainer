@@ -10,6 +10,7 @@ from teapottrainer import (
     HOTPOT_RL,
     NQ_OPEN_RL,
     SearchSettings,
+    SYNTHQA_RL,
     TRIVIA_QA_RL,
     WEB_QUESTIONS_RL,
     bind_tools,
@@ -20,8 +21,9 @@ from teapottrainer import (
     make_llm_search,
     tool_format_names,
 )
+from teapottrainer.formatting import ABSTAIN_TEXT, RAG_SYSTEM
 from teapottrainer.rl.datasets import grade_episode, sample_episode
-from teapottrainer.rl.rewards import score_gsm8k_answer, score_text_answer, used_search_tools
+from teapottrainer.rl.rewards import score_gsm8k_answer, score_synthqa_answer, score_text_answer, used_search_tools
 from teapottrainer.rl.tools import tool_schemas
 
 
@@ -176,3 +178,76 @@ def test_reward_helpers_and_hermes_still_listed():
     assert used_search_tools([{"name": "exa_search", "arguments": {"query": "x"}}])
     assert "hermes" in tool_format_names()
     assert get_tool_format("hermes").name == "hermes"
+
+
+def test_synthqa_rl_is_context_only_and_rejects_tools():
+    answerable_rows = {
+        "rows": [
+            {
+                "type": "qa",
+                "context": "Paris is the capital of France.",
+                "question": "What is the capital of France?",
+                "answer": "Paris",
+            }
+        ]
+    }
+    unanswerable_rows = {
+        "rows": [
+            {
+                "type": "unanswerable",
+                "context": "The Nile is a river in Africa.",
+                "question": "What is the phone number for the Nile?",
+                "answer": "",
+            }
+        ]
+    }
+    answerable = sample_episode(SYNTHQA_RL, answerable_rows, random.Random(0))
+    assert answerable["tools"] == []
+    assert answerable["messages"][0]["content"] == RAG_SYSTEM
+    assert "Context:" in answerable["messages"][1]["content"]
+    assert answerable["meta"]["unanswerable"] is False
+
+    # Even bind_tools cannot stick — sample always clears tools.
+    poisoned = bind_tools(SYNTHQA_RL, build_search_tools(SearchSettings(mock=True)))
+    forced = sample_episode(poisoned, answerable_rows, random.Random(0))
+    assert forced["tools"] == []
+
+    good = [
+        *answerable["messages"],
+        {"role": "assistant", "content": "Paris"},
+    ]
+    reward, metrics = grade_episode(SYNTHQA_RL, good, answerable["meta"])
+    assert metrics["tool_violation"] == 0.0
+    assert reward > 0.0
+
+    with_tool = [
+        *answerable["messages"],
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"type": "function", "function": {"name": "brave_search", "arguments": {"query": "capital"}}}
+            ],
+        },
+        {"role": "tool", "name": "brave_search", "content": "Paris"},
+        {"role": "assistant", "content": "Paris"},
+    ]
+    bad_reward, bad_metrics = grade_episode(SYNTHQA_RL, with_tool, answerable["meta"])
+    assert bad_metrics["tool_violation"] == 1.0
+    assert bad_reward == 0.0
+
+    unans = sample_episode(SYNTHQA_RL, unanswerable_rows, random.Random(0))
+    assert unans["meta"]["unanswerable"] is True
+    assert unans["meta"]["answer"] == ABSTAIN_TEXT
+    abstain_conv = [*unans["messages"], {"role": "assistant", "content": ABSTAIN_TEXT}]
+    ok, ok_m = grade_episode(SYNTHQA_RL, abstain_conv, unans["meta"])
+    assert ok_m["abstained"] == 1.0
+    assert ok == 1.0
+    invent = [*unans["messages"], {"role": "assistant", "content": "555-0100"}]
+    zero, zero_m = grade_episode(SYNTHQA_RL, invent, unans["meta"])
+    assert zero_m["abstained"] == 0.0
+    assert zero == 0.0
+
+    synth_r, synth_m = score_synthqa_answer("Paris", gold_answer="Paris", unanswerable=False)
+    assert synth_m["contained"] == 1.0
+    assert synth_r > 0.0
