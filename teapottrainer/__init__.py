@@ -7,6 +7,10 @@ from .modeling_teapot import (
     build_smollm_config,
     pack_conversation,
 )
+from .rl_config import RlConfig
+from .rl.datasets import SYNTH_MATH, RlDataset
+from .rl.trainer import RlTrainer
+from .tool_formats import TOOL_FORMATS, get_tool_format, tool_format_names
 from .trainer import TeapotTrainer
 from .datasets import (
     DatasetSourceConfig,
@@ -87,12 +91,19 @@ __all__ = [
     "CHAT_FORMATS",
     "chat_format_names",
     "use_chat_format",
+    "TOOL_FORMATS",
+    "tool_format_names",
+    "get_tool_format",
     "TeapotConfig",
     "TeapotForCausalLM",
     "build_rag_config",
     "build_smollm_config",
     "pack_conversation",
     "TeapotTrainer",
+    "RlTrainer",
+    "RlConfig",
+    "RlDataset",
+    "SYNTH_MATH",
     "TrainingConfig",
     "ModelConfig",
     "DatasetSpec",
