@@ -8,7 +8,7 @@ from .modeling_teapot import (
     pack_conversation,
 )
 from .rl_config import RlConfig
-from .rl_datasets import SYNTH_MATH, RlDataset
+from .rl.datasets import SYNTH_MATH, RlDataset
 from .rl.trainer import RlTrainer
 from .tool_formats import TOOL_FORMATS, get_tool_format, tool_format_names
 from .trainer import TeapotTrainer

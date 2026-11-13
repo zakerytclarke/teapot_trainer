@@ -1,4 +1,4 @@
-"""RL skeleton: dataset API, tool formats, and a tiny end-to-end GRPO run."""
+"""RL skeleton: dataset API, rollouts JSON, eval_datasets, tiny e2e GRPO."""
 
 from __future__ import annotations
 
@@ -9,6 +9,8 @@ from pathlib import Path
 from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM
 
 from teapottrainer import (
+    DatasetSpec,
+    GSM8K_TEST,
     RlConfig,
     RlDataset,
     RlTrainer,
@@ -17,9 +19,9 @@ from teapottrainer import (
     tool_format_names,
 )
 from teapottrainer.rl.algorithms.grpo import group_advantages
+from teapottrainer.rl.datasets import grade_episode, prepare_dataset, sample_episode
 from teapottrainer.rl.rewards import extract_number, score_numeric_answer
 from teapottrainer.rl.tools import calculator, call_tool, tool_schemas
-from teapottrainer.rl_datasets import grade_episode, prepare_dataset, sample_episode
 
 
 CHAT_TEMPLATE = (
@@ -94,7 +96,7 @@ def test_synth_math_dataset_init_sample_grade():
     assert sample["messages"]
     assert "value" in sample["meta"]
     assert all(callable(fn) for fn in sample["tools"])
-    assert tool_name_set(sample["tools"]) == {"calculator"}
+    assert {getattr(fn, "__name__", "") for fn in sample["tools"]} == {"calculator"}
 
     gold = float(sample["meta"]["value"])
     good = sample["messages"] + [
@@ -110,13 +112,7 @@ def test_synth_math_dataset_init_sample_grade():
     assert reward_bad == 0.0
 
 
-def tool_name_set(tools):
-    return {getattr(fn, "__name__", "") for fn in tools}
-
-
 def test_custom_rl_dataset_is_extensible():
-    """Users can define their own init/sample/grade without a registry."""
-
     def init_fn():
         return {"answers": {"hi": "hello"}}
 
@@ -154,8 +150,10 @@ def test_rl_config_validates_tool_format_and_group_size():
         tool_format="qwen",  # alias -> hermes
         datasets=[SYNTH_MATH],
         group_size=4,
+        save_rollouts=False,
     )
     assert cfg.tool_format == "hermes"
+    assert cfg.eval_datasets == []
     try:
         RlConfig(init_from="dummy", datasets=[SYNTH_MATH], group_size=1)
         assert False, "expected group_size validation error"
@@ -163,8 +161,8 @@ def test_rl_config_validates_tool_format_and_group_size():
         pass
 
 
-def test_e2e_grpo_synth_math_tiny_model(tmp_path: Path):
-    """Full train+eval loop on SYNTH_MATH with a tiny random Llama."""
+def test_e2e_grpo_saves_rollouts_and_runs_eval_hooks(tmp_path: Path):
+    """Full train+eval loop: rollouts.json + before/after eval_datasets hooks."""
     model_dir = _tiny_tokenizer_and_model(tmp_path)
     run_root = tmp_path / "runs"
     config = RlConfig(
@@ -172,6 +170,8 @@ def test_e2e_grpo_synth_math_tiny_model(tmp_path: Path):
         tokenizer=str(model_dir),
         tool_format="hermes",
         datasets=[SYNTH_MATH],
+        # Same DatasetSpec type as TeapotTrainer; empty-safe path still exercises hooks.
+        eval_datasets=[],
         algorithm="grpo",
         group_size=2,
         max_turns=2,
@@ -183,20 +183,45 @@ def test_e2e_grpo_synth_math_tiny_model(tmp_path: Path):
         eval_every_episodes=2,
         eval_episodes=2,
         resume_every_episodes=2,
+        save_rollouts=True,
         logging_dir=str(run_root),
         seed=0,
     )
     run_dir = RlTrainer(config).train(fresh=True)
     assert run_dir.exists()
+
     metrics_path = run_dir / "metrics.jsonl"
     assert metrics_path.exists()
     rows = [json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    assert any("reward_mean" in row for row in rows)
-    assert any(row.get("split") == "final_eval" for row in rows)
-    assert (run_dir / "checkpoints" / "final").exists()
+    splits = {row.get("split") for row in rows if "split" in row}
+    assert "eval_before_rl" in splits
+    assert "eval_after_rl" in splits
+    assert any(row.get("split") == "final_rl_env_eval" for row in rows)
+
+    rollouts_path = run_dir / "rollouts.json"
+    assert rollouts_path.exists()
+    rollouts = json.loads(rollouts_path.read_text(encoding="utf-8"))
+    assert isinstance(rollouts, list)
+    assert rollouts
+    assert "conversation" in rollouts[0]
+    assert "score" in rollouts[0]
+    assert "metrics" in rollouts[0]
+
     saved = json.loads((run_dir / "rl_config.json").read_text(encoding="utf-8"))
     assert saved["tool_format"] == "hermes"
     assert saved["datasets"][0]["name"] == "synth_math"
+    assert saved["save_rollouts"] is True
+
+
+def test_rl_config_accepts_training_eval_dataset_specs():
+    cfg = RlConfig(
+        init_from="dummy",
+        datasets=[SYNTH_MATH],
+        eval_datasets=[DatasetSpec(source=GSM8K_TEST, target_tokens=0)],
+        save_rollouts=False,
+    )
+    assert len(cfg.eval_datasets) == 1
+    assert cfg.eval_datasets[0].source.name == GSM8K_TEST.name
 
 
 def test_score_numeric_helper():

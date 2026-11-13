@@ -6,11 +6,12 @@ Parallel to ``TrainingConfig``. The unit of work is an episode sampled from an
 
 from __future__ import annotations
 
-from typing import Any, List, Optional, Union
+from typing import Any, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 
-from .rl_datasets import RlDataset, SYNTH_MATH
+from .config import DatasetSpec
+from .rl.datasets import SYNTH_MATH, RlDataset
 from .tool_formats import get_tool_format
 
 
@@ -30,6 +31,11 @@ class RlConfig(BaseModel):
 
     # Mixture of RL datasets. Each has init_fn / sample_fn / grade_fn / tools.
     datasets: List[RlDataset] = Field(default_factory=lambda: [SYNTH_MATH])
+    # Same ``DatasetSpec`` list as ``TrainingConfig.eval_datasets``. Scored with
+    # ``evaluate_source`` before RL, at checkpoint intervals, and after RL.
+    eval_datasets: List[DatasetSpec] = Field(default_factory=list)
+    eval_example_cap: int = 64
+    holdout_ratio: float = 0.05
 
     algorithm: str = "grpo"
     group_size: int = 4
@@ -50,6 +56,10 @@ class RlConfig(BaseModel):
     eval_every_episodes: int = 50
     eval_episodes: int = 32
     resume_every_episodes: int = 50
+
+    # When True, write scored conversations to ``rollouts.json`` (or ``rollouts_path``).
+    save_rollouts: bool = True
+    rollouts_path: Optional[str] = None
 
     before_batch: Optional[Any] = None
 

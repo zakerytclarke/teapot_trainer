@@ -8,13 +8,16 @@ Flow per episode:
 3. roll out tool-using conversation
 4. ``grade_fn(conversation_json, meta)`` → numeric reward
 5. GRPO update over the group of rollouts for that sample
+
+``eval_datasets`` uses the same ``DatasetSpec`` / ``evaluate_source`` path as
+``TeapotTrainer``: scored before RL, at checkpoint intervals, and after RL.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-import os
+import math
 import random
 import time
 from pathlib import Path
@@ -26,13 +29,16 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from ..config import DatasetSpec
+from ..datasets import DatasetSourceConfig
+from ..evals import evaluate_source, selection_score, source_key, task_kind
 from ..rl_config import RlConfig
-from ..rl_datasets import RlDataset, grade_episode, prepare_dataset, sample_episode
 from ..tool_formats import get_tool_format
 from .algorithms.grpo import build_batch_tensors, group_advantages, grpo_loss
+from .datasets import RlDataset, grade_episode, prepare_dataset, sample_episode
 from .rollouts import Trajectory, rollout_episode
 
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+torch.set_float32_matmul_precision("high")
 
 
 def _run_hash(config: RlConfig) -> str:
@@ -48,6 +54,15 @@ def _select_dataset(datasets: list[RlDataset], rng: random.Random) -> RlDataset:
     return rng.choices(datasets, weights=weights, k=1)[0]
 
 
+def _materialize_source(spec: DatasetSpec) -> DatasetSourceConfig:
+    source = spec.source
+    if isinstance(source, str):
+        return DatasetSourceConfig(name=source)
+    if isinstance(source, DatasetSourceConfig):
+        return source
+    raise TypeError(f"Unsupported eval dataset source type: {type(source)!r}")
+
+
 class RlTrainer:
     """Reinforcement learning trainer for tool-using language models."""
 
@@ -60,10 +75,19 @@ class RlTrainer:
         self.run_dir = base / run_name
         self.ckpt_dir = self.run_dir / "checkpoints"
         self.metrics_path = self.run_dir / "metrics.jsonl"
+        self.rollouts_path = Path(config.rollouts_path) if config.rollouts_path else self.run_dir / "rollouts.json"
+        self.rollouts: list[dict[str, Any]] = []
+        self.best_behavior: float | None = None
+        self.best_loss: float | None = None
 
     def train(self, fresh: bool = True) -> Path:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
+        if self.config.save_rollouts:
+            self.rollouts_path.parent.mkdir(parents=True, exist_ok=True)
+            if fresh and self.rollouts_path.exists():
+                self.rollouts_path.unlink()
+            self.rollouts = []
         (self.run_dir / "rl_config.json").write_text(
             json.dumps(self.config.model_dump(mode="json"), indent=2, default=str),
             encoding="utf-8",
@@ -109,11 +133,22 @@ class RlTrainer:
         resume_path = self.ckpt_dir / "resume"
         if not fresh and resume_path.exists():
             start_episodes = self._load_resume(model, optimizer, resume_path)
+            if self.config.save_rollouts and self.rollouts_path.exists():
+                try:
+                    self.rollouts = json.loads(self.rollouts_path.read_text(encoding="utf-8"))
+                    if not isinstance(self.rollouts, list):
+                        self.rollouts = []
+                except json.JSONDecodeError:
+                    self.rollouts = []
 
         writer = SummaryWriter(log_dir=str(self.run_dir / "tb"))
         episodes_done = start_episodes
         best_score = float("-inf")
         pbar = tqdm(total=int(self.config.max_train_episodes), initial=episodes_done, desc="rl")
+
+        # Same idea as TeapotTrainer: score held-out eval sets before training.
+        if start_episodes == 0:
+            self.run_evaluation_suite(model, tokenizer, tag="before_rl", episode=0, writer=writer)
 
         while episodes_done < int(self.config.max_train_episodes):
             dataset = _select_dataset(self.config.datasets, rng)
@@ -121,7 +156,7 @@ class RlTrainer:
             sample = sample_episode(dataset, state, rng)
 
             trajectories: list[Trajectory] = []
-            for _ in range(int(self.config.group_size)):
+            for group_index in range(int(self.config.group_size)):
                 self._run_before_batch(model, phase="rl")
                 traj = rollout_episode(
                     model,
@@ -137,6 +172,14 @@ class RlTrainer:
                 traj.reward = reward
                 traj.metrics = metrics
                 trajectories.append(traj)
+                self._record_rollout(
+                    split="train",
+                    episode=episodes_done + 1,
+                    dataset_name=dataset.name,
+                    sample=sample,
+                    traj=traj,
+                    group_index=group_index,
+                )
 
             rewards = [t.reward for t in trajectories]
             advantages = group_advantages(rewards)
@@ -170,30 +213,137 @@ class RlTrainer:
             writer.add_scalar("rl/loss", update_metrics.get("loss", 0.0), episodes_done)
 
             if episodes_done % int(self.config.eval_every_episodes) == 0:
-                eval_stats = self.evaluate(model, tokenizer, dataset_state, rng)
-                row = {"episode": episodes_done, "split": "eval", **eval_stats}
-                self._append_metrics(row)
-                writer.add_scalar("eval/accuracy", eval_stats.get("accuracy", 0.0), episodes_done)
-                writer.add_scalar("eval/reward", eval_stats.get("reward", 0.0), episodes_done)
-                if eval_stats.get("reward", float("-inf")) >= best_score:
-                    best_score = float(eval_stats["reward"])
+                # RL-env quick eval (same training datasets, greedy).
+                env_stats = self.evaluate_rl_envs(model, tokenizer, dataset_state, rng)
+                self._append_metrics({"episode": episodes_done, "split": "rl_env_eval", **env_stats})
+                writer.add_scalar("rl_env_eval/accuracy", env_stats.get("accuracy", 0.0), episodes_done)
+                writer.add_scalar("rl_env_eval/reward", env_stats.get("reward", 0.0), episodes_done)
+                if env_stats.get("reward", float("-inf")) >= best_score:
+                    best_score = float(env_stats["reward"])
                     self._save_checkpoint(model, optimizer, episodes_done, self.ckpt_dir / "best")
+
+                # Held-out DatasetSpec suite (same as pretrain/SFT trainer).
+                self.run_evaluation_suite(
+                    model,
+                    tokenizer,
+                    tag=f"rl_{episodes_done}",
+                    episode=episodes_done,
+                    writer=writer,
+                )
+                self._save_checkpoint(model, optimizer, episodes_done, self.ckpt_dir / f"eval_{episodes_done}")
 
             if episodes_done % int(self.config.resume_every_episodes) == 0:
                 self._save_checkpoint(model, optimizer, episodes_done, resume_path)
 
         pbar.close()
-        eval_stats = self.evaluate(model, tokenizer, dataset_state, rng)
-        self._append_metrics({"episode": episodes_done, "split": "final_eval", **eval_stats})
+        env_stats = self.evaluate_rl_envs(model, tokenizer, dataset_state, rng)
+        self._append_metrics({"episode": episodes_done, "split": "final_rl_env_eval", **env_stats})
+        self.run_evaluation_suite(model, tokenizer, tag="after_rl", episode=episodes_done, writer=writer)
         self._save_checkpoint(model, optimizer, episodes_done, resume_path)
         final_dir = self.ckpt_dir / "final"
         model.save_pretrained(final_dir)
         tokenizer.save_pretrained(final_dir)
+        self._flush_rollouts()
         writer.close()
         return self.run_dir
 
+    def run_evaluation_suite(
+        self,
+        model,
+        tokenizer,
+        *,
+        tag: str,
+        episode: int,
+        writer: SummaryWriter | None = None,
+    ) -> dict[str, float]:
+        """Score ``eval_datasets`` with the same helpers as ``TeapotTrainer``."""
+        flat: dict[str, float] = {}
+        print("\n" + "=" * 78)
+        print(f" RL EVAL  {tag}  episode {episode}")
+        print("=" * 78)
+        if not self.config.eval_datasets:
+            print(" No eval datasets configured.")
+            print("=" * 78 + "\n")
+            self._append_metrics({"episode": episode, "split": f"eval_{tag}", "empty": 1.0})
+            return flat
+
+        was_training = model.training
+        model.eval()
+        seq_len = int(getattr(getattr(model, "config", None), "max_position_embeddings", 2048) or 2048)
+
+        for spec in self.config.eval_datasets:
+            src = _materialize_source(spec)
+            kind = task_kind(src)
+            key = source_key(src)
+            print(f" scoring {key} ({kind}) on up to {self.config.eval_example_cap} examples...")
+            result = evaluate_source(
+                model,
+                tokenizer,
+                src,
+                device=self.device,
+                seq_len=seq_len,
+                max_examples=int(self.config.eval_example_cap),
+                seed=self.config.seed,
+                holdout_ratio=float(self.config.holdout_ratio),
+            )
+            for name, value in result["metrics"].items():
+                flat[f"{key}/{name}"] = float(value)
+                if not name.startswith("support"):
+                    support = result["metrics"].get(f"support_{name}", result["metrics"].get("support"))
+                    suffix = f"  n={int(support)}" if support is not None else ""
+                    print(f"   {name}: {value:.3f}{suffix}")
+
+        behavior = selection_score(flat)
+        losses = [value for name, value in flat.items() if name.endswith("/loss")]
+        mean_loss = sum(losses) / len(losses) if losses else None
+        if mean_loss is not None:
+            flat["loss"] = mean_loss
+            flat["perplexity"] = math.exp(min(mean_loss, 20))
+        if behavior is not None:
+            flat["behavior_score"] = float(behavior)
+            print(f" behavior_score: {behavior:.3f}")
+        if mean_loss is not None:
+            print(f" mean_eval_loss: {mean_loss:.4f}  ppl {flat['perplexity']:.2f}")
+        print("=" * 78 + "\n")
+
+        self._append_metrics({"episode": episode, "split": f"eval_{tag}", **flat})
+        if writer is not None:
+            for name, value in flat.items():
+                writer.add_scalar(f"eval/{tag}/{name}", value, episode)
+
+        improved = False
+        if behavior is not None and (self.best_behavior is None or behavior >= self.best_behavior):
+            self.best_behavior = float(behavior)
+            improved = True
+        elif behavior is None and mean_loss is not None and (self.best_loss is None or mean_loss <= self.best_loss):
+            self.best_loss = float(mean_loss)
+            improved = True
+        if flat:
+            snap = self.ckpt_dir / f"eval_{tag}"
+            snap.mkdir(parents=True, exist_ok=True)
+            model.save_pretrained(snap)
+            tokenizer.save_pretrained(snap)
+            (snap / "metrics.json").write_text(
+                json.dumps({"tag": tag, "episode": episode, "metrics": flat}, indent=2),
+                encoding="utf-8",
+            )
+        if improved and flat:
+            best_dir = self.ckpt_dir / "best_eval"
+            best_dir.mkdir(parents=True, exist_ok=True)
+            model.save_pretrained(best_dir)
+            tokenizer.save_pretrained(best_dir)
+            (best_dir / "metrics.json").write_text(
+                json.dumps({"tag": tag, "episode": episode, "metrics": flat}, indent=2),
+                encoding="utf-8",
+            )
+
+        if was_training:
+            model.train()
+        return flat
+
     @torch.no_grad()
-    def evaluate(self, model, tokenizer, dataset_state: dict[str, Any], rng: random.Random) -> dict[str, float]:
+    def evaluate_rl_envs(self, model, tokenizer, dataset_state: dict[str, Any], rng: random.Random) -> dict[str, float]:
+        """Greedy rollouts on the RL training datasets (not DatasetSpec evals)."""
         was_training = model.training
         model.eval()
         rewards = []
@@ -213,9 +363,19 @@ class RlTrainer:
                 top_p=1.0,
             )
             reward, metrics = grade_episode(dataset, traj.messages, traj.meta)
+            traj.reward = reward
+            traj.metrics = metrics
             rewards.append(reward)
             accs.append(metrics.get("accuracy", metrics.get("score", 0.0)))
             tool_rates.append(1.0 if metrics.get("used_calculator", 0.0) > 0 else 0.0)
+            self._record_rollout(
+                split="rl_env_eval",
+                episode=-1,
+                dataset_name=dataset.name,
+                sample=sample,
+                traj=traj,
+                group_index=0,
+            )
         if was_training:
             model.train()
         return {
@@ -223,6 +383,44 @@ class RlTrainer:
             "accuracy": float(sum(accs) / max(len(accs), 1)),
             "calculator_rate": float(sum(tool_rates) / max(len(tool_rates), 1)),
         }
+
+    def _record_rollout(
+        self,
+        *,
+        split: str,
+        episode: int,
+        dataset_name: str,
+        sample: dict[str, Any],
+        traj: Trajectory,
+        group_index: int,
+    ) -> None:
+        if not self.config.save_rollouts:
+            return
+        record = {
+            "time": time.time(),
+            "split": split,
+            "episode": int(episode),
+            "dataset": dataset_name,
+            "sample_id": sample.get("sample_id") or traj.sample_id,
+            "group_index": int(group_index),
+            "score": float(traj.reward),
+            "metrics": dict(traj.metrics),
+            "meta": dict(traj.meta),
+            "conversation": list(traj.messages),
+        }
+        self.rollouts.append(record)
+        # Flush often so a crash still leaves a usable JSON file.
+        if len(self.rollouts) % 4 == 0:
+            self._flush_rollouts()
+
+    def _flush_rollouts(self) -> None:
+        if not self.config.save_rollouts:
+            return
+        self.rollouts_path.parent.mkdir(parents=True, exist_ok=True)
+        self.rollouts_path.write_text(
+            json.dumps(self.rollouts, indent=2, default=str),
+            encoding="utf-8",
+        )
 
     def _grpo_update(self, model, ref_model, optimizer, tokenizer, trajectories, advantages) -> dict[str, float]:
         model.train()
@@ -280,6 +478,7 @@ class RlTrainer:
             json.dumps({"episodes": int(episodes), "seed": self.config.seed}, indent=2),
             encoding="utf-8",
         )
+        self._flush_rollouts()
 
     def _load_resume(self, model, optimizer, path: Path) -> int:
         weights = AutoModelForCausalLM.from_pretrained(path, trust_remote_code=True)

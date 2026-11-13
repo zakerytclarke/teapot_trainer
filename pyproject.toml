@@ -44,7 +44,7 @@ packages = [
     "teapottrainer",
     "teapottrainer.rl",
     "teapottrainer.rl.algorithms",
-    "teapottrainer.rl.tasks",
+    "teapottrainer.rl.datasets",
 ]
 
 [tool.setuptools.dynamic]
