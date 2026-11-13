@@ -4,9 +4,10 @@ The public surface is still ``TeapotTrainer(TrainingConfig).train(fresh=True)``.
 ``config.phases`` is the recipe. When it is empty, the pretrain, bridge, and
 supervised dataset lists are that recipe.
 ``fresh=False`` continues from ``checkpoints/resume`` when that directory
-exists: weights, optimizer, and the exact sample cursor. The cursor is
-rebuilt by replaying the seeded mixture from the start of the phase, then
-checked against the saved counts and random state.
+exists: weights, optimizer, and the exact sample cursor. Hugging Face
+streaming parquet sources seek by skipping whole shards over HTTP, then
+walking packed tokens on the last shard until per-source ``produced``
+matches. Tiny non-parquet tests still replay the mixed sample skip.
 Batch size, cosine schedule, bf16, and per-source token budgets are applied
 inside that call. ``init_from`` is an optional method argument for a
 confidence run that starts from an existing checkpoint; it is not a config field.
@@ -57,7 +58,12 @@ from .datasets import (
     DatasetSourceConfig,
     encode_pair,
     eos_loss_weight,
+    is_hf_parquet_source,
     iterate_encoded,
+    open_dataset,
+    parquet_shard_files,
+    parquet_shard_sizes,
+    shards_to_skip,
     span_loss_weight,
 )
 from .evals import evaluate_source, selection_score, source_key, task_kind
@@ -910,7 +916,7 @@ class TeapotTrainer:
             except StopIteration:
                 return None
 
-    def _open_iterators(self, sources, tokenizer):
+    def _open_iterators(self, sources, tokenizer, skip_shards: list[int] | None = None):
         return [
             iter(
                 DatasetRegistry.prepare_dataset_splits(
@@ -920,10 +926,67 @@ class TeapotTrainer:
                     is_eval=False,
                     holdout_ratio=self.config.holdout_ratio,
                     seed=self.config.seed,
+                    skip_shards=None if not skip_shards else [skip_shards[index]],
                 )[0]
             )
-            for src in sources
+            for index, src in enumerate(sources)
         ]
+
+    def _parquet_skip_plan(self, sources, produced_target: list[int]) -> list[tuple[int, int]] | None:
+        """Return (shards_to_skip, last_shard_walk_tokens) per source, or None."""
+        if not sources or not all(is_hf_parquet_source(src) for src in sources):
+            return None
+        tokens_per_byte = 0.20
+        plan = []
+        for src, target in zip(sources, produced_target):
+            dataset = open_dataset(src, streaming=True)
+            dataset = dataset.shuffle(seed=self.config.seed, buffer_size=512)
+            files = parquet_shard_files(dataset)
+            if len(files) <= 1:
+                print(f"  {source_key(src)}: no parquet shards to skip")
+                return None
+            sizes = parquet_shard_sizes(files)
+            skip = shards_to_skip(sizes, int(target), tokens_per_byte)
+            skipped_est = int(sum(sizes[:skip]) * tokens_per_byte)
+            remainder = max(0, int(target) - skipped_est)
+            skipped_bytes = sum(sizes[:skip])
+            print(
+                f"  {source_key(src)}: skip {skip}/{len(files)} parquet shards "
+                f"({skipped_bytes / 1e9:.2f}GB HTTP jump, ~{skipped_est:,} tok), "
+                f"then walk ~{remainder:,} tok on the next shard"
+            )
+            if skip <= 0 and int(target) > 100_000_000:
+                print(f"  {source_key(src)}: shard skip would walk the full prefix; refusing the old mixed skip")
+                return None
+            if remainder > 2_000_000_000:
+                print(
+                    f"  {source_key(src)}: last-shard remainder {remainder:,} is still a multi-hour encode; "
+                    "refusing to start it"
+                )
+                return None
+            plan.append((skip, remainder))
+        return plan
+
+    def _walk_source_to_tokens(self, iterator, target: int, label: str) -> int:
+        packed = 0
+        progress = tqdm(
+            total=target,
+            desc=f"[{label} shard-walk]",
+            unit="tok",
+            unit_scale=True,
+            dynamic_ncols=True,
+        )
+        try:
+            while packed < target:
+                sample = next(iterator)
+                packed += len(sample["input_ids"])
+                progress.update(len(sample["input_ids"]))
+        except StopIteration:
+            progress.close()
+            raise SystemExit(f"Resume shard-walk for {label} ran out of data at {packed:,} of {target:,} tokens.")
+        finally:
+            progress.close()
+        return packed
 
     def _fast_forward(self, phase_name, weights, budgets, produced, retired, take, samples_target, produced_target, restarts_target, random_target):
         print(
@@ -1102,11 +1165,8 @@ class TeapotTrainer:
             print(f"  {source_key(src)}: {budget:,} tokens")
         # Reseed immediately before the mixture so resume replays the same draws.
         random.seed(self.config.seed)
-        iterators = self._open_iterators(sources, tokenizer)
-
-        def take(index):
-            return self._next_sample(index, sources, iterators, restarts)
-
+        iterators = None
+        plan = None
         tokens = 0
         samples_taken = 0
         micro_steps = 0
@@ -1123,6 +1183,50 @@ class TeapotTrainer:
         if resume:
             tokens = int(resume["tokens"])
             samples_target = int(resume["samples_taken"])
+            produced_target = list(resume["produced"])
+            plan = self._parquet_skip_plan(sources, produced_target)
+            if plan is None and any(is_hf_parquet_source(src) for src in sources):
+                raise SystemExit(
+                    "Resume needs per-source parquet shard skip (mixed sample skip does not land "
+                    "and would walk ~7h then SystemExit). Shard skip was not available for these sources."
+                )
+            if plan is not None:
+                print(
+                    f"Seeking {phase_name} per source to the checkpoint produced counts "
+                    f"({sum(produced_target):,} tokens) by skipping parquet shards over HTTP."
+                )
+                iterators = self._open_iterators(sources, tokenizer, skip_shards=[item[0] for item in plan])
+                for index, src in enumerate(sources):
+                    remainder = plan[index][1]
+                    if remainder:
+                        self._walk_source_to_tokens(iterators[index], remainder, source_key(src))
+                    produced[index] = int(produced_target[index])
+                restarts[:] = list(resume["restarts"])
+                _set_python_random_state(resume["python_random"])
+                if produced != produced_target or list(self._restarts) != list(resume["restarts"]):
+                    raise SystemExit(
+                        f"Resume shard skip for {phase_name} did not land on the checkpoint cursor.\n"
+                        f"  produced now {produced}, checkpoint {produced_target}\n"
+                        f"  restarts now {list(self._restarts)}, checkpoint {list(resume['restarts'])}"
+                    )
+                if _python_random_state() != resume["python_random"]:
+                    raise SystemExit(
+                        f"Resume shard skip for {phase_name} did not land on the checkpoint random state."
+                    )
+                print(f"Shard skip complete at {sum(produced):,} tokens.")
+            global_step = int(resume["global_step"])
+            micro_steps = int(resume["micro_steps"])
+            next_eval = float(resume["next_eval"])
+            first_loss = resume.get("first_loss")
+            best_train_loss = resume.get("best_train_loss")
+            samples_taken = samples_target
+        if iterators is None:
+            iterators = self._open_iterators(sources, tokenizer)
+
+        def take(index):
+            return self._next_sample(index, sources, iterators, restarts)
+
+        if resume and plan is None:
             self._fast_forward(
                 phase_name,
                 weights,
@@ -1135,13 +1239,9 @@ class TeapotTrainer:
                 resume["restarts"],
                 resume["python_random"],
             )
+        if resume:
             _restore_torch_rng(resume["torch_rng"])
-            global_step = int(resume["global_step"])
-            micro_steps = int(resume["micro_steps"])
-            next_eval = float(resume["next_eval"])
-            first_loss = resume.get("first_loss")
-            best_train_loss = resume.get("best_train_loss")
-            samples_taken = samples_target
+
         optimizer = self._optimizer(_unwrap(model), peak_lr)
         optimizer_path = os.path.join(resume["dir"], "optimizer.pt") if resume else ""
         if resume and os.path.isfile(optimizer_path):

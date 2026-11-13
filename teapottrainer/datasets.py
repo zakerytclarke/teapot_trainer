@@ -802,6 +802,125 @@ def open_dataset(src: DatasetSourceConfig, streaming: bool):
         raise
 
 
+def is_hf_parquet_source(src: DatasetSourceConfig | str) -> bool:
+    name = getattr(src, "name", src)
+    return isinstance(name, str) and "/" in name and not str(name).startswith((".", "/", "~"))
+
+
+def _arrow_examples_iterable(dataset):
+    inner = getattr(dataset, "_ex_iterable", None)
+    seen: set[int] = set()
+    while inner is not None and id(inner) not in seen:
+        seen.add(id(inner))
+        files = getattr(getattr(inner, "kwargs", None), "get", None)
+        if callable(files) and inner.kwargs.get("files"):
+            return inner
+        if hasattr(inner, "generate_tables_fn") and isinstance(getattr(inner, "kwargs", None), dict):
+            return inner
+        inner = getattr(inner, "ex_iterable", None)
+    return None
+
+
+def parquet_shard_files(dataset) -> list[str]:
+    inner = _arrow_examples_iterable(dataset)
+    if inner is None:
+        return []
+    files = inner.kwargs.get("files") or []
+    return [str(item) for item in files]
+
+
+_REPO_SIZE_CACHE: dict[str, dict[str, int]] = {}
+
+
+def _hf_url_parts(url: str) -> tuple[str, str] | None:
+    prefix = "hf://datasets/"
+    if not url.startswith(prefix) or "@" not in url:
+        return None
+    rest = url[len(prefix) :]
+    repo, right = rest.split("@", 1)
+    if "/" not in right:
+        return None
+    _rev, path = right.split("/", 1)
+    return repo, path
+
+
+def parquet_shard_sizes(files: list[str]) -> list[int]:
+    """Byte sizes for ``hf://datasets/...`` parquet URLs. Missing sizes are 0."""
+    sizes = [0] * len(files)
+    needed: dict[str, list[int]] = {}
+    for index, url in enumerate(files):
+        parts = _hf_url_parts(url)
+        if parts is None:
+            continue
+        repo, path = parts
+        cached = _REPO_SIZE_CACHE.get(repo)
+        if cached and path in cached:
+            sizes[index] = cached[path]
+        else:
+            needed.setdefault(repo, []).append(index)
+    if not needed:
+        return sizes
+    from huggingface_hub import HfApi
+
+    api = HfApi()
+    for repo, indexes in needed.items():
+        listing = _REPO_SIZE_CACHE.setdefault(repo, {})
+        for item in api.list_repo_tree(repo, repo_type="dataset", recursive=True):
+            path = getattr(item, "path", None)
+            size = getattr(item, "size", None)
+            if path and path.endswith(".parquet") and size:
+                listing[path] = int(size)
+        for index in indexes:
+            parts = _hf_url_parts(files[index])
+            if parts is None:
+                continue
+            sizes[index] = listing.get(parts[1], 0)
+    return sizes
+
+
+def shards_to_skip(sizes: list[int], target_tokens: int, tokens_per_byte: float = 0.20) -> int:
+    """Skip whole files whose estimated packed tokens stay under ``target_tokens``.
+
+    ``tokens_per_byte`` is an underestimate so this prefers walking the last
+    shard over jumping past the resume cursor. Always leaves at least one file.
+    """
+    if not sizes or target_tokens <= 0:
+        return 0
+    skipped = 0.0
+    last = len(sizes) - 1
+    index = 0
+    while index < last:
+        estimated = sizes[index] * tokens_per_byte
+        if skipped + estimated >= target_tokens:
+            break
+        skipped += estimated
+        index += 1
+    remaining = target_tokens - skipped
+    while remaining > 1_500_000_000 and index < last:
+        skipped += sizes[index] * tokens_per_byte
+        index += 1
+        remaining = target_tokens - skipped
+    return index
+
+
+def skip_prefix_shards(dataset, count: int):
+    """Start a streaming parquet dataset at shard ``count`` without opening earlier files."""
+    if count <= 0:
+        return dataset
+    inner = _arrow_examples_iterable(dataset)
+    if inner is None:
+        raise SystemExit("cannot shard-skip this streaming dataset (no parquet file list)")
+    total = int(getattr(inner, "num_shards", 0) or 0)
+    if total <= 1:
+        return dataset
+    count = min(int(count), total - 1)
+    state = inner._init_state_dict()
+    state["shard_idx"] = count
+    if "shard_example_idx" in state:
+        state["shard_example_idx"] = 0
+    return dataset
+
+
 def holdout_membership(key: str, ratio: float, seed: int) -> bool:
     """True when this example belongs to the train-split holdout."""
     if ratio <= 0:
@@ -905,6 +1024,7 @@ def iterate_encoded(
     holdout_ratio: float = 0.05,
     seed: int = 42,
     rows: list[dict] | None = None,
+    skip_shards: int = 0,
 ) -> Iterator[dict]:
     """Yield fixed trainer examples.
 
@@ -922,6 +1042,8 @@ def iterate_encoded(
             # reach past them or a short run never sees an abstention.
             buffer = 4096 if "squad" in (src.name or "") else 512
             dataset = dataset.shuffle(seed=seed, buffer_size=buffer)
+        if skip_shards:
+            dataset = skip_prefix_shards(dataset, skip_shards)
         for row in dataset:
             yield row
 
@@ -981,9 +1103,11 @@ class DatasetRegistry:
         is_eval: bool = False,
         holdout_ratio: float = 0.05,
         seed: int = 42,
+        skip_shards: list[int] | None = None,
     ):
         streams = []
-        for src in sources:
+        for index, src in enumerate(sources):
+            skipped = 0 if not skip_shards else int(skip_shards[index])
             streams.append(
                 iterate_encoded(
                     src,
@@ -992,6 +1116,7 @@ class DatasetRegistry:
                     is_eval=is_eval,
                     holdout_ratio=holdout_ratio,
                     seed=seed,
+                    skip_shards=skipped,
                 )
             )
         return streams

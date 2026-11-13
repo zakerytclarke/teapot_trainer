@@ -621,6 +621,18 @@ def test_mixture_fast_forward_replays_the_same_samples():
     assert cursor == full
 
 
+def test_shards_to_skip_leaves_a_last_shard_walk():
+    from teapottrainer.datasets import shards_to_skip
+
+    sizes = [1_000_000_000] * 10
+    skip = shards_to_skip(sizes, 3_300_000_000, tokens_per_byte=0.20)
+    assert 0 < skip < 10
+    skipped = skip * 1_000_000_000 * 0.20
+    assert skipped < 3_300_000_000
+    assert shards_to_skip([], 1) == 0
+    assert shards_to_skip(sizes, 0) == 0
+
+
 def test_fast_forward_rejects_a_cursor_that_does_not_match():
     import json
     import random
