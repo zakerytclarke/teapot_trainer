@@ -91,3 +91,8 @@ def grade_episode(
     """Grade a finished conversation JSON."""
     raw = dataset.grade_fn(conversation, meta or {})
     return normalize_grade(raw)
+
+
+def bind_tools(dataset: RlDataset, tools: list[ToolFn] | None) -> RlDataset:
+    """Return a copy of ``dataset`` with a new tool list (e.g. search backends)."""
+    return dataset.model_copy(update={"tools": list(tools or [])})
