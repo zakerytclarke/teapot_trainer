@@ -12,6 +12,7 @@ from .search import (
     make_brave_search,
     make_exa_search,
     make_llm_search,
+    make_llmsearchindex,
 )
 from .tools import calculator, call_tool, call_tool_by_name, tool_schemas
 
@@ -21,6 +22,7 @@ __all__ = [
     "make_brave_search",
     "make_exa_search",
     "make_llm_search",
+    "make_llmsearchindex",
     "calculator",
     "call_tool",
     "call_tool_by_name",

@@ -37,7 +37,7 @@ class RlConfig(BaseModel):
     eval_datasets: List[DatasetSpec] = Field(default_factory=list)
     eval_example_cap: int = 64
     holdout_ratio: float = 0.05
-    # Optional search backend knobs (Brave / Exa / LLM-search). Datasets still
+    # Optional search knobs (default backend: llmsearchindex). Datasets still
     # need ``bind_tools(..., build_search_tools(search))`` to expose them.
     search: Optional[SearchSettings] = None
 

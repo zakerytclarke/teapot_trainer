@@ -15,6 +15,7 @@ from .rl.datasets import (
     RlDataset,
     SYNTH_MATH,
     SYNTHQA_RL,
+    TEAPOT_CHAT_RL,
     TRIVIA_QA_RL,
     WEB_QUESTIONS_RL,
     bind_tools,
@@ -25,6 +26,7 @@ from .rl.search import (
     make_brave_search,
     make_exa_search,
     make_llm_search,
+    make_llmsearchindex,
 )
 from .rl.trainer import RlTrainer
 from .tool_formats import TOOL_FORMATS, get_tool_format, tool_format_names
@@ -103,7 +105,7 @@ from .datasets import (
     BFCL_IRRELEVANCE,
 )
 
-__version__ = "0.1.6"
+__version__ = "0.1.8"
 __all__ = [
     "CHAT_FORMATS",
     "chat_format_names",
@@ -123,6 +125,7 @@ __all__ = [
     "SYNTH_MATH",
     "GSM8K_RL",
     "SYNTHQA_RL",
+    "TEAPOT_CHAT_RL",
     "NQ_OPEN_RL",
     "HOTPOT_RL",
     "WEB_QUESTIONS_RL",
@@ -133,6 +136,7 @@ __all__ = [
     "make_brave_search",
     "make_exa_search",
     "make_llm_search",
+    "make_llmsearchindex",
     "TrainingConfig",
     "ModelConfig",
     "DatasetSpec",

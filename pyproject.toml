@@ -33,6 +33,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "build", "twine"]
+search = ["llmsearchindex>=1.2.0"]
 
 [project.urls]
 Homepage = "https://github.com/zakerytclarke/teapot_trainer"
