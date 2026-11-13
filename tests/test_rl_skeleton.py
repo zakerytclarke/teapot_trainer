@@ -234,6 +234,10 @@ def test_e2e_grpo_saves_rollouts_and_runs_eval_hooks(tmp_path: Path):
     assert "conversation" in rollouts[0]
     assert "score" in rollouts[0]
     assert "metrics" in rollouts[0]
+    # Tools show up in the rendered prompt / schemas, not as chat messages.
+    assert rollouts[0]["tools"]
+    assert rollouts[0]["tools"][0]["function"]["name"] == "calculator"
+    assert "calculator" in (rollouts[0].get("rendered_prompt") or "")
 
     saved = json.loads((run_dir / "rl_config.json").read_text(encoding="utf-8"))
     assert saved["tool_format"] == "hermes"
