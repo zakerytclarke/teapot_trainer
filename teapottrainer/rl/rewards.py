@@ -177,39 +177,49 @@ def score_text_answer(
     return float(reward), metrics
 
 
+def score_exact_answer(
+    prediction: str,
+    gold_answer: str,
+) -> tuple[float, dict[str, float]]:
+    """Binary reward: normalized prediction must equal the gold string exactly."""
+    em, f1, contained = best_span_scores(prediction or "", [gold_answer])
+    reward = float(em)
+    metrics = {
+        "accuracy": float(em),
+        "f1": float(f1),
+        "contained": float(contained),
+        "prose": 1.0 if (prediction or "").strip() else 0.0,
+    }
+    return reward, metrics
+
+
 def score_synthqa_answer(
     prediction: str,
     *,
     gold_answer: str,
     unanswerable: bool,
 ) -> tuple[float, dict[str, float]]:
-    """Context-grounded SynthQA reward (mirrors supervised eval rules).
+    """SynthQA keepalive reward: exact match only (no tools, no soft F1).
 
-    Unanswerable rows must abstain with the exact SynthQA refusal sentence.
-    Answerable rows are scored with span EM / F1 / containment; abstaining when
-    an answer exists is penalized.
+    Unanswerable rows must reply with the exact abstain sentence. Answerable
+    rows must match the gold answer exactly after normalization.
     """
     text = prediction or ""
     abstained = 1.0 if is_abstention(text) else 0.0
     if unanswerable:
-        correct = abstained
-        em, f1, contained = (correct, correct, correct)
-        reward = float(correct)
-    else:
-        em, f1, contained = best_span_scores(text, [gold_answer])
-        correct = max(f1, contained, em)
-        reward = float(correct)
-        if abstained:
-            # Refused even though the context had the answer.
+        # Prefer the exact abstain string; is_abstention is a soft fallback check.
+        reward, metrics = score_exact_answer(text, gold_answer)
+        if reward < 1.0 and abstained:
+            # Still accept known abstain paraphrases only if gold is the canonical line
+            # and the model used a recognized abstain — keep strict: require EM.
             reward = 0.0
-            correct = 0.0
+        metrics["abstained"] = abstained
+        metrics["unanswerable"] = 1.0
+        return float(reward), metrics
 
-    metrics = {
-        "accuracy": float(em),
-        "f1": float(f1),
-        "contained": float(contained),
-        "abstained": abstained,
-        "unanswerable": 1.0 if unanswerable else 0.0,
-        "prose": 1.0 if text.strip() else 0.0,
-    }
+    reward, metrics = score_exact_answer(text, gold_answer)
+    if abstained:
+        reward = 0.0
+    metrics["abstained"] = abstained
+    metrics["unanswerable"] = 0.0
     return float(reward), metrics

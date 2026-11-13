@@ -1,11 +1,8 @@
-"""Full RL mix: calculator math, GSM8K, context-only SynthQA, and web search QA.
+"""Single-phase RL mix: tool tasks + exact-match keepalives (SynthQA / TeapotChat).
 
-Tool access is per-dataset:
-
-* ``SYNTH_MATH`` / ``GSM8K_RL`` — calculator only
-* ``SYNTHQA_RL`` — **no tools** (answer from context or exact abstain string)
-* ``NQ_OPEN_RL`` / ``WEB_QUESTIONS_RL`` / ``HOTPOT_RL`` / ``TRIVIA_QA_RL`` —
-  Brave / Exa / LLM-search via ``bind_tools``
+No separate SFT step. Math and open-web search get tools; SynthQA and TeapotChat
+stay tool-free and grade with exact answer match so GRPO does not wash out
+grounding / chat style.
 
 API keys (optional; falls back to mock stubs when unset):
 
@@ -34,6 +31,7 @@ from teapottrainer import (
     SYNTH_MATH,
     SYNTHQA_RL,
     SYNTHQA_TEST,
+    TEAPOT_CHAT_RL,
     TRIVIA_QA_RL,
     WEB_QUESTIONS_RL,
     bind_tools,
@@ -47,8 +45,9 @@ def build_full_rl_config(
     tokenizer: str | None = None,
     max_train_episodes: int = 200,
     mock_search: bool | None = None,
+    keepalive_weight: float = 1.0,
 ) -> RlConfig:
-    """Assemble the full multi-dataset RL config (shared by the recipe + Colab)."""
+    """Assemble the mixed RL config (tool tasks + exact-match keepalives)."""
     if mock_search is None:
         mock_search = not any(
             os.environ.get(name)
@@ -69,22 +68,23 @@ def build_full_rl_config(
         )
     print(f"search tools: {[fn.__name__ for fn in search_tools]}  mock={search.mock}")
 
+    keepalive = float(keepalive_weight)
     return RlConfig(
         init_from=init_from,
         tokenizer=tokenizer or init_from,
         tool_format="hermes",
         search=search,
         datasets=[
-            # Math / calculator
-            SYNTH_MATH,
-            GSM8K_RL,
-            # Context-grounded RAG — never bind search tools here
-            SYNTHQA_RL,
-            # Open-web search QA
-            bind_tools(NQ_OPEN_RL, search_tools),
-            bind_tools(WEB_QUESTIONS_RL, search_tools),
-            bind_tools(HOTPOT_RL, search_tools),
-            bind_tools(TRIVIA_QA_RL, search_tools),
+            # Tool tasks
+            SYNTH_MATH.model_copy(update={"weight": 1.0}),
+            GSM8K_RL.model_copy(update={"weight": 1.0}),
+            bind_tools(NQ_OPEN_RL, search_tools).model_copy(update={"weight": 1.0}),
+            bind_tools(WEB_QUESTIONS_RL, search_tools).model_copy(update={"weight": 1.0}),
+            bind_tools(HOTPOT_RL, search_tools).model_copy(update={"weight": 1.0}),
+            bind_tools(TRIVIA_QA_RL, search_tools).model_copy(update={"weight": 1.0}),
+            # Exact-match keepalives (no tools) — run in the same RL loop
+            SYNTHQA_RL.model_copy(update={"weight": keepalive}),
+            TEAPOT_CHAT_RL.model_copy(update={"weight": keepalive}),
         ],
         eval_datasets=[
             DatasetSpec(source=GSM8K_TEST, target_tokens=0),

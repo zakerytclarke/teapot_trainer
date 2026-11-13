@@ -22,6 +22,7 @@ from .base import (
 from .gsm8k import GSM8K_RL
 from .synth_math import SYNTH_MATH
 from .synthqa import SYNTHQA_RL
+from .teapot_chat import TEAPOT_CHAT_RL
 from .web_qa import HOTPOT_RL, NQ_OPEN_RL, TRIVIA_QA_RL, WEB_QUESTIONS_RL, grade_web_qa
 
 __all__ = [
@@ -29,6 +30,7 @@ __all__ = [
     "SYNTH_MATH",
     "GSM8K_RL",
     "SYNTHQA_RL",
+    "TEAPOT_CHAT_RL",
     "NQ_OPEN_RL",
     "HOTPOT_RL",
     "WEB_QUESTIONS_RL",

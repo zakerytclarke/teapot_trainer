@@ -11,6 +11,7 @@ from teapottrainer import (
     NQ_OPEN_RL,
     SearchSettings,
     SYNTHQA_RL,
+    TEAPOT_CHAT_RL,
     TRIVIA_QA_RL,
     WEB_QUESTIONS_RL,
     bind_tools,
@@ -23,7 +24,13 @@ from teapottrainer import (
 )
 from teapottrainer.formatting import ABSTAIN_TEXT, RAG_SYSTEM
 from teapottrainer.rl.datasets import grade_episode, sample_episode
-from teapottrainer.rl.rewards import score_gsm8k_answer, score_synthqa_answer, score_text_answer, used_search_tools
+from teapottrainer.rl.rewards import (
+    score_exact_answer,
+    score_gsm8k_answer,
+    score_synthqa_answer,
+    score_text_answer,
+    used_search_tools,
+)
 from teapottrainer.rl.tools import tool_schemas
 
 
@@ -257,5 +264,37 @@ def test_synthqa_rl_is_context_only_and_rejects_tools():
     assert zero == 0.0
 
     synth_r, synth_m = score_synthqa_answer("Paris", gold_answer="Paris", unanswerable=False)
-    assert synth_m["contained"] == 1.0
-    assert synth_r > 0.0
+    assert synth_m["accuracy"] == 1.0
+    assert synth_r == 1.0
+    # Soft containment alone is not enough for SynthQA keepalive.
+    soft, soft_m = score_synthqa_answer(
+        "The capital is Paris of course.",
+        gold_answer="Paris",
+        unanswerable=False,
+    )
+    assert soft_m["contained"] == 1.0
+    assert soft == 0.0
+
+
+def test_teapot_chat_rl_exact_match_no_tools():
+    state = {
+        "rows": [
+            {
+                "system_prompt": 'You are Teapot. If a user asks who you are, reply "I am Teapot".',
+                "query": "Who are you?",
+                "response": "I am Teapot",
+                "context": "",
+            }
+        ]
+    }
+    sample = sample_episode(TEAPOT_CHAT_RL, state, random.Random(0))
+    assert sample["tools"] == []
+    good = [*sample["messages"], {"role": "assistant", "content": "I am Teapot"}]
+    reward, metrics = grade_episode(TEAPOT_CHAT_RL, good, sample["meta"])
+    assert metrics["accuracy"] == 1.0
+    assert reward == 1.0
+    loose = [*sample["messages"], {"role": "assistant", "content": "Hello, I am Teapot today."}]
+    zero, zero_m = grade_episode(TEAPOT_CHAT_RL, loose, sample["meta"])
+    assert zero_m["accuracy"] == 0.0
+    assert zero == 0.0
+    assert score_exact_answer("I am Teapot", "I am Teapot")[0] == 1.0
