@@ -225,6 +225,11 @@ def test_e2e_grpo_saves_rollouts_and_runs_eval_hooks(tmp_path: Path):
     assert "eval_before_rl" in splits
     assert "eval_after_rl" in splits
     assert any(row.get("split") == "final_rl_env_eval" for row in rows)
+    train_rows = [row for row in rows if "score_avg" in row]
+    assert train_rows, "expected running average score in train metrics"
+    env_eval = next(row for row in rows if row.get("split") == "final_rl_env_eval")
+    assert "dataset/synth_math/score" in env_eval
+    assert "avg_score" in env_eval
 
     rollouts_path = run_dir / "rollouts.json"
     assert rollouts_path.exists()

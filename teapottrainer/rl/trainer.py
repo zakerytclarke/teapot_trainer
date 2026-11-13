@@ -63,6 +63,39 @@ def _materialize_source(spec: DatasetSpec) -> DatasetSourceConfig:
     raise TypeError(f"Unsupported eval dataset source type: {type(source)!r}")
 
 
+def _primary_score(metrics: dict[str, float]) -> float | None:
+    """Pick a single headline score from a metrics dict."""
+    for key in (
+        "score",
+        "reward",
+        "accuracy",
+        "exact_match",
+        "em",
+        "pass",
+        "strict_accuracy",
+        "f1",
+        "behavior_score",
+    ):
+        if key in metrics and isinstance(metrics[key], (int, float)):
+            return float(metrics[key])
+    # Prefer non-loss, non-support numeric metrics.
+    candidates = [
+        (name, float(value))
+        for name, value in metrics.items()
+        if isinstance(value, (int, float))
+        and not name.startswith("support")
+        and not name.endswith("loss")
+        and "perplexity" not in name
+    ]
+    if not candidates:
+        if "loss" in metrics:
+            return float(metrics["loss"])
+        return None
+    # Prefer names containing accuracy / score / f1.
+    preferred = [pair for pair in candidates if any(tok in pair[0] for tok in ("acc", "score", "f1", "exact", "pass"))]
+    return (preferred or candidates)[0][1]
+
+
 class RlTrainer:
     """Reinforcement learning trainer for tool-using language models."""
 
@@ -144,6 +177,8 @@ class RlTrainer:
         writer = SummaryWriter(log_dir=str(self.run_dir / "tb"))
         episodes_done = start_episodes
         best_score = float("-inf")
+        running_score_sum = 0.0
+        running_score_n = 0
         pbar = tqdm(total=int(self.config.max_train_episodes), initial=episodes_done, desc="rl")
 
         # Same idea as TeapotTrainer: score held-out eval sets before training.
@@ -193,22 +228,35 @@ class RlTrainer:
             )
 
             episodes_done += 1
-            pbar.update(1)
             mean_reward = sum(rewards) / max(len(rewards), 1)
             mean_acc = sum(t.metrics.get("accuracy", t.metrics.get("score", 0.0)) for t in trajectories) / max(
                 len(trajectories), 1
             )
+            mean_calc = sum(t.metrics.get("used_calculator", 0.0) for t in trajectories) / max(len(trajectories), 1)
+            running_score_sum += mean_reward
+            running_score_n += 1
+            avg_score = running_score_sum / max(running_score_n, 1)
+            pbar.set_postfix(
+                score=f"{mean_reward:.2f}",
+                avg=f"{avg_score:.2f}",
+                calc=f"{mean_calc:.2f}",
+                ds=dataset.name,
+                refresh=False,
+            )
+            pbar.update(1)
             row = {
                 "episode": episodes_done,
                 "dataset": dataset.name,
                 "sample_id": sample.get("sample_id"),
                 "reward_mean": mean_reward,
                 "accuracy_mean": mean_acc,
+                "score_avg": avg_score,
                 "reward_group": rewards,
                 **{f"train/{k}": v for k, v in update_metrics.items()},
             }
             self._append_metrics(row)
             writer.add_scalar("rl/reward_mean", mean_reward, episodes_done)
+            writer.add_scalar("rl/score_avg", avg_score, episodes_done)
             writer.add_scalar("rl/accuracy_mean", mean_acc, episodes_done)
             writer.add_scalar("rl/loss", update_metrics.get("loss", 0.0), episodes_done)
 
@@ -218,6 +266,9 @@ class RlTrainer:
                 self._append_metrics({"episode": episodes_done, "split": "rl_env_eval", **env_stats})
                 writer.add_scalar("rl_env_eval/accuracy", env_stats.get("accuracy", 0.0), episodes_done)
                 writer.add_scalar("rl_env_eval/reward", env_stats.get("reward", 0.0), episodes_done)
+                for key, value in env_stats.items():
+                    if key.startswith("dataset/") and key.endswith("/score"):
+                        writer.add_scalar(f"rl_env_eval/{key}", value, episodes_done)
                 if env_stats.get("reward", float("-inf")) >= best_score:
                     best_score = float(env_stats["reward"])
                     self._save_checkpoint(model, optimizer, episodes_done, self.ckpt_dir / "best")
@@ -270,6 +321,7 @@ class RlTrainer:
         was_training = model.training
         model.eval()
         seq_len = int(getattr(getattr(model, "config", None), "max_position_embeddings", 2048) or 2048)
+        per_dataset_scores: dict[str, float] = {}
 
         for spec in self.config.eval_datasets:
             src = _materialize_source(spec)
@@ -286,12 +338,29 @@ class RlTrainer:
                 seed=self.config.seed,
                 holdout_ratio=float(self.config.holdout_ratio),
             )
-            for name, value in result["metrics"].items():
-                flat[f"{key}/{name}"] = float(value)
+            local = {str(name): float(value) for name, value in result["metrics"].items()}
+            for name, value in local.items():
+                flat[f"{key}/{name}"] = value
                 if not name.startswith("support"):
-                    support = result["metrics"].get(f"support_{name}", result["metrics"].get("support"))
+                    support = local.get(f"support_{name}", local.get("support"))
                     suffix = f"  n={int(support)}" if support is not None else ""
                     print(f"   {name}: {value:.3f}{suffix}")
+            primary = _primary_score(local)
+            if primary is not None:
+                per_dataset_scores[key] = primary
+                flat[f"{key}/avg_score"] = primary
+                print(f"   avg_score: {primary:.3f}")
+
+        print("-" * 78)
+        print(" average score per dataset:")
+        if per_dataset_scores:
+            for key, value in per_dataset_scores.items():
+                print(f"   {key}: {value:.3f}")
+            overall = sum(per_dataset_scores.values()) / len(per_dataset_scores)
+            flat["avg_score"] = float(overall)
+            print(f"   overall: {overall:.3f}")
+        else:
+            print("   (no scored datasets)")
 
         behavior = selection_score(flat)
         losses = [value for name, value in flat.items() if name.endswith("/loss")]
@@ -346,43 +415,73 @@ class RlTrainer:
         """Greedy rollouts on the RL training datasets (not DatasetSpec evals)."""
         was_training = model.training
         model.eval()
-        rewards = []
-        accs = []
-        tool_rates = []
-        for _ in range(int(self.config.eval_episodes)):
-            dataset = _select_dataset(self.config.datasets, rng)
-            sample = sample_episode(dataset, dataset_state[dataset.name], rng)
-            traj = rollout_episode(
-                model,
-                tokenizer,
-                sample,
-                self.tool_format,
-                max_turns=self.config.max_turns,
-                max_new_tokens=self.config.max_new_tokens,
-                temperature=0.0,
-                top_p=1.0,
+        print("\n" + "=" * 78)
+        print(" RL ENV EVAL  (average score per dataset)")
+        print("=" * 78)
+
+        all_rewards: list[float] = []
+        all_accs: list[float] = []
+        all_tool_rates: list[float] = []
+        out: dict[str, float] = {}
+        n_per = max(1, int(self.config.eval_episodes))
+
+        for dataset in self.config.datasets:
+            rewards: list[float] = []
+            accs: list[float] = []
+            tool_rates: list[float] = []
+            for _ in range(n_per):
+                sample = sample_episode(dataset, dataset_state[dataset.name], rng)
+                traj = rollout_episode(
+                    model,
+                    tokenizer,
+                    sample,
+                    self.tool_format,
+                    max_turns=self.config.max_turns,
+                    max_new_tokens=self.config.max_new_tokens,
+                    temperature=0.0,
+                    top_p=1.0,
+                )
+                reward, metrics = grade_episode(dataset, traj.messages, traj.meta)
+                traj.reward = reward
+                traj.metrics = metrics
+                rewards.append(reward)
+                accs.append(metrics.get("accuracy", metrics.get("score", 0.0)))
+                tool_rates.append(1.0 if metrics.get("used_calculator", 0.0) > 0 else 0.0)
+                self._record_rollout(
+                    split="rl_env_eval",
+                    episode=-1,
+                    dataset_name=dataset.name,
+                    sample=sample,
+                    traj=traj,
+                    group_index=0,
+                )
+
+            mean_score = float(sum(rewards) / max(len(rewards), 1))
+            mean_acc = float(sum(accs) / max(len(accs), 1))
+            mean_calc = float(sum(tool_rates) / max(len(tool_rates), 1))
+            out[f"dataset/{dataset.name}/score"] = mean_score
+            out[f"dataset/{dataset.name}/accuracy"] = mean_acc
+            out[f"dataset/{dataset.name}/calculator_rate"] = mean_calc
+            out[f"dataset/{dataset.name}/n"] = float(len(rewards))
+            print(
+                f"   {dataset.name}: avg_score={mean_score:.3f}  "
+                f"accuracy={mean_acc:.3f}  calc={mean_calc:.3f}  n={len(rewards)}"
             )
-            reward, metrics = grade_episode(dataset, traj.messages, traj.meta)
-            traj.reward = reward
-            traj.metrics = metrics
-            rewards.append(reward)
-            accs.append(metrics.get("accuracy", metrics.get("score", 0.0)))
-            tool_rates.append(1.0 if metrics.get("used_calculator", 0.0) > 0 else 0.0)
-            self._record_rollout(
-                split="rl_env_eval",
-                episode=-1,
-                dataset_name=dataset.name,
-                sample=sample,
-                traj=traj,
-                group_index=0,
-            )
+            all_rewards.extend(rewards)
+            all_accs.extend(accs)
+            all_tool_rates.extend(tool_rates)
+
+        overall = float(sum(all_rewards) / max(len(all_rewards), 1))
+        out["reward"] = overall
+        out["accuracy"] = float(sum(all_accs) / max(len(all_accs), 1))
+        out["calculator_rate"] = float(sum(all_tool_rates) / max(len(all_tool_rates), 1))
+        out["avg_score"] = overall
+        print(f"   overall: avg_score={overall:.3f}")
+        print("=" * 78 + "\n")
+
         if was_training:
             model.train()
-        return {
-            "reward": float(sum(rewards) / max(len(rewards), 1)),
-            "accuracy": float(sum(accs) / max(len(accs), 1)),
-            "calculator_rate": float(sum(tool_rates) / max(len(tool_rates), 1)),
-        }
+        return out
 
     def _record_rollout(
         self,
