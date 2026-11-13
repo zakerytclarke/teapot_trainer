@@ -582,6 +582,15 @@ def open_dataset(src: DatasetSourceConfig, streaming: bool):
             split="train",
             streaming=streaming,
         )
+    # Local JSON / JSONL written by recipes (e.g. tool-call cold-start SFT).
+    local = Path(src.name).expanduser()
+    if local.is_file() and local.suffix.lower() in {".json", ".jsonl"}:
+        return load_dataset(
+            "json",
+            data_files=str(local.resolve()),
+            split=src.split,
+            streaming=streaming,
+        )
     kwargs = {"split": src.split, "streaming": streaming}
     # These benchmarks publish one train split. The preset split stays test so
     # eval sees the benchmark instead of a 5% train holdout.

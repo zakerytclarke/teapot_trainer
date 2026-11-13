@@ -9,6 +9,7 @@ from pathlib import Path
 from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM
 
 from teapottrainer import (
+    DatasetSourceConfig,
     DatasetSpec,
     GSM8K_TEST,
     RlConfig,
@@ -284,3 +285,21 @@ def test_score_numeric_helper():
         calculator_result_ok=True,
     )
     assert good >= 1.0
+
+
+def test_open_dataset_loads_local_jsonl(tmp_path: Path):
+    from teapottrainer.datasets import open_dataset
+    from teapottrainer.formatting import messages_format
+    from sft_then_rl_math import write_sft_jsonl
+
+    path = tmp_path / "math_hermes.jsonl"
+    write_sft_jsonl(path, num_examples=2, seed=0)
+    src = DatasetSourceConfig(
+        name=str(path),
+        split="train",
+        is_sft=True,
+        chat_template_fn=messages_format,
+    )
+    rows = list(open_dataset(src, streaming=False))
+    assert len(rows) == 2
+    assert rows[0]["messages"][2]["content"].startswith("<tool_call>")
