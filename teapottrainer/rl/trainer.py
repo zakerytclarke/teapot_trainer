@@ -406,6 +406,10 @@ class RlTrainer:
             "score": float(traj.reward),
             "metrics": dict(traj.metrics),
             "meta": dict(traj.meta),
+            # Tools are injected by the chat template, not as chat messages.
+            "tool_format": traj.tool_format,
+            "tools": list(traj.tool_schemas),
+            "rendered_prompt": traj.rendered_prompt,
             "conversation": list(traj.messages),
         }
         self.rollouts.append(record)

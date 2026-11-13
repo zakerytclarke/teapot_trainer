@@ -8,7 +8,7 @@ from typing import Any
 import torch
 
 from ..tool_formats import ToolFormat, canonical_tool_calls, get_tool_format
-from .tools import ToolFn, call_tool_by_name
+from .tools import ToolFn, call_tool_by_name, tool_schemas
 
 
 @dataclass
@@ -25,6 +25,11 @@ class Trajectory:
     completion_ids: list[int] = field(default_factory=list)
     completion_mask: list[int] = field(default_factory=list)
     logprob: float = 0.0
+    # Tools are injected by the chat template, not stored as chat messages.
+    # Keep the rendered first-turn prompt + schemas so rollouts.json shows them.
+    tool_schemas: list[dict] = field(default_factory=list)
+    rendered_prompt: str = ""
+    tool_format: str = ""
 
 
 def _assistant_has_tool_calls(message: dict) -> bool:
@@ -63,8 +68,12 @@ def generate_assistant_message(
     max_new_tokens: int,
     temperature: float,
     top_p: float,
-) -> tuple[dict, list[int], list[int], list[float], list[int]]:
-    """Sample one assistant turn. Tools are Python functions."""
+) -> tuple[dict, list[int], list[int], list[float], list[int], str]:
+    """Sample one assistant turn. Tools are Python functions.
+
+    Returns message, prompt_ids, completion_ids, token_logprobs, completion_mask,
+    and the rendered prompt string (including any tool schema injection).
+    """
     fmt = get_tool_format(tool_format)
     tool_fns = list(tools or [])
 
@@ -108,7 +117,7 @@ def generate_assistant_message(
     completion_ids = sequences[0, prompt_len:].tolist()
     token_logprobs = _token_logprobs_from_scores(outputs.scores or (), sequences, prompt_len)
     completion_mask = [1] * len(completion_ids)
-    return message, prompt_ids, completion_ids, token_logprobs, completion_mask
+    return message, prompt_ids, completion_ids, token_logprobs, completion_mask, prompt_text
 
 
 def rollout_episode(
@@ -132,7 +141,13 @@ def rollout_episode(
     tools: list[ToolFn] = list(sample.get("tools") or [])
     messages = [dict(m) for m in sample["messages"]]
     meta = dict(sample.get("meta") or {})
-    traj = Trajectory(sample_id=str(sample.get("sample_id") or "sample"), messages=messages, meta=meta)
+    traj = Trajectory(
+        sample_id=str(sample.get("sample_id") or "sample"),
+        messages=messages,
+        meta=meta,
+        tool_schemas=tool_schemas(tools),
+        tool_format=fmt.name,
+    )
 
     all_completion_ids: list[int] = []
     all_masks: list[int] = []
@@ -140,7 +155,7 @@ def rollout_episode(
     first_prompt_ids: list[int] | None = None
 
     for _ in range(int(max_turns)):
-        message, prompt_ids, completion_ids, token_logprobs, completion_mask = generate_assistant_message(
+        message, prompt_ids, completion_ids, token_logprobs, completion_mask, prompt_text = generate_assistant_message(
             model,
             tokenizer,
             messages,
@@ -152,6 +167,7 @@ def rollout_episode(
         )
         if first_prompt_ids is None:
             first_prompt_ids = prompt_ids
+            traj.rendered_prompt = prompt_text
         messages.append(message)
         traj.actions.append(message)
         all_completion_ids.extend(completion_ids)

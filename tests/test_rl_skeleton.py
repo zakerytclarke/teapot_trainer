@@ -97,13 +97,41 @@ def test_synth_math_dataset_init_sample_grade():
     assert "value" in sample["meta"]
     assert all(callable(fn) for fn in sample["tools"])
     assert {getattr(fn, "__name__", "") for fn in sample["tools"]} == {"calculator"}
+    # Prompts must require the tool; optional wording lets models skip it.
+    assert "must" in sample["messages"][0]["content"].lower()
 
     gold = float(sample["meta"]["value"])
-    good = sample["messages"] + [
-        {"role": "assistant", "content": f"The answer is {int(gold) if gold.is_integer() else gold}."}
+    answer = f"The answer is {int(gold) if gold.is_integer() else gold}."
+
+    # Correct without calculator → no reward (otherwise GRPO never learns tools).
+    no_tool = sample["messages"] + [{"role": "assistant", "content": answer}]
+    reward_no_tool, metrics_no_tool = grade_episode(SYNTH_MATH, no_tool, sample["meta"])
+    assert metrics_no_tool["accuracy"] == 1.0
+    assert metrics_no_tool["used_calculator"] == 0.0
+    assert reward_no_tool == 0.0
+
+    # Correct with calculator tool result → rewarded.
+    with_tool = sample["messages"] + [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "calculator",
+                        "arguments": {"expression": sample["meta"]["expression"]},
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "name": "calculator", "content": str(int(gold) if gold.is_integer() else gold)},
+        {"role": "assistant", "content": answer},
     ]
-    reward, metrics = grade_episode(SYNTH_MATH, good, sample["meta"])
+    reward, metrics = grade_episode(SYNTH_MATH, with_tool, sample["meta"])
     assert metrics["accuracy"] == 1.0
+    assert metrics["used_calculator"] == 1.0
+    assert metrics["calculator_result_ok"] == 1.0
     assert reward >= 1.0
 
     bad = sample["messages"] + [{"role": "assistant", "content": "The answer is 123456."}]
@@ -206,6 +234,10 @@ def test_e2e_grpo_saves_rollouts_and_runs_eval_hooks(tmp_path: Path):
     assert "conversation" in rollouts[0]
     assert "score" in rollouts[0]
     assert "metrics" in rollouts[0]
+    # Tools show up in the rendered prompt / schemas, not as chat messages.
+    assert rollouts[0]["tools"]
+    assert rollouts[0]["tools"][0]["function"]["name"] == "calculator"
+    assert "calculator" in (rollouts[0].get("rendered_prompt") or "")
 
     saved = json.loads((run_dir / "rl_config.json").read_text(encoding="utf-8"))
     assert saved["tool_format"] == "hermes"
@@ -229,3 +261,21 @@ def test_score_numeric_helper():
     assert metrics["accuracy"] == 1.0
     assert reward >= 1.0
     assert extract_number("answer: 3.5 units") == 3.5
+
+    # Required-tool path: correct answer alone is not enough.
+    zero, metrics_req = score_numeric_answer(
+        "I think it is 42.",
+        42,
+        used_calculator=False,
+        require_calculator=True,
+    )
+    assert metrics_req["accuracy"] == 1.0
+    assert zero == 0.0
+    good, _ = score_numeric_answer(
+        "I think it is 42.",
+        42,
+        used_calculator=True,
+        require_calculator=True,
+        calculator_result_ok=True,
+    )
+    assert good >= 1.0
