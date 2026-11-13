@@ -105,7 +105,7 @@ from .datasets import (
     BFCL_IRRELEVANCE,
 )
 
-__version__ = "0.1.8"
+__version__ = "0.1.9"
 __all__ = [
     "CHAT_FORMATS",
     "chat_format_names",

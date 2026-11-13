@@ -156,7 +156,7 @@ HOTPOT_RL = RlDataset(
 
 def init_web_questions() -> dict[str, Any]:
     # Compact Freebase-backed open QA set commonly used with web retrieval.
-    rows = load_hf_rows("web_questions", split="train")
+    rows = load_hf_rows("stanfordnlp/web_questions", split="train")
     return {"name": "web_questions", "rows": rows}
 
 
@@ -187,7 +187,7 @@ WEB_QUESTIONS_RL = RlDataset(
 
 
 def init_trivia_qa() -> dict[str, Any]:
-    rows = load_hf_rows("trivia_qa", subset="rc.nocontext", split="train")
+    rows = load_hf_rows("mandarjoshi/trivia_qa", subset="rc.nocontext", split="train")
     return {"name": "trivia_qa", "rows": rows}
 
 
