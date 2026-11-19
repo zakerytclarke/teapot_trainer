@@ -20,6 +20,7 @@ from .rl.datasets import (
     WEB_QUESTIONS_RL,
     bind_tools,
 )
+from .rl.agent import run_agent
 from .rl.browser import (
     BrowserSession,
     BrowserSettings,
@@ -27,6 +28,7 @@ from .rl.browser import (
     build_browser_toolkit,
     build_browser_tools,
 )
+from .rl.rollouts import Trajectory, rollout_episode
 from .rl.search import (
     SearchSettings,
     build_search_tools,
@@ -35,6 +37,7 @@ from .rl.search import (
     make_llm_search,
     make_llmsearchindex,
 )
+from .rl.tools import calculator
 from .rl.trainer import RlTrainer
 from .tool_formats import TOOL_FORMATS, get_tool_format, tool_format_names
 from .trainer import TeapotTrainer
@@ -112,7 +115,7 @@ from .datasets import (
     BFCL_IRRELEVANCE,
 )
 
-__version__ = "0.1.10"
+__version__ = "0.1.11"
 __all__ = [
     "CHAT_FORMATS",
     "chat_format_names",
@@ -149,6 +152,10 @@ __all__ = [
     "BrowserToolkit",
     "build_browser_toolkit",
     "build_browser_tools",
+    "calculator",
+    "run_agent",
+    "Trajectory",
+    "rollout_episode",
     "TrainingConfig",
     "ModelConfig",
     "DatasetSpec",

@@ -6,6 +6,7 @@ This ``__init__`` only exposes leaf modules so dataset presets can import
 tools/rewards without circular imports.
 """
 
+from .agent import run_agent
 from .browser import (
     BrowserSession,
     BrowserSettings,
@@ -13,6 +14,7 @@ from .browser import (
     build_browser_toolkit,
     build_browser_tools,
 )
+from .rollouts import Trajectory, rollout_episode
 from .search import (
     SearchSettings,
     build_search_tools,
@@ -24,6 +26,9 @@ from .search import (
 from .tools import calculator, call_tool, call_tool_by_name, tool_schemas
 
 __all__ = [
+    "run_agent",
+    "Trajectory",
+    "rollout_episode",
     "BrowserSession",
     "BrowserSettings",
     "BrowserToolkit",
