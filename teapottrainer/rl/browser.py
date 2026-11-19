@@ -7,10 +7,14 @@ session:
 * ``browser_read()`` — markdown-ish page text with link URLs + interactive ids
 * ``browser_act(element_id, action, text)`` — click or type into a marked id
 
+Playwright's sync API is run on a dedicated worker thread so this works in
+normal scripts **and** Colab/Jupyter (which already have a running asyncio loop).
+
 Install::
 
     pip install "teapottrainer[browser]"
-    playwright install chromium
+    python -m playwright install --only-shell chromium   # headless (Colab-friendly)
+    # or: python -m playwright install chromium          # full Chrome
 
 Usage::
 
@@ -23,8 +27,11 @@ Usage::
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import threading
-from typing import Any
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Callable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -233,12 +240,37 @@ class BrowserSettings(BaseModel):
         return cls(**data)
 
 
+def ensure_playwright_browsers(*, only_shell: bool | None = None) -> None:
+    """Install Playwright Chromium browsers (safe for Colab and local scripts).
+
+    When ``only_shell`` is true (default if ``TEAPOT_BROWSER_HEADED`` is unset),
+    installs the smaller headless shell only — enough for ``headless=True``.
+    """
+    if only_shell is None:
+        only_shell = os.environ.get("TEAPOT_BROWSER_HEADED", "").strip().lower() not in {
+            "1",
+            "true",
+            "yes",
+        }
+    cmd = [sys.executable, "-m", "playwright", "install"]
+    if only_shell:
+        cmd.extend(["--only-shell", "chromium"])
+    else:
+        cmd.append("chromium")
+    subprocess.check_call(cmd)
+
+
 class BrowserSession:
-    """Owns one real Chromium process + page (or a mock stand-in)."""
+    """Owns one real Chromium process + page (or a mock stand-in).
+
+    Real Playwright sync calls always run on a dedicated worker thread so Colab
+    / Jupyter's already-running asyncio loop does not break ``sync_playwright``.
+    """
 
     def __init__(self, settings: BrowserSettings | None = None):
         self.settings = settings or BrowserSettings()
         self._lock = threading.RLock()
+        self._worker: ThreadPoolExecutor | None = None
         self._pw = None
         self._browser = None
         self._context = None
@@ -254,165 +286,210 @@ class BrowserSession:
     def started(self) -> bool:
         return self._started
 
-    def start(self) -> None:
-        with self._lock:
-            if self._started:
-                return
-            if self.settings.mock:
-                self._started = True
-                return
+    def _timeout_s(self) -> float:
+        return max(30.0, float(self.settings.timeout_ms) / 1000.0 + 30.0)
+
+    def _run(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Run ``fn`` on the Playwright worker thread (or inline for mock)."""
+        if self.settings.mock:
+            with self._lock:
+                return fn(*args, **kwargs)
+        if self._worker is None:
+            self._worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="teapot-pw")
+        return self._worker.submit(fn, *args, **kwargs).result(timeout=self._timeout_s())
+
+    def _start_worker(self) -> None:
+        if self._started:
+            return
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                "playwright is not installed. Run: pip install playwright && "
+                "python -m playwright install --only-shell chromium"
+            ) from exc
+        self._pw = sync_playwright().start()
+        self._browser = self._pw.chromium.launch(
+            headless=bool(self.settings.headless),
+            args=list(self.settings.chromium_args or []),
+        )
+        self._context = self._browser.new_context(
+            viewport={
+                "width": int(self.settings.viewport_width),
+                "height": int(self.settings.viewport_height),
+            }
+        )
+        self._context.set_default_timeout(float(self.settings.timeout_ms))
+        self._page = self._context.new_page()
+        self._started = True
+
+    def _close_worker(self) -> None:
+        for obj in (self._context, self._browser):
+            if obj is not None:
+                try:
+                    obj.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        if self._pw is not None:
             try:
-                from playwright.sync_api import sync_playwright
-            except Exception as exc:  # noqa: BLE001
-                raise RuntimeError(
-                    "playwright is not installed. Run: pip install playwright && playwright install chromium"
-                ) from exc
-            self._pw = sync_playwright().start()
-            self._browser = self._pw.chromium.launch(
-                headless=bool(self.settings.headless),
-                args=list(self.settings.chromium_args or []),
-            )
-            self._context = self._browser.new_context(
-                viewport={
-                    "width": int(self.settings.viewport_width),
-                    "height": int(self.settings.viewport_height),
-                }
-            )
-            self._context.set_default_timeout(float(self.settings.timeout_ms))
-            self._page = self._context.new_page()
-            self._started = True
+                self._pw.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        self._pw = None
+        self._browser = None
+        self._context = None
+        self._page = None
+        self._started = False
+        self._id_to_selector.clear()
+
+    def start(self) -> None:
+        if self._started:
+            return
+        if self.settings.mock:
+            with self._lock:
+                self._started = True
+            return
+        self._run(self._start_worker)
 
     def ensure(self) -> None:
         if not self._started:
             self.start()
 
     def close(self) -> None:
-        with self._lock:
-            if self.settings.mock:
+        if self.settings.mock:
+            with self._lock:
                 self._started = False
                 self._id_to_selector.clear()
-                return
-            for obj in (self._context, self._browser):
-                if obj is not None:
-                    try:
-                        obj.close()
-                    except Exception:  # noqa: BLE001
-                        pass
-            if self._pw is not None:
-                try:
-                    self._pw.stop()
-                except Exception:  # noqa: BLE001
-                    pass
-            self._pw = None
-            self._browser = None
-            self._context = None
-            self._page = None
+            return
+        if self._worker is not None:
+            try:
+                self._run(self._close_worker)
+            except Exception:  # noqa: BLE001
+                pass
+            self._worker.shutdown(wait=False, cancel_futures=True)
+            self._worker = None
+        else:
             self._started = False
             self._id_to_selector.clear()
 
+    def _goto_worker(self, target: str) -> str:
+        assert self._page is not None
+        try:
+            self._page.goto(target, wait_until="domcontentloaded")
+        except Exception as exc:  # noqa: BLE001
+            return f"ERROR: navigation failed: {exc}"
+        self._id_to_selector.clear()
+        return f"OK navigated to {self._page.url}"
+
+    def _goto_mock(self, target: str) -> str:
+        self._mock_url = target
+        self._mock_title = f"Mock page for {target}"
+        self._mock_body = (
+            f"Stub page body for {target}.\n\n"
+            f"[Example]({target}/docs) `#e1`\n"
+            f"[button #e2: OK]\n"
+            f'[textbox #e3: query value=""]\n'
+        )
+        self._mock_catalog = [
+            {"id": "e1", "kind": "link", "label": "Example", "href": f"{target}/docs"},
+            {"id": "e2", "kind": "button", "label": "OK", "href": None},
+            {"id": "e3", "kind": "textbox", "label": "query", "href": None},
+        ]
+        self._id_to_selector = {row["id"]: f"[data-teapot-id='{row['id']}']" for row in self._mock_catalog}
+        return f"OK navigated to {target}"
+
     def goto(self, url: str) -> str:
-        self.ensure()
         target = str(url or "").strip()
         if not target:
             return "ERROR: empty url"
-        with self._lock:
-            if self.settings.mock:
-                self._mock_url = target
-                self._mock_title = f"Mock page for {target}"
-                self._mock_body = (
-                    f"Stub page body for {target}.\n\n"
-                    f"[Example]({target}/docs) `#e1`\n"
-                    f"[button #e2: OK]\n"
-                    f"[textbox #e3: query value=\"\"]\n"
-                )
-                self._mock_catalog = [
-                    {"id": "e1", "kind": "link", "label": "Example", "href": f"{target}/docs"},
-                    {"id": "e2", "kind": "button", "label": "OK", "href": None},
-                    {"id": "e3", "kind": "textbox", "label": "query", "href": None},
-                ]
-                self._id_to_selector = {row["id"]: f"[data-teapot-id='{row['id']}']" for row in self._mock_catalog}
-                return f"OK navigated to {target}"
-            assert self._page is not None
-            try:
-                self._page.goto(target, wait_until="domcontentloaded")
-            except Exception as exc:  # noqa: BLE001
-                return f"ERROR: navigation failed: {exc}"
-            self._id_to_selector.clear()
-            return f"OK navigated to {self._page.url}"
+        self.ensure()
+        if self.settings.mock:
+            return self._run(self._goto_mock, target)
+        return self._run(self._goto_worker, target)
+
+    def _read_worker(self, limit: int) -> str:
+        assert self._page is not None
+        try:
+            payload = self._page.evaluate(_EXTRACT_JS)
+        except Exception as exc:  # noqa: BLE001
+            return f"ERROR: page read failed: {exc}"
+        if not isinstance(payload, dict):
+            return "ERROR: unexpected extract payload"
+        catalog = payload.get("catalog") or []
+        self._id_to_selector = {
+            str(row["id"]): f"[data-teapot-id='{row['id']}']"
+            for row in catalog
+            if isinstance(row, dict) and row.get("id")
+        }
+        md = str(payload.get("markdown") or "").strip() or "(empty page)"
+        if len(md) > limit:
+            md = md[: limit - 20] + "\n...[truncated]"
+        return md
+
+    def _read_mock(self, limit: int) -> str:
+        title = self._mock_title or "(mock)"
+        md = f"# {title}\nURL: {self._mock_url}\n\n{self._mock_body}"
+        lines = []
+        for row in self._mock_catalog:
+            if row["kind"] == "link":
+                lines.append(f"- link #{row['id']}: {row['label']} -> {row['href']}")
+            else:
+                lines.append(f"- {row['kind']} #{row['id']}: {row['label']}")
+        md += "\n\n## Interactive elements\n" + ("\n".join(lines) if lines else "(none visible)")
+        if len(md) > limit:
+            md = md[: limit - 20] + "\n...[truncated]"
+        return md
 
     def read(self, max_chars: int | None = None) -> str:
-        self.ensure()
         limit = int(max_chars) if max_chars is not None else int(self.settings.max_read_chars)
         limit = max(500, limit)
-        with self._lock:
-            if self.settings.mock:
-                title = self._mock_title or "(mock)"
-                md = f"# {title}\nURL: {self._mock_url}\n\n{self._mock_body}"
-                lines = []
-                for row in self._mock_catalog:
-                    if row["kind"] == "link":
-                        lines.append(f"- link #{row['id']}: {row['label']} -> {row['href']}")
-                    else:
-                        lines.append(f"- {row['kind']} #{row['id']}: {row['label']}")
-                md += "\n\n## Interactive elements\n" + ("\n".join(lines) if lines else "(none visible)")
-                if len(md) > limit:
-                    md = md[: limit - 20] + "\n...[truncated]"
-                return md
-            assert self._page is not None
-            try:
-                payload = self._page.evaluate(_EXTRACT_JS)
-            except Exception as exc:  # noqa: BLE001
-                return f"ERROR: page read failed: {exc}"
-            if not isinstance(payload, dict):
-                return "ERROR: unexpected extract payload"
-            catalog = payload.get("catalog") or []
-            self._id_to_selector = {
-                str(row["id"]): f"[data-teapot-id='{row['id']}']"
-                for row in catalog
-                if isinstance(row, dict) and row.get("id")
-            }
-            md = str(payload.get("markdown") or "").strip() or "(empty page)"
-            if len(md) > limit:
-                md = md[: limit - 20] + "\n...[truncated]"
-            return md
+        self.ensure()
+        if self.settings.mock:
+            return self._run(self._read_mock, limit)
+        return self._run(self._read_worker, limit)
+
+    def _act_worker(self, eid: str, act: str, text: str) -> str:
+        assert self._page is not None
+        # Refresh map in-thread (do not re-enter the executor — would deadlock).
+        if eid not in self._id_to_selector:
+            self._read_worker(int(self.settings.max_read_chars))
+        selector = self._id_to_selector.get(eid)
+        if not selector:
+            known = ", ".join(sorted(self._id_to_selector)) or "(none)"
+            return f"ERROR: unknown element_id {eid!r}. Call browser_read first. Known: {known}"
+        try:
+            locator = self._page.locator(selector).first
+            if act == "click":
+                locator.click()
+                return f"OK clicked #{eid} (url={self._page.url})"
+            locator.click()
+            locator.fill(str(text))
+            return f"OK typed into #{eid}: {text!r}"
+        except Exception as exc:  # noqa: BLE001
+            return f"ERROR: act failed on #{eid}: {exc}"
+
+    def _act_mock(self, eid: str, act: str, text: str) -> str:
+        if eid not in self._id_to_selector and eid not in {r["id"] for r in self._mock_catalog}:
+            known = ", ".join(sorted(self._id_to_selector) or [r["id"] for r in self._mock_catalog]) or "(none)"
+            return f"ERROR: unknown element_id {eid!r}. Call browser_read first. Known: {known}"
+        if act == "type":
+            for row in self._mock_catalog:
+                if row["id"] == eid:
+                    row["label"] = f"{row.get('label', '')} (typed)"
+            return f"OK typed into #{eid}: {text!r}"
+        return f"OK clicked #{eid}"
 
     def act(self, element_id: str, action: str = "click", text: str = "") -> str:
-        self.ensure()
         eid = str(element_id or "").strip().lstrip("#")
         act = str(action or "click").strip().lower()
         if not eid:
             return "ERROR: empty element_id"
         if act not in {"click", "type"}:
             return "ERROR: action must be 'click' or 'type'"
-        with self._lock:
-            if self.settings.mock:
-                if eid not in self._id_to_selector and eid not in {r["id"] for r in self._mock_catalog}:
-                    known = ", ".join(sorted(self._id_to_selector) or [r["id"] for r in self._mock_catalog]) or "(none)"
-                    return f"ERROR: unknown element_id {eid!r}. Call browser_read first. Known: {known}"
-                if act == "type":
-                    for row in self._mock_catalog:
-                        if row["id"] == eid:
-                            row["label"] = f"{row.get('label', '')} (typed)"
-                    return f"OK typed into #{eid}: {text!r}"
-                return f"OK clicked #{eid}"
-            assert self._page is not None
-            # Refresh map if missing (model skipped read, or page mutated).
-            if eid not in self._id_to_selector:
-                self.read()
-            selector = self._id_to_selector.get(eid)
-            if not selector:
-                known = ", ".join(sorted(self._id_to_selector)) or "(none)"
-                return f"ERROR: unknown element_id {eid!r}. Call browser_read first. Known: {known}"
-            try:
-                locator = self._page.locator(selector).first
-                if act == "click":
-                    locator.click()
-                    return f"OK clicked #{eid} (url={self._page.url})"
-                locator.click()
-                locator.fill(str(text))
-                return f"OK typed into #{eid}: {text!r}"
-            except Exception as exc:  # noqa: BLE001
-                return f"ERROR: act failed on #{eid}: {exc}"
+        self.ensure()
+        if self.settings.mock:
+            return self._run(self._act_mock, eid, act, text)
+        return self._run(self._act_worker, eid, act, text)
 
 
 class BrowserToolkit:

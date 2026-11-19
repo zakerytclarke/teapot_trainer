@@ -27,6 +27,7 @@ from .rl.browser import (
     BrowserToolkit,
     build_browser_toolkit,
     build_browser_tools,
+    ensure_playwright_browsers,
 )
 from .rl.rollouts import Trajectory, rollout_episode
 from .rl.search import (
@@ -115,7 +116,7 @@ from .datasets import (
     BFCL_IRRELEVANCE,
 )
 
-__version__ = "0.1.11"
+__version__ = "0.1.12"
 __all__ = [
     "CHAT_FORMATS",
     "chat_format_names",
@@ -152,6 +153,7 @@ __all__ = [
     "BrowserToolkit",
     "build_browser_toolkit",
     "build_browser_tools",
+    "ensure_playwright_browsers",
     "calculator",
     "run_agent",
     "Trajectory",

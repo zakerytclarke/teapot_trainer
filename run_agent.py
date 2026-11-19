@@ -15,7 +15,7 @@ Example::
 Install extras as needed::
 
     pip install "teapottrainer[search,browser]"
-    playwright install chromium
+    python -m playwright install --only-shell chromium   # Colab / headless
 """
 
 from __future__ import annotations
