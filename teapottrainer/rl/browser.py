@@ -13,7 +13,8 @@ normal scripts **and** Colab/Jupyter (which already have a running asyncio loop)
 Install::
 
     pip install "teapottrainer[browser]"
-    python -m playwright install --only-shell chromium   # headless (Colab-friendly)
+    python -m playwright install-deps chromium           # OS libs (needed on Colab)
+    python -m playwright install --only-shell chromium   # headless browser binary
     # or: python -m playwright install chromium          # full Chrome
 
 Usage::
@@ -240,11 +241,62 @@ class BrowserSettings(BaseModel):
         return cls(**data)
 
 
-def ensure_playwright_browsers(*, only_shell: bool | None = None) -> None:
+def _install_system_deps() -> None:
+    """Install OS libraries Chromium needs (libatk, etc.). Required on Colab."""
+    # Preferred: Playwright's own dependency installer.
+    deps_cmd = [sys.executable, "-m", "playwright", "install-deps", "chromium"]
+    try:
+        subprocess.check_call(deps_cmd)
+        return
+    except Exception:
+        pass
+    # Fallback for minimal Debian/Ubuntu images (incl. many Colab runtimes).
+    apt_packages = [
+        "libatk1.0-0",
+        "libatk-bridge2.0-0",
+        "libcups2",
+        "libdrm2",
+        "libxkbcommon0",
+        "libxcomposite1",
+        "libxdamage1",
+        "libxfixes3",
+        "libxrandr2",
+        "libgbm1",
+        "libasound2",
+        "libpango-1.0-0",
+        "libcairo2",
+        "libnss3",
+        "libnspr4",
+        "libx11-xcb1",
+        "libxcb1",
+        "libx11-6",
+        "libxcb-dri3-0",
+    ]
+    apt = ["apt-get", "update", "-qq"]
+    install = ["apt-get", "install", "-y", "-qq", *apt_packages]
+    try:
+        subprocess.check_call(apt)
+        subprocess.check_call(install)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            "Could not install Chromium system libraries. On Colab/Debian run:\n"
+            "  !python -m playwright install-deps chromium\n"
+            "or install libatk1.0-0 and related packages via apt."
+        ) from exc
+
+
+def ensure_playwright_browsers(
+    *,
+    only_shell: bool | None = None,
+    with_deps: bool = True,
+) -> None:
     """Install Playwright Chromium browsers (safe for Colab and local scripts).
 
     When ``only_shell`` is true (default if ``TEAPOT_BROWSER_HEADED`` is unset),
     installs the smaller headless shell only — enough for ``headless=True``.
+
+    ``with_deps=True`` also installs OS shared libraries (fixes Colab errors like
+    ``libatk-1.0.so.0: cannot open shared object file``).
     """
     if only_shell is None:
         only_shell = os.environ.get("TEAPOT_BROWSER_HEADED", "").strip().lower() not in {
@@ -252,6 +304,8 @@ def ensure_playwright_browsers(*, only_shell: bool | None = None) -> None:
             "true",
             "yes",
         }
+    if with_deps and sys.platform.startswith("linux"):
+        _install_system_deps()
     cmd = [sys.executable, "-m", "playwright", "install"]
     if only_shell:
         cmd.extend(["--only-shell", "chromium"])
@@ -306,13 +360,24 @@ class BrowserSession:
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(
                 "playwright is not installed. Run: pip install playwright && "
-                "python -m playwright install --only-shell chromium"
+                "from teapottrainer import ensure_playwright_browsers; ensure_playwright_browsers()"
             ) from exc
         self._pw = sync_playwright().start()
-        self._browser = self._pw.chromium.launch(
-            headless=bool(self.settings.headless),
-            args=list(self.settings.chromium_args or []),
-        )
+        try:
+            self._browser = self._pw.chromium.launch(
+                headless=bool(self.settings.headless),
+                args=list(self.settings.chromium_args or []),
+            )
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc)
+            if "shared libraries" in msg or "libatk" in msg or "TargetClosedError" in type(exc).__name__:
+                raise RuntimeError(
+                    "Chromium failed to launch (missing OS libraries). Run:\n"
+                    "  from teapottrainer import ensure_playwright_browsers\n"
+                    "  ensure_playwright_browsers()\n"
+                    "Or in a shell: python -m playwright install-deps chromium"
+                ) from exc
+            raise
         self._context = self._browser.new_context(
             viewport={
                 "width": int(self.settings.viewport_width),
