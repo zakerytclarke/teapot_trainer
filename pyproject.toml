@@ -34,6 +34,8 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8", "build", "twine"]
 search = ["llmsearchindex>=1.2.0"]
+browser = ["playwright>=1.40"]
+
 
 [project.urls]
 Homepage = "https://github.com/zakerytclarke/teapot_trainer"

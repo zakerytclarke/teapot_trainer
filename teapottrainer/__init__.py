@@ -20,6 +20,13 @@ from .rl.datasets import (
     WEB_QUESTIONS_RL,
     bind_tools,
 )
+from .rl.browser import (
+    BrowserSession,
+    BrowserSettings,
+    BrowserToolkit,
+    build_browser_toolkit,
+    build_browser_tools,
+)
 from .rl.search import (
     SearchSettings,
     build_search_tools,
@@ -105,7 +112,7 @@ from .datasets import (
     BFCL_IRRELEVANCE,
 )
 
-__version__ = "0.1.9"
+__version__ = "0.1.10"
 __all__ = [
     "CHAT_FORMATS",
     "chat_format_names",
@@ -137,6 +144,11 @@ __all__ = [
     "make_exa_search",
     "make_llm_search",
     "make_llmsearchindex",
+    "BrowserSession",
+    "BrowserSettings",
+    "BrowserToolkit",
+    "build_browser_toolkit",
+    "build_browser_tools",
     "TrainingConfig",
     "ModelConfig",
     "DatasetSpec",
