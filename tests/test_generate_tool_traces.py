@@ -1,4 +1,4 @@
-"""Unit tests for tool-trace grading (no teacher model)."""
+"""Unit tests for tool-trace generation helpers and after-the-fact grading."""
 
 from __future__ import annotations
 
@@ -6,8 +6,25 @@ from generate_tool_traces import (
     ABSTAIN_TEXT,
     EpisodeSpec,
     build_system_prompt,
-    grade_trace,
 )
+from grade_tool_traces import grade_row
+
+
+def _row(spec: EpisodeSpec, trace: list[dict], available_tools: list[str]) -> dict:
+    return {
+        "sample_id": spec.sample_id,
+        "dataset": spec.dataset,
+        "task_type": spec.task_type,
+        "question": spec.question,
+        "gold_answers": list(spec.gold_answers),
+        "tools_available": list(available_tools),
+        "tools_required": list(spec.required_tools),
+        "messages_input": list(spec.messages_input),
+        "messages_trace": list(trace),
+        "final_assistant": "",
+        "injected_context": spec.injected_context,
+        "unanswerable": bool(spec.unanswerable),
+    }
 
 
 def _spec(**kwargs):
@@ -31,7 +48,7 @@ def test_grade_requires_search_when_available():
         {"role": "user", "content": spec.question},
         {"role": "assistant", "content": "Paris"},
     ]
-    score, metrics = grade_trace(spec, trace, available_tools=["web_search", "calculator"])
+    score, metrics = grade_row(_row(spec, trace, ["web_search", "calculator"]))
     assert score == 0.0
     assert metrics["used_required_tools"] == 0.0
 
@@ -53,7 +70,7 @@ def test_grade_search_grounded_success():
         {"role": "tool", "name": "web_search", "content": "Paris is the capital of France."},
         {"role": "assistant", "content": "Paris"},
     ]
-    score, metrics = grade_trace(spec, trace, available_tools=["web_search"])
+    score, metrics = grade_row(_row(spec, trace, ["web_search"]))
     assert score == 1.0
     assert metrics["grounded"] == 1.0
     assert metrics["answer_contained"] == 1.0
@@ -77,7 +94,7 @@ def test_grade_hallucination_without_evidence():
         {"role": "tool", "name": "web_search", "content": "No relevant results about France."},
         {"role": "assistant", "content": "Paris"},
     ]
-    score, metrics = grade_trace(spec, trace, available_tools=["web_search"])
+    score, metrics = grade_row(_row(spec, trace, ["web_search"]))
     assert score == 0.0
     assert metrics["hallucinated"] == 1.0
 
@@ -95,7 +112,7 @@ def test_grade_gsm8k_requires_calculator():
         {"role": "user", "content": spec.question},
         {"role": "assistant", "content": "323"},
     ]
-    score, _ = grade_trace(spec, bad, available_tools=["calculator"])
+    score, _ = grade_row(_row(spec, bad, ["calculator"]))
     assert score == 0.0
 
     good = [
@@ -113,7 +130,7 @@ def test_grade_gsm8k_requires_calculator():
         {"role": "tool", "name": "calculator", "content": "323"},
         {"role": "assistant", "content": "The answer is 323."},
     ]
-    score2, metrics = grade_trace(spec, good, available_tools=["calculator"])
+    score2, metrics = grade_row(_row(spec, good, ["calculator"]))
     assert score2 == 1.0
     assert metrics["grounded"] == 1.0
 
@@ -131,7 +148,7 @@ def test_grade_context_unanswerable_abstain():
         {"role": "user", "content": "What is the phone number for the Nile?"},
         {"role": "assistant", "content": ABSTAIN_TEXT},
     ]
-    score, metrics = grade_trace(spec, good, available_tools=[])
+    score, metrics = grade_row(_row(spec, good, []))
     assert score == 1.0
     assert metrics["abstained"] == 1.0
 
@@ -139,7 +156,7 @@ def test_grade_context_unanswerable_abstain():
         {"role": "user", "content": "What is the phone number for the Nile?"},
         {"role": "assistant", "content": "555-0100"},
     ]
-    score2, metrics2 = grade_trace(spec, bad, available_tools=[])
+    score2, metrics2 = grade_row(_row(spec, bad, []))
     assert score2 == 0.0
     assert metrics2["hallucinated"] == 1.0
 

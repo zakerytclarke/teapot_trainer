@@ -1,30 +1,21 @@
-"""Generate teacher tool-use traces for SFT distillation.
+"""Generate teacher tool-use traces (no grading).
 
-Runs a strong instruct model (default Qwen2.5-14B) with a **random subset** of
-tools on general assistant / QnA tasks (no coding). Each row stores:
+Runs a strong instruct model (default ``Qwen/Qwen3.5-27B``) with a **random
+subset** of tools on general assistant / QnA tasks (no coding). Each row stores
+the prompt, full agent trace, golds, and tool metadata — filter/score later with
+``grade_tool_traces.py``.
 
-* ``messages_input`` — conversation before generation
-* ``messages_trace`` — full agent loop (input + tool calls + final answer)
-* ``score`` / ``metrics`` — grounded outcome
+Sources: GSM8K, NQ-Open, WebQuestions, TriviaQA, Hotpot, SQuAD v2.
 
-Grading rules (high level):
-
-* **GSM8K / calc tasks:** if ``calculator`` was available, it must be used; final
-  answer must match gold. Hallucinated arithmetic without the tool scores 0.
-* **Search / browser tasks:** if the matching tool was available, it must be used;
-  the gold answer must appear in the final reply **and** be supported by tool
-  evidence (or injected context). Answering from parametric memory alone scores 0.
-* **Context QA (e.g. SQuAD):** evidence is the ``[INJECTED_CONTEXT]`` block. The
-  model must answer from that context, or abstain when the context is insufficient.
-  Making something up that is not in context scores 0.
-
-Example::
+Example (full multi-day run)::
 
     python generate_tool_traces.py \\
-      --model Qwen/Qwen2.5-14B-Instruct \\
+      --model Qwen/Qwen3.5-27B \\
       --load-in-4bit \\
-      --max-samples 200 \\
-      --out traces.parquet
+      --per-dataset 0 \\
+      --max-samples 0 \\
+      --out tool_traces.jsonl \\
+      --flush-every 10
 """
 
 from __future__ import annotations
@@ -49,24 +40,10 @@ from teapottrainer import (
     run_agent,
 )
 from teapottrainer.formatting import ABSTAIN_TEXT
-from teapottrainer.metrics import (
-    _normalize_answer,
-    best_span_scores,
-    gold_gsm_number,
-    is_abstention,
-    score_gsm,
-)
-from teapottrainer.rl.rewards import used_named_tools, used_search_tools
-from teapottrainer.rl.tools import ToolFn, conversation_tool_calls, final_assistant_text
+from teapottrainer.rl.tools import ToolFn, final_assistant_text
 
-BROWSER_TOOLS = frozenset({"browser_goto", "browser_read", "browser_act"})
 CONTEXT_TAG_OPEN = "[INJECTED_CONTEXT]"
 CONTEXT_TAG_CLOSE = "[/INJECTED_CONTEXT]"
-
-
-# ---------------------------------------------------------------------------
-# Prompt / tool lottery
-# ---------------------------------------------------------------------------
 
 
 def build_system_prompt(*, today: str | None = None) -> str:
@@ -80,7 +57,7 @@ Evidence rules (strict):
 - Never invent biographies, numbers, dates, or citations.
 
 Tool rules:
-- calculator — required for arithmetic when available.
+- calculator — use for arithmetic when available.
 - web_search — look up open-domain facts when available.
 - browser_goto / browser_read / browser_act — use for live pages when available.
 - Prefer a short final answer after gathering evidence.
@@ -120,11 +97,6 @@ def tool_names(tools: Iterable[ToolFn]) -> list[str]:
     return [str(getattr(fn, "__name__", "tool")) for fn in tools]
 
 
-# ---------------------------------------------------------------------------
-# Episode specs
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class EpisodeSpec:
     sample_id: str
@@ -133,10 +105,9 @@ class EpisodeSpec:
     question: str
     gold_answers: list[str]
     messages_input: list[dict[str, Any]]
+    # Intended tools for *later* grading (only enforced if present in tools_available).
     required_tools: list[str] = field(default_factory=list)
-    # If True, gold is "must abstain" (unanswerable / insufficient evidence).
     unanswerable: bool = False
-    # Extra evidence already in the prompt (injected context).
     injected_context: str = ""
     meta: dict[str, Any] = field(default_factory=dict)
 
@@ -180,43 +151,14 @@ def _messages_for_question(system: str, question: str, *, injected_context: str 
     return msgs
 
 
-# --- Dataset loaders --------------------------------------------------------
-
-
-def load_gsm8k(split: str = "train", limit: int | None = None) -> list[dict[str, Any]]:
-    ds = load_dataset("openai/gsm8k", "main", split=split)
-    rows = [dict(r) for r in ds]
-    return rows[:limit] if limit else rows
-
-
-def load_nq_open(split: str = "train", limit: int | None = None) -> list[dict[str, Any]]:
-    ds = load_dataset("google-research-datasets/nq_open", split=split)
-    rows = [dict(r) for r in ds]
-    return rows[:limit] if limit else rows
-
-
-def load_web_questions(split: str = "train", limit: int | None = None) -> list[dict[str, Any]]:
-    ds = load_dataset("stanfordnlp/web_questions", split=split)
-    rows = [dict(r) for r in ds]
-    return rows[:limit] if limit else rows
-
-
-def load_trivia_qa(split: str = "train", limit: int | None = None) -> list[dict[str, Any]]:
-    ds = load_dataset("mandarjoshi/trivia_qa", "rc.nocontext", split=split)
-    rows = [dict(r) for r in ds]
-    return rows[:limit] if limit else rows
-
-
-def load_hotpot(split: str = "train", limit: int | None = None) -> list[dict[str, Any]]:
-    ds = load_dataset("hotpotqa/hotpot_qa", "distractor", split=split)
-    rows = [dict(r) for r in ds]
-    return rows[:limit] if limit else rows
-
-
-def load_squad_v2(split: str = "train", limit: int | None = None) -> list[dict[str, Any]]:
-    ds = load_dataset("rajpurkar/squad_v2", split=split)
-    rows = [dict(r) for r in ds]
-    return rows[:limit] if limit else rows
+def _load_rows(name: str, *, subset: str | None = None, split: str = "train", limit: int | None = None) -> list[dict]:
+    if subset:
+        ds = load_dataset(name, subset, split=split)
+    else:
+        ds = load_dataset(name, split=split)
+    if limit is not None and limit > 0:
+        ds = ds.select(range(min(limit, len(ds))))
+    return [dict(row) for row in ds]
 
 
 def make_gsm8k_episode(row: dict[str, Any], system: str, idx: int) -> EpisodeSpec:
@@ -229,7 +171,7 @@ def make_gsm8k_episode(row: dict[str, Any], system: str, idx: int) -> EpisodeSpe
         question=q,
         gold_answers=[gold],
         messages_input=_messages_for_question(system, q),
-        required_tools=["calculator"],  # enforced only if calculator is in the bundle
+        required_tools=["calculator"],
         meta={"raw_answer": gold},
     )
 
@@ -256,8 +198,9 @@ def make_search_episode(
 def make_squad_episode(row: dict[str, Any], system: str, idx: int) -> EpisodeSpec:
     context = str(row.get("context") or "").strip()
     question = str(row.get("question") or "").strip()
-    answers = _as_answers((row.get("answers") or {}).get("text") if isinstance(row.get("answers"), dict) else row.get("answers"))
-    # SQuAD v2: empty answers => unanswerable
+    answers = _as_answers(
+        (row.get("answers") or {}).get("text") if isinstance(row.get("answers"), dict) else row.get("answers")
+    )
     unanswerable = len(answers) == 0 or bool(row.get("is_impossible"))
     gold = [ABSTAIN_TEXT] if unanswerable else answers
     return EpisodeSpec(
@@ -267,52 +210,44 @@ def make_squad_episode(row: dict[str, Any], system: str, idx: int) -> EpisodeSpe
         question=question,
         gold_answers=gold,
         messages_input=_messages_for_question(system, question, injected_context=context),
-        required_tools=[],  # answer from injected context; tools optional noise
+        required_tools=[],
         unanswerable=unanswerable,
         injected_context=context,
     )
 
 
-def build_episode_pool(
-    system: str,
-    *,
-    per_dataset: int,
-    seed: int,
-) -> list[EpisodeSpec]:
+def build_episode_pool(system: str, *, per_dataset: int, seed: int) -> list[EpisodeSpec]:
+    """``per_dataset <= 0`` means use the full train split for each source."""
     rng = random.Random(seed)
+    limit = None if per_dataset <= 0 else int(per_dataset)
     episodes: list[EpisodeSpec] = []
 
-    for i, row in enumerate(load_gsm8k(limit=per_dataset)):
+    for i, row in enumerate(_load_rows("openai/gsm8k", subset="main", limit=limit)):
         episodes.append(make_gsm8k_episode(row, system, i))
 
-    for i, row in enumerate(load_nq_open(limit=per_dataset)):
-        q = str(row.get("question") or "").strip()
-        ans = _as_answers(row.get("answer") or row.get("answers"))
+    for i, row in enumerate(_load_rows("google-research-datasets/nq_open", limit=limit)):
         episodes.append(
             make_search_episode(
                 dataset="nq_open",
                 sample_id=f"nq_open:{i}",
-                question=q,
-                answers=ans,
+                question=str(row.get("question") or "").strip(),
+                answers=_as_answers(row.get("answer") or row.get("answers")),
                 system=system,
             )
         )
 
-    for i, row in enumerate(load_web_questions(limit=per_dataset)):
-        q = str(row.get("question") or "").strip()
-        ans = _as_answers(row.get("answers") or row.get("answer"))
+    for i, row in enumerate(_load_rows("stanfordnlp/web_questions", limit=limit)):
         episodes.append(
             make_search_episode(
                 dataset="web_questions",
                 sample_id=f"web_questions:{i}",
-                question=q,
-                answers=ans,
+                question=str(row.get("question") or "").strip(),
+                answers=_as_answers(row.get("answers") or row.get("answer")),
                 system=system,
             )
         )
 
-    for i, row in enumerate(load_trivia_qa(limit=per_dataset)):
-        q = str(row.get("question") or "").strip()
+    for i, row in enumerate(_load_rows("mandarjoshi/trivia_qa", subset="rc.nocontext", limit=limit)):
         blob = row.get("answer") or {}
         ans: list[str] = []
         if isinstance(blob, dict):
@@ -321,8 +256,7 @@ def build_episode_pool(
             ans.extend(_as_answers(blob.get("value") or blob.get("normalized_value")))
         else:
             ans.extend(_as_answers(blob))
-        # de-dupe
-        seen = set()
+        seen: set[str] = set()
         uniq = []
         for a in ans:
             key = a.lower()
@@ -334,227 +268,28 @@ def build_episode_pool(
             make_search_episode(
                 dataset="trivia_qa",
                 sample_id=f"trivia_qa:{i}",
-                question=q,
+                question=str(row.get("question") or "").strip(),
                 answers=uniq,
                 system=system,
             )
         )
 
-    for i, row in enumerate(load_hotpot(limit=per_dataset)):
-        q = str(row.get("question") or "").strip()
-        ans = _as_answers(row.get("answer"))
+    for i, row in enumerate(_load_rows("hotpotqa/hotpot_qa", subset="distractor", limit=limit)):
         episodes.append(
             make_search_episode(
                 dataset="hotpot",
                 sample_id=f"hotpot:{i}",
-                question=q,
-                answers=ans,
+                question=str(row.get("question") or "").strip(),
+                answers=_as_answers(row.get("answer")),
                 system=system,
             )
         )
 
-    for i, row in enumerate(load_squad_v2(limit=per_dataset)):
+    for i, row in enumerate(_load_rows("rajpurkar/squad_v2", limit=limit)):
         episodes.append(make_squad_episode(row, system, i))
 
     rng.shuffle(episodes)
     return episodes
-
-
-# ---------------------------------------------------------------------------
-# Evidence + grading
-# ---------------------------------------------------------------------------
-
-
-def extract_injected_context(messages: list[dict[str, Any]]) -> str:
-    chunks = []
-    for message in messages:
-        content = str(message.get("content") or "")
-        if CONTEXT_TAG_OPEN in content and CONTEXT_TAG_CLOSE in content:
-            start = content.find(CONTEXT_TAG_OPEN) + len(CONTEXT_TAG_OPEN)
-            end = content.find(CONTEXT_TAG_CLOSE)
-            if end > start:
-                chunks.append(content[start:end].strip())
-    return "\n".join(chunks)
-
-
-def extract_tool_evidence(messages: list[dict[str, Any]]) -> str:
-    parts = []
-    for message in messages:
-        if message.get("role") != "tool":
-            continue
-        parts.append(str(message.get("content") or ""))
-    return "\n".join(parts)
-
-
-def evidence_corpus(messages: list[dict[str, Any]], injected: str = "") -> str:
-    return "\n".join(
-        p
-        for p in (injected, extract_injected_context(messages), extract_tool_evidence(messages))
-        if p and p.strip()
-    )
-
-
-def gold_supported_by_evidence(golds: list[str], evidence: str) -> bool:
-    """True if any gold span (normalized) appears in the evidence text."""
-    ev = _normalize_answer(evidence or "")
-    if not ev:
-        return False
-    for gold in golds:
-        g = _normalize_answer(gold)
-        # GSM8K gold may be a long rationale with #### N — prefer the number.
-        num = gold_gsm_number(gold)
-        if num and _normalize_answer(num) in ev:
-            return True
-        if g and g in ev:
-            return True
-        # soft: any reasonably long gold token overlap
-        if g and len(g) >= 3 and g in ev:
-            return True
-    return False
-
-
-def answer_supported_by_evidence(prediction: str, evidence: str, golds: list[str]) -> bool:
-    """Final answer must be grounded: gold in evidence, or prediction span in evidence."""
-    if gold_supported_by_evidence(golds, evidence):
-        # Also require the reply itself to contain the gold (answered correctly).
-        _, _, contained = best_span_scores(prediction, golds)
-        if contained:
-            return True
-        if score_gsm(prediction, golds[0]) >= 1.0:
-            return True
-    # Fallback: predicted number / short answer literal in evidence
-    pred_norm = _normalize_answer(prediction)
-    ev = _normalize_answer(evidence)
-    if not pred_norm or not ev:
-        return False
-    # Avoid counting huge replies as "in evidence"
-    for gold in golds:
-        g = _normalize_answer(gold_gsm_number(gold) or gold)
-        if g and g in pred_norm and g in ev:
-            return True
-    return False
-
-
-def effective_required_tools(spec: EpisodeSpec, available: list[str]) -> list[str]:
-    """Only require tools that were actually offered this episode."""
-    avail = set(available)
-    out = []
-    for name in spec.required_tools:
-        if name == "web_search" and any(t in avail for t in ("web_search", "brave_search", "exa_search")):
-            out.append("web_search")
-        elif name == "calculator" and "calculator" in avail:
-            out.append("calculator")
-        elif name == "browser" and (BROWSER_TOOLS & avail):
-            out.append("browser")
-        elif name in avail:
-            out.append(name)
-    return out
-
-
-def required_tools_used(required: list[str], calls: list[dict]) -> bool:
-    if not required:
-        return True
-    for name in required:
-        if name == "web_search":
-            if not used_search_tools(calls):
-                return False
-        elif name == "browser":
-            if not used_named_tools(calls, BROWSER_TOOLS):
-                return False
-        elif not used_named_tools(calls, [name]):
-            return False
-    return True
-
-
-def grade_trace(
-    spec: EpisodeSpec,
-    messages_trace: list[dict[str, Any]],
-    *,
-    available_tools: list[str],
-) -> tuple[float, dict[str, Any]]:
-    final = final_assistant_text(messages_trace)
-    calls = conversation_tool_calls(messages_trace)
-    required = effective_required_tools(spec, available_tools)
-    used_ok = required_tools_used(required, calls)
-    abstained = is_abstention(final)
-    evidence = evidence_corpus(messages_trace, injected=spec.injected_context)
-    has_evidence = bool(_normalize_answer(evidence))
-
-    metrics: dict[str, Any] = {
-        "used_required_tools": 1.0 if used_ok else 0.0,
-        "abstained": 1.0 if abstained else 0.0,
-        "has_evidence": 1.0 if has_evidence else 0.0,
-        "required_tools": required,
-        "task_type": spec.task_type,
-    }
-
-    # --- Unanswerable / must abstain ---
-    if spec.unanswerable:
-        # Good: abstain. Bad: confident answer.
-        if abstained and used_ok:
-            score = 1.0
-        elif abstained:
-            score = 0.5
-        else:
-            score = 0.0
-        metrics["grounded"] = 1.0 if abstained else 0.0
-        metrics["answer_contained"] = 0.0
-        metrics["hallucinated"] = 0.0 if abstained else 1.0
-        return float(score), metrics
-
-    # --- Must use required tools when offered ---
-    if not used_ok:
-        metrics["grounded"] = 0.0
-        metrics["answer_contained"] = 0.0
-        metrics["hallucinated"] = 1.0
-        return 0.0, metrics
-
-    # --- Answer match ---
-    if spec.task_type == "calc":
-        gold = spec.gold_answers[0] if spec.gold_answers else ""
-        answer_ok = score_gsm(final, gold) >= 1.0
-        # Prefer evidence that literally contains the number; else require a calc call.
-        grounded = answer_ok and (
-            gold_supported_by_evidence(spec.gold_answers, evidence)
-            or used_named_tools(calls, ["calculator"])
-        )
-        if used_named_tools(calls, ["calculator"]) and evidence.strip():
-            grounded = answer_ok and gold_supported_by_evidence(spec.gold_answers, evidence)
-        metrics["answer_contained"] = 1.0 if answer_ok else 0.0
-        metrics["grounded"] = 1.0 if grounded else 0.0
-        metrics["hallucinated"] = (
-            1.0 if ((answer_ok and not grounded) or (not answer_ok and not abstained)) else 0.0
-        )
-        if answer_ok and grounded:
-            return 1.0, metrics
-        if abstained and not has_evidence:
-            return 0.4, metrics
-        return 0.0, metrics
-
-    # search / context_qa / browser
-    _, _, contained = best_span_scores(final, spec.gold_answers)
-    answer_ok = bool(contained)
-    grounded = answer_supported_by_evidence(final, evidence, spec.gold_answers)
-
-    metrics["answer_contained"] = 1.0 if answer_ok else 0.0
-    metrics["grounded"] = 1.0 if grounded else 0.0
-
-    # Hallucination: answered something not supported by evidence.
-    hallucinated = (not abstained) and (not grounded)
-    metrics["hallucinated"] = 1.0 if hallucinated else 0.0
-
-    if answer_ok and grounded and used_ok:
-        return 1.0, metrics
-    # Correct abstain when evidence truly lacks gold (model refused to hallucinate).
-    if abstained and not gold_supported_by_evidence(spec.gold_answers, evidence):
-        return 0.5, metrics
-    # Right final string but not supported by tool/context evidence => hallucination.
-    return 0.0, metrics
-
-
-# ---------------------------------------------------------------------------
-# IO
-# ---------------------------------------------------------------------------
 
 
 def _json_default(obj: Any) -> Any:
@@ -563,77 +298,64 @@ def _json_default(obj: Any) -> Any:
     raise TypeError(f"not serializable: {type(obj)!r}")
 
 
-def rows_to_table(rows: list[dict[str, Any]]):
-    import pyarrow as pa
-
-    # Nested structures stored as JSON strings for a flat, portable schema.
-    flat = []
-    for row in rows:
-        flat.append(
-            {
-                "sample_id": row["sample_id"],
-                "dataset": row["dataset"],
-                "task_type": row["task_type"],
-                "question": row["question"],
-                "gold_answers_json": json.dumps(row["gold_answers"], ensure_ascii=False),
-                "tools_available_json": json.dumps(row["tools_available"], ensure_ascii=False),
-                "tools_required_json": json.dumps(row["tools_required"], ensure_ascii=False),
-                "messages_input_json": json.dumps(row["messages_input"], ensure_ascii=False),
-                "messages_trace_json": json.dumps(row["messages_trace"], ensure_ascii=False),
-                "final_assistant": row["final_assistant"],
-                "score": float(row["score"]),
-                "metrics_json": json.dumps(row["metrics"], ensure_ascii=False, default=_json_default),
-                "model": row["model"],
-                "tool_format": row["tool_format"],
-                "unanswerable": bool(row["unanswerable"]),
-            }
-        )
-    return pa.Table.from_pylist(flat)
+def row_to_flat(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "sample_id": row["sample_id"],
+        "dataset": row["dataset"],
+        "task_type": row["task_type"],
+        "question": row["question"],
+        "gold_answers_json": json.dumps(row["gold_answers"], ensure_ascii=False),
+        "tools_available_json": json.dumps(row["tools_available"], ensure_ascii=False),
+        "tools_required_json": json.dumps(row["tools_required"], ensure_ascii=False),
+        "messages_input_json": json.dumps(row["messages_input"], ensure_ascii=False),
+        "messages_trace_json": json.dumps(row["messages_trace"], ensure_ascii=False),
+        "final_assistant": row["final_assistant"],
+        "injected_context": row.get("injected_context") or "",
+        "model": row["model"],
+        "tool_format": row["tool_format"],
+        "unanswerable": bool(row["unanswerable"]),
+    }
 
 
-def write_output(path: Path, rows: list[dict[str, Any]]) -> None:
+def append_jsonl(path: Path, row: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    suffix = path.suffix.lower()
-    if suffix == ".parquet":
-        import pyarrow.parquet as pq
-
-        pq.write_table(rows_to_table(rows), path)
-    elif suffix == ".csv":
-        import csv
-
-        table = rows_to_table(rows)
-        with path.open("w", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=table.column_names)
-            writer.writeheader()
-            for i in range(table.num_rows):
-                writer.writerow({name: table[name][i].as_py() for name in table.column_names})
-    else:
-        # jsonl fallback
-        with path.open("w", encoding="utf-8") as f:
-            for row in rows:
-                f.write(json.dumps(row, ensure_ascii=False, default=_json_default) + "\n")
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False, default=_json_default) + "\n")
 
 
-# ---------------------------------------------------------------------------
-# Main loop
-# ---------------------------------------------------------------------------
+def write_parquet(path: Path, rows: list[dict[str, Any]]) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.Table.from_pylist([row_to_flat(r) for r in rows]), path)
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--model", default="Qwen/Qwen2.5-14B-Instruct")
+    p.add_argument("--model", default="Qwen/Qwen3.5-27B")
     p.add_argument("--tool-format", default="hermes")
     p.add_argument("--load-in-4bit", action="store_true")
-    p.add_argument("--per-dataset", type=int, default=32, help="Rows to pull from each source")
-    p.add_argument("--max-samples", type=int, default=64, help="Episodes to generate this run")
+    p.add_argument(
+        "--per-dataset",
+        type=int,
+        default=0,
+        help="Rows per source (0 = full train split)",
+    )
+    p.add_argument(
+        "--max-samples",
+        type=int,
+        default=0,
+        help="Cap total episodes after shuffle (0 = no cap)",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--max-turns", type=int, default=6)
     p.add_argument("--max-new-tokens", type=int, default=256)
     p.add_argument("--temperature", type=float, default=0.2)
     p.add_argument("--mock-search", action="store_true")
     p.add_argument("--mock-browser", action="store_true")
-    p.add_argument("--out", default="tool_traces.parquet")
-    p.add_argument("--keep-min-score", type=float, default=-1.0, help="If >=0, only write rows with score >= this")
+    p.add_argument("--out", default="tool_traces.jsonl", help="Prefer .jsonl for long runs (append-safe)")
+    p.add_argument("--flush-every", type=int, default=10, help="Also rewrite parquet snapshot every N rows when --out ends with .parquet")
     return p.parse_args()
 
 
@@ -663,6 +385,7 @@ def main() -> None:
     args = parse_args()
     rng = random.Random(args.seed)
     system = build_system_prompt()
+    out = Path(args.out)
 
     print("building episode pool…")
     pool = build_episode_pool(system, per_dataset=args.per_dataset, seed=args.seed)
@@ -681,7 +404,13 @@ def main() -> None:
     print(f"loading teacher {args.model} …")
     model, tokenizer = load_model(args.model, load_in_4bit=bool(args.load_in_4bit))
 
+    # For long runs, always also append jsonl next to parquet.
+    jsonl_path = out if out.suffix.lower() == ".jsonl" else out.with_suffix(".jsonl")
+    if jsonl_path.exists():
+        print(f"appending to existing {jsonl_path}")
+
     rows: list[dict[str, Any]] = []
+    written = 0
     try:
         for i, spec in enumerate(pool):
             tools = sample_tool_bundle(
@@ -690,7 +419,6 @@ def main() -> None:
                 browser_tools=toolkit.tools,
             )
             available = tool_names(tools)
-            # Context-QA episodes: allow empty tool set sometimes so it must use injected context.
             if spec.task_type == "context_qa" and rng.random() < 0.35:
                 tools = []
                 available = []
@@ -714,8 +442,6 @@ def main() -> None:
                 print(f"  ERROR: {exc}")
                 continue
 
-            score, metrics = grade_trace(spec, trace, available_tools=available)
-            final = final_assistant_text(trace)
             row = {
                 "sample_id": spec.sample_id,
                 "dataset": spec.dataset,
@@ -723,27 +449,29 @@ def main() -> None:
                 "question": spec.question,
                 "gold_answers": spec.gold_answers,
                 "tools_available": available,
-                "tools_required": effective_required_tools(spec, available),
+                "tools_required": list(spec.required_tools),
                 "messages_input": spec.messages_input,
                 "messages_trace": trace,
-                "final_assistant": final,
-                "score": score,
-                "metrics": metrics,
+                "final_assistant": final_assistant_text(trace),
+                "injected_context": spec.injected_context,
                 "model": args.model,
                 "tool_format": args.tool_format,
                 "unanswerable": spec.unanswerable,
             }
-            if args.keep_min_score >= 0 and score < args.keep_min_score:
-                print(f"  drop score={score:.2f} metrics={metrics}")
-                continue
+            append_jsonl(jsonl_path, row)
             rows.append(row)
-            print(f"  score={score:.2f} grounded={metrics.get('grounded')} contained={metrics.get('answer_contained')}")
+            written += 1
+            print(f"  wrote ({written}) final={row['final_assistant'][:120]!r}")
+
+            if out.suffix.lower() == ".parquet" and args.flush_every > 0 and written % args.flush_every == 0:
+                write_parquet(out, rows)
+                print(f"  parquet snapshot -> {out}")
     finally:
         toolkit.close()
 
-    out = Path(args.out)
-    write_output(out, rows)
-    print(f"wrote {len(rows)} rows -> {out}")
+    if out.suffix.lower() == ".parquet":
+        write_parquet(out, rows)
+    print(f"done: {written} traces -> {jsonl_path}" + (f" and {out}" if out.suffix.lower() == ".parquet" else ""))
 
 
 if __name__ == "__main__":
