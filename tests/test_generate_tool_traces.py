@@ -165,3 +165,71 @@ def test_system_prompt_includes_date_and_context_tags():
     text = build_system_prompt(today="2026-11-19")
     assert "2026-11-19" in text
     assert "[INJECTED_CONTEXT]" in text
+    assert "browser_goto" in text
+
+
+def test_mind2web_episode_is_browser_task():
+    from generate_tool_traces import make_mind2web_episode
+
+    system = build_system_prompt(today="2026-11-19")
+    ep = make_mind2web_episode(
+        {
+            "confirmed_task": "Find men's running shoes under $50 and add to cart.",
+            "website": "kohls",
+            "domain": "Shopping",
+            "annotation_id": "abc",
+            "action_reprs": ["[searchbox] Search -> TYPE: running shoes"],
+        },
+        system,
+        0,
+    )
+    assert ep is not None
+    assert ep.dataset == "mind2web"
+    assert ep.task_type == "browser"
+    assert ep.required_tools == ["browser"]
+    assert "kohls" in ep.question
+    assert "www.kohls.com" in ep.question
+
+
+def test_weblinx_skips_credential_tasks():
+    from generate_tool_traces import extract_weblinx_goal, make_weblinx_episode
+
+    hist = (
+        'say(speaker="instructor", utterance="Hello") '
+        'say(speaker="instructor", utterance="Open site and login with google using the below details: '
+        'Id: webtasks.navigator@gmail.com Password: secret")'
+    )
+    assert extract_weblinx_goal(hist) is None
+
+    good = (
+        'say(speaker="instructor", utterance="Hello") '
+        'say(speaker="instructor", utterance="Open the Trello website.")'
+    )
+    goal = extract_weblinx_goal(good)
+    assert goal == "Open the Trello website."
+    ep = make_weblinx_episode("demo1", goal, build_system_prompt(today="2026-11-19"))
+    assert ep is not None
+    assert ep.task_type == "browser"
+    assert "Trello" in ep.question
+
+
+def test_sample_tool_bundle_browser_always_includes_browser():
+    from generate_tool_traces import sample_tool_bundle
+
+    class _T:
+        def __init__(self, name):
+            self.__name__ = name
+
+        def __call__(self, *a, **k):
+            return "ok"
+
+    rng = __import__("random").Random(0)
+    for _ in range(20):
+        tools = sample_tool_bundle(
+            rng,
+            search_tools=[_T("web_search")],
+            browser_tools=[_T("browser_goto"), _T("browser_read"), _T("browser_act")],
+            task_type="browser",
+        )
+        names = {t.__name__ for t in tools}
+        assert "browser_goto" in names

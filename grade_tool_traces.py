@@ -194,6 +194,29 @@ def grade_row(row: dict[str, Any]) -> tuple[float, dict[str, Any]]:
             return 0.4, metrics
         return 0.0, metrics
 
+    if task_type == "browser":
+        # Soft heuristic until a dedicated browser grader exists: require browser tools,
+        # prefer goto+read(+act), and treat empty finals as failures.
+        used_browser = used_named_tools(calls, BROWSER_TOOLS)
+        used_goto = used_named_tools(calls, ["browser_goto"])
+        used_read = used_named_tools(calls, ["browser_read"])
+        used_act = used_named_tools(calls, ["browser_act"])
+        metrics["used_browser"] = 1.0 if used_browser else 0.0
+        metrics["used_goto"] = 1.0 if used_goto else 0.0
+        metrics["used_read"] = 1.0 if used_read else 0.0
+        metrics["used_act"] = 1.0 if used_act else 0.0
+        metrics["answer_contained"] = 0.0
+        ok_flow = used_ok and used_goto and used_read and bool(final.strip())
+        metrics["grounded"] = 1.0 if (ok_flow and has_evidence) else 0.0
+        metrics["hallucinated"] = 0.0 if metrics["grounded"] else 1.0
+        if ok_flow and used_act and has_evidence:
+            return 1.0, metrics
+        if ok_flow and has_evidence:
+            return 0.7, metrics
+        if used_ok and used_browser:
+            return 0.3, metrics
+        return 0.0, metrics
+
     _, _, contained = best_span_scores(final, golds)
     answer_ok = bool(contained)
     grounded = answer_supported_by_evidence(final, evidence, golds)
