@@ -1,6 +1,6 @@
 """Generate teacher tool-use traces (no grading).
 
-Runs a strong instruct model (default ``Qwen/Qwen3.5-27B``) with a **random
+Runs a strong instruct model (default ``Qwen/Qwen3.8-27B``) with a **random
 subset** of tools on general assistant / QnA tasks (no coding). Each row stores
 the prompt, full agent trace, golds, and tool metadata — filter/score later with
 ``grade_tool_traces.py``.
@@ -10,7 +10,7 @@ Sources: GSM8K, NQ-Open, WebQuestions, TriviaQA, Hotpot, SQuAD v2.
 Example (full multi-day run)::
 
     python generate_tool_traces.py \\
-      --model Qwen/Qwen3.5-27B \\
+      --model Qwen/Qwen3.8-27B \\
       --load-in-4bit \\
       --per-dataset 0 \\
       --max-samples 0 \\
@@ -333,7 +333,7 @@ def write_parquet(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--model", default="Qwen/Qwen3.5-27B")
+    p.add_argument("--model", default="Qwen/Qwen3.8-27B")
     p.add_argument("--tool-format", default="hermes")
     p.add_argument("--load-in-4bit", action="store_true")
     p.add_argument(
