@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_valid
 
 from .config import DatasetSpec
 from .rl.datasets import SYNTH_MATH, RlDataset
+from .rl.browser import BrowserSettings
 from .rl.search import SearchSettings
 from .tool_formats import get_tool_format
 
@@ -40,6 +41,9 @@ class RlConfig(BaseModel):
     # Optional search knobs (default backend: llmsearchindex). Datasets still
     # need ``bind_tools(..., build_search_tools(search))`` to expose them.
     search: Optional[SearchSettings] = None
+    # Optional Playwright browser knobs. Datasets still need
+    # ``bind_tools(..., build_browser_tools(browser))`` to expose them.
+    browser: Optional[BrowserSettings] = None
 
     algorithm: str = "grpo"
     group_size: int = 4
