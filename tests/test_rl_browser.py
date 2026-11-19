@@ -70,6 +70,12 @@ def test_browser_settings_from_env(monkeypatch):
     assert settings.headless is False
 
 
+def test_ensure_playwright_browsers_is_exported():
+    from teapottrainer import ensure_playwright_browsers
+
+    assert callable(ensure_playwright_browsers)
+
+
 def test_browser_tools_work_inside_running_asyncio_loop():
     """Colab/Jupyter already have a running loop; tools must still work."""
 
