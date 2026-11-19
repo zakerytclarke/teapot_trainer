@@ -958,7 +958,7 @@ class TeapotTrainer:
             if skip <= 0 and int(target) > 100_000_000:
                 print(f"  {source_key(src)}: shard skip would walk the full prefix; refusing the old mixed skip")
                 return None
-            if remainder > 2_000_000_000:
+            if remainder > 3_000_000_000:
                 print(
                     f"  {source_key(src)}: last-shard remainder {remainder:,} is still a multi-hour encode; "
                     "refusing to start it"
