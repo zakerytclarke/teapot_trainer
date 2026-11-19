@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from teapottrainer import (
     BrowserSettings,
     NQ_OPEN_RL,
@@ -66,3 +68,21 @@ def test_browser_settings_from_env(monkeypatch):
     settings = BrowserSettings.from_env()
     assert settings.mock is True
     assert settings.headless is False
+
+
+def test_browser_tools_work_inside_running_asyncio_loop():
+    """Colab/Jupyter already have a running loop; tools must still work."""
+
+    async def _inside_loop():
+        kit = build_browser_toolkit(BrowserSettings(mock=True, eager=True))
+        try:
+            out = call_tool_by_name(
+                kit.tools, "browser_goto", {"url": "https://example.com"}
+            )
+            assert "OK navigated" in out
+            page = call_tool_by_name(kit.tools, "browser_read", {})
+            assert "Interactive elements" in page
+        finally:
+            kit.close()
+
+    asyncio.run(_inside_loop())

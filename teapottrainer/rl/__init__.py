@@ -13,6 +13,7 @@ from .browser import (
     BrowserToolkit,
     build_browser_toolkit,
     build_browser_tools,
+    ensure_playwright_browsers,
 )
 from .rollouts import Trajectory, rollout_episode
 from .search import (
@@ -34,6 +35,7 @@ __all__ = [
     "BrowserToolkit",
     "build_browser_toolkit",
     "build_browser_tools",
+    "ensure_playwright_browsers",
     "SearchSettings",
     "build_search_tools",
     "make_brave_search",
