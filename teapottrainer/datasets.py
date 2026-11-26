@@ -1,9 +1,12 @@
 """Dataset presets and the streaming encoder.
 
-New presets are additional constants. ``chat_template_fn`` may return one
-``(prompt, answer)`` pair or a list of pairs (one per assistant turn).
-``token_loss_weight_fn`` is optional and, when set, returns one loss weight
-per label. The trainer applies those weights; it does not decide them.
+Import a corpus and take the split you mean: ``gsm8k.train`` and ``gsm8k.test``.
+The uppercase constants are those same splits, so older imports keep working.
+``chat_template_fn`` may return one ``(prompt, answer)`` pair or a list of
+pairs (one per assistant turn). ``token_loss_weight_fn`` is optional and, when
+set, returns one loss weight per label. The trainer applies those weights; it
+does not decide them. ``metric`` is the eval the scorer should run.
+``formatted`` copies a split with a different template, metric, or loss weight.
 """
 
 from __future__ import annotations
@@ -17,6 +20,10 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
+
+# Declared here so a split can name its eval without importing the scorer.
+# ``task_kind`` returns this when it is set, and otherwise reads the dataset id.
+MetricName = str
 from datasets import load_dataset
 
 from .chat_formats import current_chat_format, supervised_end
@@ -63,11 +70,16 @@ from .formatting import (
 
 
 class DatasetSourceConfig(BaseModel):
-    """Configuration for an individual dataset source in a mix."""
+    """One split of a corpus: its file, its prompt format, and its eval."""
 
     name: str
     subset: Optional[str] = None
     split: str = "train"
+    # train, validation, or test. Test and validation are read whole.
+    # A train split keeps a hash holdout out of the training stream.
+    role: str = Field(default="train", exclude=True)
+    # Eval name (squad, gsm8k, lm, sft_loss, ...). None keeps the name heuristic.
+    metric: Optional[MetricName] = Field(default=None, exclude=True)
     target_tokens: int = 100_000_000
     weight: float = 1.0
     text_column: str = "text"
@@ -79,6 +91,76 @@ class DatasetSourceConfig(BaseModel):
     token_loss_weight_fn: Optional[Callable[[dict, Any], list[float]]] = Field(default=None, exclude=True)
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    def formatted(
+        self,
+        chat_template_fn: Optional[Callable] = None,
+        *,
+        preprocess_fn: Optional[Callable] = None,
+        token_loss_weight_fn: Optional[Callable] = None,
+        metric: Optional[str] = None,
+        role: Optional[str] = None,
+        split: Optional[str] = None,
+    ) -> "DatasetSourceConfig":
+        """Copy this split with a new prompt, loss weight, metric, or role.
+
+        Omitted arguments stay as they are, so a format change does not drop
+        the eval or the stop-token weight.
+        """
+        updates: dict[str, Any] = {}
+        if chat_template_fn is not None:
+            updates["chat_template_fn"] = chat_template_fn
+        if preprocess_fn is not None:
+            updates["preprocess_fn"] = preprocess_fn
+        if token_loss_weight_fn is not None:
+            updates["token_loss_weight_fn"] = token_loss_weight_fn
+        if metric is not None:
+            updates["metric"] = metric
+        if role is not None:
+            updates["role"] = role
+        if split is not None:
+            updates["split"] = split
+        if not updates:
+            return self
+        return self.model_copy(update=updates)
+
+
+class Dataset(BaseModel):
+    """One corpus. Import this and use ``.train``, ``.validation``, or ``.test``."""
+
+    train: Optional[DatasetSourceConfig] = None
+    validation: Optional[DatasetSourceConfig] = None
+    test: Optional[DatasetSourceConfig] = None
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    def get(self, role: str) -> DatasetSourceConfig:
+        value = getattr(self, role, None)
+        if not isinstance(value, DatasetSourceConfig):
+            raise KeyError(role)
+        return value
+
+    def formatted(
+        self,
+        chat_template_fn: Optional[Callable] = None,
+        *,
+        preprocess_fn: Optional[Callable] = None,
+        token_loss_weight_fn: Optional[Callable] = None,
+        metric: Optional[str] = None,
+    ) -> "Dataset":
+        """Copy every split with the same format change."""
+
+        def apply(src: Optional[DatasetSourceConfig]) -> Optional[DatasetSourceConfig]:
+            if src is None:
+                return None
+            return src.formatted(
+                chat_template_fn,
+                preprocess_fn=preprocess_fn,
+                token_loss_weight_fn=token_loss_weight_fn,
+                metric=metric,
+            )
+
+        return Dataset(train=apply(self.train), validation=apply(self.validation), test=apply(self.test))
 
 
 # End-of-answer token, relative to a normal supervised token.
@@ -482,6 +564,125 @@ BFCL_PARALLEL = BFCL_SIMPLE.model_copy(update={"subset": "parallel"})
 BFCL_IRRELEVANCE = BFCL_SIMPLE.model_copy(update={"subset": "irrelevance"})
 
 
+def _split_role(split: str) -> str:
+    """Train splits stay train, including ``train_sft``. Validation stays validation."""
+    if split == "validation":
+        return "validation"
+    if split == "train" or str(split).startswith("train"):
+        return "train"
+    return "test"
+
+
+# The scorer reads ``metric`` off the split. The name heuristic remains the fallback.
+_PRESET_METRICS = {
+    "FINEWEB_EDU": "lm",
+    "DCLM_EDU": "lm",
+    "STACK_EDU": "lm",
+    "FINEMATH": "lm",
+    "INFIWEBMATH": "lm",
+    "COSMOPEDIA_V2": "lm",
+    "SMOLTALK": "sft_loss",
+    "SMOLTALK_MAGPIE": "sft_loss",
+    "SMOLTALK_EVERYDAY": "sft_loss",
+    "SMOLTALK_OPENHERMES": "sft_loss",
+    "SMOLTALK_SYSTEMCHATS": "sft_loss",
+    "SMOLTALK_SUMMARIZE": "sft_loss",
+    "SMOLTALK_REWRITE": "sft_loss",
+    "SMOLTALK_METAMATH": "sft_loss",
+    "SMOLTALK_MAGPIE_TEST": "sft_loss",
+    "ULTRACHAT": "sft_loss",
+    "ULTRACHAT_TEST": "sft_loss",
+    "ALPACA": "sft_loss",
+    "TEAPOT_CHAT": "chat",
+    "SMOLTALK_APIGEN": "tools",
+    "SMOLTALK_APIGEN_DECISION": "tools",
+    "SMOLTALK_APIGEN_ALIASED": "tools",
+    "SMOLTALK_APIGEN_MISSING": "tools",
+    "SMOLTALK_APIGEN_UNRELATED": "tools",
+    "SMOLTALK_APIGEN_TEST": "tools",
+    "SMOLTALK_APIGEN_DECISION_TEST": "tools",
+    "SMOLTALK_APIGEN_ALIASED_TEST": "tools",
+    "HERMES_FUNCTION_CALLING": "tools",
+    "SMOLTALK_CONSTRAINTS": "constraints",
+    "SMOLTALK_CONSTRAINTS_TEST": "constraints",
+    "GSM8K": "gsm8k",
+    "GSM8K_TEST": "gsm8k",
+    "WHEN2CALL": "when2call",
+    "WHEN2CALL_TEST": "when2call",
+    "WHEN2CALL_ASK": "when2call",
+    "WHEN2CALL_REFUSE": "when2call",
+    "SQUAD_V2": "squad",
+    "SQUAD_V2_VAL": "squad",
+    "SQUAD_V2_ANSWERABLE": "squad",
+    "SQUAD_V2_UNANSWERABLE": "squad",
+    "SQUAD_V2_CONTRASTIVE": "squad",
+    "HOTPOT": "hotpot",
+    "HOTPOT_VAL": "hotpot",
+    "HOTPOT_CONTRASTIVE": "hotpot",
+    "SYNTHQA": "synthqa",
+    "SYNTHQA_TEST": "synthqa",
+    "SYNTHQA_ANSWERABLE": "synthqa",
+    "SYNTHQA_UNANSWERABLE": "synthqa",
+    "SYNTHQA_CONTRASTIVE": "synthqa",
+    "IFEVAL": "ifeval",
+    "MT_BENCH": "mtbench",
+    "ALPACA_EVAL": "alpaca",
+    "ARENA_HARD": "arena",
+    "ARC_EASY": "choice",
+    "ARC_EASY_VAL": "choice",
+    "HELLASWAG": "choice",
+    "HELLASWAG_VAL": "choice",
+    "PIQA": "choice",
+    "PIQA_VAL": "choice",
+    "WINOGRANDE": "choice",
+    "WINOGRANDE_VAL": "choice",
+    "COQA": "coqa",
+    "COQA_VAL": "coqa",
+    "DROP": "drop",
+    "DROP_VAL": "drop",
+    "BFCL_SIMPLE": "bfcl",
+    "BFCL_MULTIPLE": "bfcl",
+    "BFCL_PARALLEL": "bfcl",
+    "BFCL_IRRELEVANCE": "bfcl",
+}
+
+for _preset_name, _preset_metric in _PRESET_METRICS.items():
+    _preset = globals()[_preset_name]
+    globals()[_preset_name] = _preset.model_copy(
+        update={"metric": _preset_metric, "role": _split_role(_preset.split)}
+    )
+del _preset, _preset_name, _preset_metric
+
+fineweb_edu = Dataset(train=FINEWEB_EDU)
+dclm_edu = Dataset(train=DCLM_EDU)
+stack_edu = Dataset(train=STACK_EDU)
+finemath = Dataset(train=FINEMATH)
+infiwebmath = Dataset(train=INFIWEBMATH)
+cosmopedia = Dataset(train=COSMOPEDIA_V2)
+smoltalk = Dataset(train=SMOLTALK)
+smoltalk_magpie = Dataset(train=SMOLTALK_MAGPIE, test=SMOLTALK_MAGPIE_TEST)
+smoltalk_constraints = Dataset(train=SMOLTALK_CONSTRAINTS, test=SMOLTALK_CONSTRAINTS_TEST)
+smoltalk_openhermes = Dataset(train=SMOLTALK_OPENHERMES)
+smoltalk_apigen = Dataset(train=SMOLTALK_APIGEN, test=SMOLTALK_APIGEN_TEST)
+smoltalk_apigen_decision = Dataset(train=SMOLTALK_APIGEN_DECISION, test=SMOLTALK_APIGEN_DECISION_TEST)
+smoltalk_apigen_aliased = Dataset(train=SMOLTALK_APIGEN_ALIASED, test=SMOLTALK_APIGEN_ALIASED_TEST)
+gsm8k = Dataset(train=GSM8K, test=GSM8K_TEST)
+when2call = Dataset(train=WHEN2CALL, test=WHEN2CALL_TEST)
+squad_v2 = Dataset(train=SQUAD_V2, validation=SQUAD_V2_VAL)
+hotpot = Dataset(train=HOTPOT, validation=HOTPOT_VAL)
+synthqa = Dataset(train=SYNTHQA, test=SYNTHQA_TEST)
+teapot_chat = Dataset(train=TEAPOT_CHAT)
+arc_easy = Dataset(train=ARC_EASY, validation=ARC_EASY_VAL)
+hellaswag = Dataset(train=HELLASWAG, validation=HELLASWAG_VAL)
+piqa = Dataset(train=PIQA, validation=PIQA_VAL)
+winogrande = Dataset(train=WINOGRANDE, validation=WINOGRANDE_VAL)
+coqa = Dataset(train=COQA, validation=COQA_VAL)
+drop = Dataset(train=DROP, validation=DROP_VAL)
+hermes = Dataset(train=HERMES_FUNCTION_CALLING)
+ultrachat = Dataset(train=ULTRACHAT, test=ULTRACHAT_TEST)
+alpaca = Dataset(train=ALPACA)
+
+
 class _RowDataset:
     """In-memory rows with the shuffle call the streaming trainer uses."""
 
@@ -601,6 +802,125 @@ def open_dataset(src: DatasetSourceConfig, streaming: bool):
         raise
 
 
+def is_hf_parquet_source(src: DatasetSourceConfig | str) -> bool:
+    name = getattr(src, "name", src)
+    return isinstance(name, str) and "/" in name and not str(name).startswith((".", "/", "~"))
+
+
+def _arrow_examples_iterable(dataset):
+    inner = getattr(dataset, "_ex_iterable", None)
+    seen: set[int] = set()
+    while inner is not None and id(inner) not in seen:
+        seen.add(id(inner))
+        files = getattr(getattr(inner, "kwargs", None), "get", None)
+        if callable(files) and inner.kwargs.get("files"):
+            return inner
+        if hasattr(inner, "generate_tables_fn") and isinstance(getattr(inner, "kwargs", None), dict):
+            return inner
+        inner = getattr(inner, "ex_iterable", None)
+    return None
+
+
+def parquet_shard_files(dataset) -> list[str]:
+    inner = _arrow_examples_iterable(dataset)
+    if inner is None:
+        return []
+    files = inner.kwargs.get("files") or []
+    return [str(item) for item in files]
+
+
+_REPO_SIZE_CACHE: dict[str, dict[str, int]] = {}
+
+
+def _hf_url_parts(url: str) -> tuple[str, str] | None:
+    prefix = "hf://datasets/"
+    if not url.startswith(prefix) or "@" not in url:
+        return None
+    rest = url[len(prefix) :]
+    repo, right = rest.split("@", 1)
+    if "/" not in right:
+        return None
+    _rev, path = right.split("/", 1)
+    return repo, path
+
+
+def parquet_shard_sizes(files: list[str]) -> list[int]:
+    """Byte sizes for ``hf://datasets/...`` parquet URLs. Missing sizes are 0."""
+    sizes = [0] * len(files)
+    needed: dict[str, list[int]] = {}
+    for index, url in enumerate(files):
+        parts = _hf_url_parts(url)
+        if parts is None:
+            continue
+        repo, path = parts
+        cached = _REPO_SIZE_CACHE.get(repo)
+        if cached and path in cached:
+            sizes[index] = cached[path]
+        else:
+            needed.setdefault(repo, []).append(index)
+    if not needed:
+        return sizes
+    from huggingface_hub import HfApi
+
+    api = HfApi()
+    for repo, indexes in needed.items():
+        listing = _REPO_SIZE_CACHE.setdefault(repo, {})
+        for item in api.list_repo_tree(repo, repo_type="dataset", recursive=True):
+            path = getattr(item, "path", None)
+            size = getattr(item, "size", None)
+            if path and path.endswith(".parquet") and size:
+                listing[path] = int(size)
+        for index in indexes:
+            parts = _hf_url_parts(files[index])
+            if parts is None:
+                continue
+            sizes[index] = listing.get(parts[1], 0)
+    return sizes
+
+
+def shards_to_skip(sizes: list[int], target_tokens: int, tokens_per_byte: float = 0.20) -> int:
+    """Skip whole files whose estimated packed tokens stay under ``target_tokens``.
+
+    ``tokens_per_byte`` is an underestimate so this prefers walking the last
+    shard over jumping past the resume cursor. Always leaves at least one file.
+    """
+    if not sizes or target_tokens <= 0:
+        return 0
+    skipped = 0.0
+    last = len(sizes) - 1
+    index = 0
+    while index < last:
+        estimated = sizes[index] * tokens_per_byte
+        if skipped + estimated >= target_tokens:
+            break
+        skipped += estimated
+        index += 1
+    remaining = target_tokens - skipped
+    while remaining > 1_500_000_000 and index < last:
+        skipped += sizes[index] * tokens_per_byte
+        index += 1
+        remaining = target_tokens - skipped
+    return index
+
+
+def skip_prefix_shards(dataset, count: int):
+    """Start a streaming parquet dataset at shard ``count`` without opening earlier files."""
+    if count <= 0:
+        return dataset
+    inner = _arrow_examples_iterable(dataset)
+    if inner is None:
+        raise SystemExit("cannot shard-skip this streaming dataset (no parquet file list)")
+    total = int(getattr(inner, "num_shards", 0) or 0)
+    if total <= 1:
+        return dataset
+    count = min(int(count), total - 1)
+    state = inner._init_state_dict()
+    state["shard_idx"] = count
+    if "shard_example_idx" in state:
+        state["shard_example_idx"] = 0
+    return dataset
+
+
 def holdout_membership(key: str, ratio: float, seed: int) -> bool:
     """True when this example belongs to the train-split holdout."""
     if ratio <= 0:
@@ -704,6 +1024,7 @@ def iterate_encoded(
     holdout_ratio: float = 0.05,
     seed: int = 42,
     rows: list[dict] | None = None,
+    skip_shards: int = 0,
 ) -> Iterator[dict]:
     """Yield fixed trainer examples.
 
@@ -721,6 +1042,8 @@ def iterate_encoded(
             # reach past them or a short run never sees an abstention.
             buffer = 4096 if "squad" in (src.name or "") else 512
             dataset = dataset.shuffle(seed=seed, buffer_size=buffer)
+        if skip_shards:
+            dataset = skip_prefix_shards(dataset, skip_shards)
         for row in dataset:
             yield row
 
@@ -780,9 +1103,11 @@ class DatasetRegistry:
         is_eval: bool = False,
         holdout_ratio: float = 0.05,
         seed: int = 42,
+        skip_shards: list[int] | None = None,
     ):
         streams = []
-        for src in sources:
+        for index, src in enumerate(sources):
+            skipped = 0 if not skip_shards else int(skip_shards[index])
             streams.append(
                 iterate_encoded(
                     src,
@@ -791,6 +1116,7 @@ class DatasetRegistry:
                     is_eval=is_eval,
                     holdout_ratio=holdout_ratio,
                     seed=seed,
+                    skip_shards=skipped,
                 )
             )
         return streams
